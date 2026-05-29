@@ -448,7 +448,14 @@ class FastWAM(torch.nn.Module):
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
     def training_loss(self, sample, tiled: bool = False):
+        # Synchronous path: build inputs inline, then run the DiT-side loss.
+        # The encode-overlap path (see trainer.AsyncEncodePrefetcher) calls
+        # `build_inputs` on a worker thread and feeds the dict to
+        # `training_loss_from_inputs` directly.
         inputs = self.build_inputs(sample, tiled=tiled)
+        return self.training_loss_from_inputs(inputs)
+
+    def training_loss_from_inputs(self, inputs):
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
         context = inputs["context"]

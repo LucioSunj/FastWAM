@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import os
+import contextlib
 from typing import Any, Dict, Tuple, Optional
 from .helpers.gradient import gradient_checkpoint_forward
 
@@ -9,7 +11,20 @@ from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-    
+
+# FASTWAM_SDPA_BACKEND=cudnn forces CUDNN_ATTENTION for DiT SDPA
+# (3.5-4x faster fwd+bwd at production shapes on sm_120). Otherwise defaults
+# to PyTorch's auto-selection.
+_USE_CUDNN_SDPA = os.environ.get("FASTWAM_SDPA_BACKEND", "").lower() == "cudnn"
+
+
+def _sdpa_context():
+    if not _USE_CUDNN_SDPA:
+        return contextlib.nullcontext()
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    return sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
+
+
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True):
     if compatibility_mode:
         B, S_q, _ = q.shape
@@ -18,7 +33,8 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         q = q.view(B, S_q, num_heads, head_dim).transpose(1, 2)
         k = k.view(B, S_k, num_heads, head_dim).transpose(1, 2)
         v = v.view(B, S_k, num_heads, head_dim).transpose(1, 2)
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
+        with _sdpa_context():
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
         x = x.transpose(1, 2).reshape(B, S_q, -1)
         return x
     else:
