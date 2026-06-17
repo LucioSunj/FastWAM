@@ -4,6 +4,7 @@ import inspect
 from typing import Any, Mapping, Optional
 
 import torch
+import torch.nn.functional as F
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
@@ -274,6 +275,293 @@ class MetricAdaptiveFastWAM(FastWAMIDM):
                 call_kwargs[key] = value
         return call_kwargs
 
+    # ---- corrected dual-regime training ---------------------------------
+    # The inference router picks base or idm per call, but both share one set
+    # of weights. To keep the shared action expert in-distribution for BOTH
+    # branches, every training step computes the action loss under BOTH
+    # conditioning regimes while the video-denoising loss is computed ONCE.
+    #
+    # Knobs are set by create_metric_adaptive_fastwam (read via getattr so the
+    # model still runs if wiring is omitted):
+    #   self.action_regime_weight_base : float = 1.0   # w_base
+    #   self.train_share_inputs        : bool  = True   # single VAE encode/step
+
+    def _action_loss_per_sample(
+        self,
+        pred_action: torch.Tensor,
+        target_action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Per-sample action loss, identical reduction to FastWAM/FastWAMIDM
+        (fastwam.py:550-556, fastwam_idm.py:209-215). Returns [B] (pre-weight)."""
+        action_loss_token = F.mse_loss(
+            pred_action.float(), target_action.float(), reduction="none"
+        ).mean(dim=2)
+        if action_is_pad is not None:
+            valid = (~action_is_pad).to(
+                device=action_loss_token.device, dtype=action_loss_token.dtype
+            )
+            valid_sum = valid.sum(dim=1).clamp(min=1.0)
+            return (action_loss_token * valid).sum(dim=1) / valid_sum
+        return action_loss_token.mean(dim=1)
+
+    def _base_regime_action_loss(self, inputs: dict) -> torch.Tensor:
+        """BASE-regime action loss (differentiable scalar, batch mean).
+
+        Mirrors FastWAM.infer_action (fastwam.py:993-1012): a SINGLE CLEAN
+        first-frame latent at timestep_video=0, action=None into
+        video_expert.pre_dit (action_conditioned=false ignores it), and the
+        FastWAM first-frame attention mask. NO video loss is computed here
+        (tokens_out["video"] is discarded), so the video-denoising loss is
+        never double-counted.
+        """
+        first_frame_latents = inputs["first_frame_latents"]
+        if first_frame_latents is None:
+            raise ValueError(
+                "Base-regime action training requires `fuse_vae_embedding_in_latents=true` "
+                "so that `first_frame_latents` is available (the adaptive config sets this)."
+            )
+        input_latents = inputs["input_latents"]
+        batch_size = input_latents.shape[0]
+        context = inputs["context"]
+        context_mask = inputs["context_mask"]
+        action = inputs["action"]
+        action_is_pad = inputs["action_is_pad"]
+        fuse_flag = inputs["fuse_vae_embedding_in_latents"]
+
+        # Independent noisy action / timestep for the base regime.
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size, device=self.device, dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+
+        # Video branch = single CLEAN first frame at timestep 0 (matches infer_action).
+        timestep_video = torch.zeros(
+            (batch_size,), dtype=first_frame_latents.dtype, device=self.device,
+        )
+        video_pre = self.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,  # action_conditioned=false -> ignored; matches base inference
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+
+        # IMPORTANT: explicitly use FastWAM's FIRST-FRAME mask, NOT
+        # self._build_mot_attention_mask (which MRO-resolves to FastWAMJoint's
+        # full-video mask). With a single-frame video they coincide, but the
+        # explicit call is faithful to base inference and future-proof.
+        attention_mask = FastWAM._build_mot_attention_mask(
+            self,
+            video_seq_len=int(video_pre["tokens"].shape[1]),
+            action_seq_len=int(action_pre["tokens"].shape[1]),
+            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
+            device=video_pre["tokens"].device,
+        )
+
+        tokens_out = self.mot(
+            embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
+            attention_mask=attention_mask,
+            freqs_all={"video": video_pre["freqs"], "action": action_pre["freqs"]},
+            context_all={
+                "video": {"context": video_pre["context"], "mask": video_pre["context_mask"]},
+                "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
+            },
+            t_mod_all={"video": video_pre["t_mod"], "action": action_pre["t_mod"]},
+        )
+        # NOTE: tokens_out["video"] is intentionally discarded -> NO video loss.
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+
+        action_loss_per_sample = self._action_loss_per_sample(
+            pred_action, target_action, action_is_pad
+        )
+        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
+        )
+        return (action_loss_per_sample * action_weight).mean()
+
+    def _idm_regime_losses(self, inputs: dict):
+        """IDM-regime video + action losses from a PRE-BUILT `inputs` dict.
+
+        Line-for-line equivalent of FastWAMIDM.training_loss (fastwam_idm.py:69-220)
+        EXCEPT it consumes the caller's `inputs` (single VAE encode/step) and returns
+        the two DIFFERENTIABLE loss tensors. Keep in sync with the parent if it
+        ever changes (or set share_inputs=false to delegate to it verbatim).
+        Returns (loss_video, loss_action_idm) as 0-dim tensors.
+        """
+        input_latents = inputs["input_latents"]
+        batch_size = input_latents.shape[0]
+        context = inputs["context"]
+        context_mask = inputs["context_mask"]
+        action = inputs["action"]
+        action_is_pad = inputs["action_is_pad"]
+        image_is_pad = inputs["image_is_pad"]
+        fuse_flag = inputs["fuse_vae_embedding_in_latents"]
+        first_frame_latents = inputs["first_frame_latents"]
+
+        # Branch A: noisy video.
+        noise_video = torch.randn_like(input_latents)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size, device=self.device, dtype=input_latents.dtype,
+        )
+        latents_noisy = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+        if first_frame_latents is not None:
+            latents_noisy[:, :, 0:1] = first_frame_latents
+
+        # Branch B: noisy action (idm-conditioned).
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size, device=self.device, dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+
+        # Branch C: teacher-forcing cond-video, per-sample noised w.p. video_cond_noise_prob.
+        cond_noise_mask = torch.rand((batch_size,), device=self.device) < float(self.video_cond_noise_prob)
+        timestep_video_cond = torch.zeros_like(timestep_video, dtype=input_latents.dtype, device=self.device)
+        latents_cond = input_latents
+        if bool(cond_noise_mask.any()):
+            timestep_video_cond_sampled = self.train_video_scheduler.sample_training_t(
+                batch_size=batch_size, device=self.device, dtype=input_latents.dtype,
+            )
+            timestep_video_cond = torch.where(cond_noise_mask, timestep_video_cond_sampled, timestep_video_cond)
+            noise_video_cond = torch.randn_like(input_latents)
+            latents_cond_noisy = self.train_video_scheduler.add_noise(
+                input_latents, noise_video_cond, timestep_video_cond_sampled
+            )
+            cond_noise_selector = cond_noise_mask.view(batch_size, 1, 1, 1, 1)
+            latents_cond = torch.where(cond_noise_selector, latents_cond_noisy, input_latents)
+        if first_frame_latents is not None:
+            latents_cond = latents_cond.clone()
+            latents_cond[:, :, 0:1] = first_frame_latents
+
+        video_pre_noisy = self.video_expert.pre_dit(
+            x=latents_noisy, timestep=timestep_video, context=context,
+            context_mask=context_mask, action=None, fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_pre_cond = self.video_expert.pre_dit(
+            x=latents_cond, timestep=timestep_video_cond, context=context,
+            context_mask=context_mask, action=None, fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        if video_pre_noisy["t_mod"].ndim != 4 or video_pre_cond["t_mod"].ndim != 4:
+            raise ValueError(
+                "Teacher-forcing requires token-wise `t_mod`; "
+                "ensure `seperated_timestep=true` and `fuse_vae_embedding_in_latents=true`."
+            )
+
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action, timestep=timestep_action,
+            context=context, context_mask=context_mask,
+        )
+
+        noisy_video_seq_len = int(video_pre_noisy["tokens"].shape[1])
+        cond_video_seq_len = int(video_pre_cond["tokens"].shape[1])
+        noisy_tpf = int(video_pre_noisy["meta"]["tokens_per_frame"])
+        cond_tpf = int(video_pre_cond["meta"]["tokens_per_frame"])
+
+        merged_video_tokens = torch.cat([video_pre_noisy["tokens"], video_pre_cond["tokens"]], dim=1)
+        merged_video_freqs = torch.cat([video_pre_noisy["freqs"], video_pre_cond["freqs"]], dim=0)
+        merged_video_t_mod = torch.cat([video_pre_noisy["t_mod"], video_pre_cond["t_mod"]], dim=1)
+        merged_video_context_mask = torch.cat(
+            [video_pre_noisy["context_mask"], video_pre_cond["context_mask"]], dim=1
+        )
+
+        attention_mask = self._build_teacher_forcing_attention_mask(
+            noisy_video_seq_len=noisy_video_seq_len,
+            cond_video_seq_len=cond_video_seq_len,
+            action_seq_len=action_pre["tokens"].shape[1],
+            noisy_video_tokens_per_frame=noisy_tpf,
+            cond_video_tokens_per_frame=cond_tpf,
+            device=merged_video_tokens.device,
+        )
+
+        tokens_out = self.mot(
+            embeds_all={"video": merged_video_tokens, "action": action_pre["tokens"]},
+            attention_mask=attention_mask,
+            freqs_all={"video": merged_video_freqs, "action": action_pre["freqs"]},
+            context_all={
+                "video": {"context": video_pre_noisy["context"], "mask": merged_video_context_mask},
+                "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]},
+            },
+            t_mod_all={"video": merged_video_t_mod, "action": action_pre["t_mod"]},
+        )
+
+        # Video loss ONLY from the noisy-video half (no double count).
+        pred_video = self.video_expert.post_dit(
+            tokens_out["video"][:, :noisy_video_seq_len], video_pre_noisy
+        )
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+
+        include_initial_video_step = first_frame_latents is None
+        if first_frame_latents is not None:
+            pred_video = pred_video[:, :, 1:]
+            target_video = target_video[:, :, 1:]
+
+        loss_video_per_sample = self._compute_video_loss_per_sample(
+            pred_video=pred_video, target_video=target_video,
+            image_is_pad=image_is_pad, include_initial_video_step=include_initial_video_step,
+        )
+        video_weight = self.train_video_scheduler.training_weight(timestep_video).to(
+            loss_video_per_sample.device, dtype=loss_video_per_sample.dtype
+        )
+        loss_video = (loss_video_per_sample * video_weight).mean()
+
+        action_loss_per_sample = self._action_loss_per_sample(pred_action, target_action, action_is_pad)
+        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
+        )
+        loss_action_idm = (action_loss_per_sample * action_weight).mean()
+        return loss_video, loss_action_idm
+
+    def training_loss(self, sample, tiled: bool = False):
+        """Dual-regime training: action expert sees BOTH the idm and base
+        conditioning regimes every step; video loss is computed exactly once."""
+        w_base = float(getattr(self, "action_regime_weight_base", 1.0))
+        share_inputs = bool(getattr(self, "train_share_inputs", True))
+
+        if share_inputs:
+            # Single VAE encode / context build per step (no redundant encode).
+            inputs = self.build_inputs(sample, tiled=tiled)
+            loss_video, loss_action_idm = self._idm_regime_losses(inputs)
+            loss_action_base = self._base_regime_action_loss(inputs)
+            loss_idm_total = (
+                self.loss_lambda_video * loss_video
+                + self.loss_lambda_action * loss_action_idm
+            )
+        else:
+            # Pure zero-drift path: delegate verbatim to the unmodified parent for
+            # video + idm-action, then add a base-regime action term from a second
+            # build_inputs (one extra VAE encode, but no inline-copy drift risk).
+            loss_idm_total, idm_dict = FastWAMIDM.training_loss(self, sample, tiled=tiled)
+            inputs = self.build_inputs(sample, tiled=tiled)
+            loss_action_base = self._base_regime_action_loss(inputs)
+
+        loss_total = loss_idm_total + self.loss_lambda_action * w_base * loss_action_base
+
+        if share_inputs:
+            loss_dict = {
+                "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+                "loss_action_idm": self.loss_lambda_action * float(loss_action_idm.detach().item()),
+                "loss_action_base": self.loss_lambda_action * w_base * float(loss_action_base.detach().item()),
+            }
+        else:
+            loss_dict = {
+                "loss_video": float(idm_dict["loss_video"]),
+                "loss_action_idm": float(idm_dict["loss_action"]),
+                "loss_action_base": self.loss_lambda_action * w_base * float(loss_action_base.detach().item()),
+            }
+        return loss_total, loss_dict
+
 
 def create_metric_adaptive_fastwam(
     model_id: str,
@@ -294,13 +582,20 @@ def create_metric_adaptive_fastwam(
     device: str = "cuda",
     adaptive=None,
     router=None,
+    train=None,
 ):
     adaptive_cfg = _to_plain_dict(adaptive if adaptive is not None else router)
     routing_metric = _maybe_instantiate(adaptive_cfg.get("metric"))
     routing_selector = _maybe_instantiate(adaptive_cfg.get("selector"))
     annotate_outputs = bool(adaptive_cfg.get("annotate_outputs", True))
 
-    return MetricAdaptiveFastWAM.from_wan22_pretrained(
+    # Dual-regime training knobs. NOT threaded through from_wan22_pretrained
+    # (the FastWAM base signature has no **kwargs); set as attributes post-build.
+    train_cfg = _to_plain_dict(train)
+    action_regime_weight_base = float(train_cfg.get("action_regime_weight_base", 1.0))
+    train_share_inputs = bool(train_cfg.get("share_inputs", True))
+
+    model = MetricAdaptiveFastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
         model_id=model_id,
@@ -330,6 +625,10 @@ def create_metric_adaptive_fastwam(
         routing_selector=routing_selector,
         annotate_outputs=annotate_outputs,
     )
+    # Set training knobs AFTER construction (do NOT pass into from_wan22_pretrained).
+    model.action_regime_weight_base = action_regime_weight_base
+    model.train_share_inputs = train_share_inputs
+    return model
 
 
 def _to_plain_dict(value) -> dict[str, Any]:

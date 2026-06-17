@@ -57,6 +57,15 @@ action_scheduler:
 loss:
   lambda_action: 1.0
 
+train:
+  # Dual-regime action training (corrected MetricAdaptiveFastWAM.training_loss).
+  # Every step trains the shared action expert under BOTH inference regimes:
+  #   - idm  regime: action conditions on the teacher-forced cond-video
+  #   - base regime: action conditions on the clean first frame
+  # The video-denoising loss is computed ONCE (in the idm forward only).
+  action_regime_weight_base: 1.0   # w_base; 1.0 = equal idm/base action weight
+  share_inputs: true               # true = single VAE encode/step (recommended)
+
 adaptive:
   annotate_outputs: true
   metric:
