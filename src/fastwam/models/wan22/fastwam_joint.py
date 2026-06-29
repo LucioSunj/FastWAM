@@ -164,6 +164,10 @@ class FastWAMJoint(FastWAM):
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         latents_video[:, :, 0:1] = first_frame_latents.clone()
+        # VLSP seam (no-op when disabled): inherits FastWAM._make_action_source.
+        latents_action = self._make_action_source(
+            latents_action, video_latent=first_frame_latents, seed=seed, generator=action_generator
+        )
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None

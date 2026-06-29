@@ -8,6 +8,11 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
+from .action_source_prior import (
+    ActionSourcePrior,
+    ActionSourcePriorConfig,
+    compute_prior_regularization,
+)
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -38,6 +43,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        source_prior_config: Optional[dict] = None,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -85,7 +91,73 @@ class FastWAM(torch.nn.Module):
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
 
+        # VLSP (Video-Latent Source Prior): optional, disabled by default.
+        # Registered UNDER `self.mot` so the existing trainer (which optimizes
+        # `model.dit.parameters()` and unfreezes `model.dit`) and the checkpointer
+        # (`mot.state_dict()` + strict=False load) pick it up with no changes.
+        # When disabled, no submodule is added => behaviour is exactly the baseline.
+        self._source_prior_cfg = ActionSourcePriorConfig.from_dict(source_prior_config)
+        _source_prior = ActionSourcePrior(
+            self._source_prior_cfg,
+            action_dim=int(self.action_expert.action_dim),
+            video_emb_dim=int(self.vae.model.z_dim),
+            proprio_dim=self.proprio_dim,
+        )
+        if _source_prior.enabled:
+            self.mot.add_module(
+                "action_source_prior", _source_prior.to(device=self.device, dtype=torch_dtype)
+            )
+        self._pending_source_metrics = None
+
         self.to(self.device)
+
+    @property
+    def source_prior(self) -> Optional[ActionSourcePrior]:
+        # Lives under `self.mot` (so trainer/checkpoint pick it up); accessed via
+        # this property to avoid registering it twice on the module tree.
+        return getattr(self.mot, "action_source_prior", None)
+
+    def _make_action_source(
+        self,
+        gaussian: torch.Tensor,
+        *,
+        video_latent: torch.Tensor,
+        proprio: Optional[torch.Tensor] = None,
+        training: bool = False,
+        seed: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
+        x0: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Seam for the action flow source. Returns the Gaussian unchanged unless a
+        VLSP source prior is enabled, in which case it returns the informed source
+        (same shape/space/dtype). The drawn `gaussian` is reused as the prior's
+        reparameterization noise, so seeding/determinism is inherited and the
+        disabled path is bit-identical to the original `torch.randn` behaviour."""
+        sp = self.source_prior
+        if sp is None or not sp.enabled:
+            return gaussian
+        source, metrics = sp(
+            gaussian,
+            video_latent=video_latent,
+            proprio=proprio,
+            training=training,
+            seed=seed,
+            generator=generator,
+            x0=x0,
+        )
+        if training:
+            self._pending_source_metrics = metrics
+        return source.to(dtype=gaussian.dtype)
+
+    def _pop_source_prior_loss(self):
+        """Optional KL/mean-L2/std regularizer for the most recent training source.
+        Returns 0.0 when VLSP is disabled (no effect on the baseline loss)."""
+        sp = self.source_prior
+        metrics = self._pending_source_metrics
+        self._pending_source_metrics = None
+        if sp is None or metrics is None:
+            return 0.0
+        return compute_prior_regularization(metrics, sp)
 
     @classmethod
     def from_wan22_pretrained(
@@ -111,6 +183,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        source_prior_config: dict[str, Any] | None = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -168,6 +241,7 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            source_prior_config=source_prior_config,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -468,6 +542,12 @@ class FastWAM(torch.nn.Module):
             latents[:, :, 0:1] = inputs["first_frame_latents"]
 
         noise_action = torch.randn_like(action)
+        # VLSP seam: replace the Gaussian action source with a video-latent-derived
+        # source (no-op when disabled). Uses the clean first-frame latent (current
+        # observation), which is identical at train and inference time.
+        noise_action = self._make_action_source(
+            noise_action, video_latent=input_latents[:, :, 0:1], training=True, x0=action
+        )
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
@@ -565,6 +645,11 @@ class FastWAM(torch.nn.Module):
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        # VLSP seam: optional source-prior regularizer (0.0 when disabled).
+        source_prior_loss = self._pop_source_prior_loss()
+        if torch.is_tensor(source_prior_loss):
+            loss_total = loss_total + source_prior_loss
+            loss_dict["loss_source_prior"] = float(source_prior_loss.detach().item())
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -820,6 +905,10 @@ class FastWAM(torch.nn.Module):
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         latents_video[:, :, 0:1] = first_frame_latents.clone()
+        # VLSP seam (no-op when disabled): informed action source from first frame.
+        latents_action = self._make_action_source(
+            latents_action, video_latent=first_frame_latents, seed=seed, generator=action_generator
+        )
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -959,6 +1048,10 @@ class FastWAM(torch.nn.Module):
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        # VLSP seam (no-op when disabled): informed action source from first frame.
+        latents_action = self._make_action_source(
+            latents_action, video_latent=first_frame_latents, seed=seed, generator=generator
+        )
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None

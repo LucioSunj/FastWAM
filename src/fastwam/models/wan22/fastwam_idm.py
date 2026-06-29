@@ -80,6 +80,10 @@ class FastWAMIDM(FastWAMJoint):
 
         # Branch B: noisy action.
         noise_action = torch.randn_like(action)
+        # VLSP seam (no-op when disabled): inherits FastWAM._make_action_source.
+        noise_action = self._make_action_source(
+            noise_action, video_latent=input_latents[:, :, 0:1], training=True, x0=action
+        )
         timestep_action = self.train_action_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
@@ -224,6 +228,11 @@ class FastWAMIDM(FastWAMJoint):
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        # VLSP seam: optional source-prior regularizer (0.0 when disabled).
+        source_prior_loss = self._pop_source_prior_loss()
+        if torch.is_tensor(source_prior_loss):
+            loss_total = loss_total + source_prior_loss
+            loss_dict["loss_source_prior"] = float(source_prior_loss.detach().item())
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -346,6 +355,10 @@ class FastWAMIDM(FastWAMJoint):
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
         latents_video[:, :, 0:1] = first_frame_latents.clone()
+        # VLSP seam (no-op when disabled): inherits FastWAM._make_action_source.
+        latents_action = self._make_action_source(
+            latents_action, video_latent=first_frame_latents, seed=seed, generator=action_generator
+        )
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None

@@ -56,3 +56,29 @@ action_scheduler:
 
 loss:
   lambda_action: 1.0
+
+# VLSP (Video-Latent Source Prior). Disabled by default => exact FastWAM baseline.
+# Enable e.g.: model.source_prior.enabled=true model.source_prior.mode=video_prior_sample
+source_prior:
+  enabled: false
+  mode: gaussian            # gaussian | video_prior_{sample,mean,residual,blend,dropout} | shuffled_video_prior
+  source_feature: first_frame
+  pool_type: mean           # mean | attention | perceiver
+  hidden_dim: 512
+  max_action_horizon: 64
+  num_attention_heads: 8
+  num_perceiver_latents: 8
+  mlp_depth: 2
+  logstd_min: -5.0
+  logstd_max: 1.0
+  init_logstd: -1.0
+  sampling_temperature: 1.0
+  blend_alpha: 1.0
+  residual_scale: 1.0
+  source_dropout_prob: 0.0
+  dropout_granularity: sample
+  detach_video_latents: true
+  use_proprio: false
+  kl_weight: 0.0
+  mean_l2_weight: 0.0
+  std_reg_weight: 0.0
