@@ -6,8 +6,8 @@ forward-prediction compute the frozen world-action model spends:
 | mode | meaning | code path (frozen model) |
 |---|---|---|
 | **SKIP** | no future prediction (reactive); action conditions on current-context latent only | `force_branch="base"` → `FastWAM.infer_action` (first-frame, no video denoise) |
-| **LATENT** | run video branch a few steps (`k_lo`), condition action on intermediate self-generated latent (no pixel decode) | `force_branch=<joint|idm>` → `infer_action(num_inference_steps=k_lo)` |
-| **FULL** | full video schedule (`k_hi`), condition action on refined self-generated latent | `force_branch=<joint|idm>` → `infer_action(num_inference_steps=k_hi)` |
+| **LATENT** | run future branch a few steps (`k_lo`), condition action on intermediate self-generated latent (no pixel decode) | `joint`: native coupled `video/action=k_lo`; `idm`: `video=k_lo`, `action=k_hi` |
+| **FULL** | full future schedule (`k_hi`), condition action on refined self-generated latent | `force_branch=<joint|idm>` → full action schedule (`k_hi`) |
 
 The gate is trained with RLinf (GRPO first, PPO later); **fastwam stays frozen**;
 only the gate trains. This doc covers the **fastwam side** (Milestone 1). The gate
@@ -51,6 +51,11 @@ No-leakage: the conditioned future is the model's own self-generated latent (the
 dual-regime model denoises from noise; only frame-0 is the encoded current image).
 LATENT/FULL never decode pixels. `force_branch` bypasses the model's internal
 PolicyEntropy probe so the gate is the sole decision-maker.
+
+Backbone semantic note: `FastWAMJoint` denoises video and action synchronously in
+one MoT sequence, so its LATENT mode remains coupled at `k_lo` action steps. The
+IDM branch is already two-stage (video then action), so LATENT can use
+`video_inference_steps=k_lo` while keeping `action_inference_steps=k_hi`.
 
 ## Cost / reward unit (decision #6)
 

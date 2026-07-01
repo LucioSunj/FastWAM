@@ -239,6 +239,8 @@ class FastWAMIDM(FastWAMJoint):
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
+        video_inference_steps: Optional[int] = None,
+        action_inference_steps: Optional[int] = None,
         sigma_shift: Optional[float] = None,
         seed: Optional[int] = None,
         rand_device: str = "cpu",
@@ -257,6 +259,8 @@ class FastWAMIDM(FastWAMJoint):
             negative_prompt=negative_prompt,
             text_cfg_scale=text_cfg_scale,
             num_inference_steps=num_inference_steps,
+            video_inference_steps=video_inference_steps,
+            action_inference_steps=action_inference_steps,
             sigma_shift=sigma_shift,
             seed=seed,
             rand_device=rand_device,
@@ -279,6 +283,8 @@ class FastWAMIDM(FastWAMJoint):
         negative_prompt: Optional[str] = None,
         text_cfg_scale: float = 1.0,
         num_inference_steps: int = 20,
+        video_inference_steps: Optional[int] = None,
+        action_inference_steps: Optional[int] = None,
         sigma_shift: Optional[float] = None,
         seed: Optional[int] = None,
         rand_device: str = "cpu",
@@ -287,6 +293,8 @@ class FastWAMIDM(FastWAMJoint):
     ) -> dict[str, Any]:
         del negative_prompt, text_cfg_scale, test_action_with_infer_action
         self.eval()
+        video_steps = int(video_inference_steps if video_inference_steps is not None else num_inference_steps)
+        action_steps = int(action_inference_steps if action_inference_steps is not None else num_inference_steps)
 
         if action is not None:
             logger.warning(
@@ -379,7 +387,7 @@ class FastWAMIDM(FastWAMJoint):
 
         # Stage 1: denoise video only.
         infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=video_steps,
             device=self.device,
             dtype=latents_video.dtype,
             shift_override=sigma_shift,
@@ -428,7 +436,7 @@ class FastWAMIDM(FastWAMJoint):
         )
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=action_steps,
             device=self.device,
             dtype=latents_action.dtype,
             shift_override=sigma_shift,

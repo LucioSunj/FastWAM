@@ -26,10 +26,12 @@ from fastwam.adaptive_gate import (  # noqa: E402
     NUM_MODES,
     WAMMode,
     WAMModeAdapter,
+    coerce_mode,
     default_cost_table,
     future_branch_for,
     load_cost_table,
     mode_from_index,
+    mode_to_branch_step_counts,
     mode_to_branch_steps,
     mode_to_index,
     normalize_cost_table,
@@ -46,6 +48,10 @@ def test_mode_order_and_index_roundtrip():
     for i, m in enumerate(MODE_ORDER):
         assert mode_to_index(m) == i
         assert mode_from_index(i) == m
+        assert coerce_mode(i) == m
+        assert coerce_mode(m.value) == m
+    with pytest.raises(ValueError):
+        coerce_mode(99)
 
 
 def test_future_branch_for():
@@ -61,6 +67,16 @@ def test_mode_to_branch_steps(backbone, future):
     assert mode_to_branch_steps(WAMMode.SKIP, **common) == ("base", 20)
     assert mode_to_branch_steps(WAMMode.LATENT, **common) == (future, 4)
     assert mode_to_branch_steps(WAMMode.FULL, **common) == (future, 20)
+
+
+def test_mode_to_branch_step_counts_respects_backbone_semantics():
+    common = dict(k_lo=4, k_hi=20, action_steps=20)
+    assert mode_to_branch_step_counts(WAMMode.LATENT, backbone_kind="joint", **common) == (
+        "joint", 4, 4,
+    )
+    assert mode_to_branch_step_counts(WAMMode.LATENT, backbone_kind="idm", **common) == (
+        "idm", 4, 20,
+    )
 
 
 # ======================================================================== #
@@ -128,9 +144,12 @@ class _StubModel:
 
     def infer_action(self, *, prompt, input_image, action_horizon, num_video_frames=None,
                      proprio=None, context=None, context_mask=None, num_inference_steps=20,
+                     video_inference_steps=None, action_inference_steps=None,
                      seed=None, force_branch=None, return_routing_info=False, **kw):
         self.calls.append(
             dict(force_branch=force_branch, num_inference_steps=num_inference_steps,
+                 video_inference_steps=video_inference_steps,
+                 action_inference_steps=action_inference_steps,
                  num_video_frames=num_video_frames, action_horizon=action_horizon)
         )
         return {"action": torch.zeros(action_horizon, 7), "_routing": {"selected_branch": force_branch}}
@@ -164,22 +183,26 @@ def test_world_feat_dim_and_shape():
 
 
 @pytest.mark.parametrize(
-    "backbone,mode,exp_branch,exp_steps",
+    "backbone,mode,exp_branch,exp_steps,exp_video_steps,exp_action_steps",
     [
-        ("joint", WAMMode.SKIP, "base", 20),
-        ("joint", WAMMode.LATENT, "joint", 4),
-        ("joint", WAMMode.FULL, "joint", 20),
-        ("idm", WAMMode.LATENT, "idm", 4),
-        ("idm", WAMMode.FULL, "idm", 20),
+        ("joint", WAMMode.SKIP, "base", 20, None, None),
+        ("joint", WAMMode.LATENT, "joint", 4, None, None),
+        ("joint", WAMMode.FULL, "joint", 20, None, None),
+        ("idm", WAMMode.LATENT, "idm", 20, 4, 20),
+        ("idm", WAMMode.FULL, "idm", 20, None, None),
     ],
 )
-def test_act_dispatches_branch_and_steps(backbone, mode, exp_branch, exp_steps):
+def test_act_dispatches_branch_and_steps(
+    backbone, mode, exp_branch, exp_steps, exp_video_steps, exp_action_steps
+):
     a = _adapter(backbone)
     out = a.act(input_image=torch.rand(1, 3, 64, 64), mode=mode,
                 context=torch.randn(1, 16, 4096), context_mask=torch.ones(1, 16, dtype=torch.bool))
     call = a.model.calls[-1]
     assert call["force_branch"] == exp_branch
     assert call["num_inference_steps"] == exp_steps
+    assert call["video_inference_steps"] == exp_video_steps
+    assert call["action_inference_steps"] == exp_action_steps
     assert call["num_video_frames"] == 9  # passed for all modes; stub keeps it
     assert out["action_chunk"].shape == (32, 7)
     assert out["world_feat"].shape == (8,)
@@ -204,6 +227,16 @@ def test_world_feat_reused_when_passed():
     a.act(input_image=torch.rand(1, 3, 64, 64), mode=WAMMode.SKIP, world_feat=feat,
           context=torch.randn(1, 16, 4096), context_mask=torch.ones(1, 16, dtype=torch.bool))
     assert a.model.encode_calls == encodes_before  # not re-encoded
+
+
+def test_act_accepts_categorical_mode_index():
+    a = _adapter("joint")
+    out = a.act(input_image=torch.rand(1, 3, 64, 64), mode=1,
+                context=torch.randn(1, 16, 4096), context_mask=torch.ones(1, 16, dtype=torch.bool))
+    call = a.model.calls[-1]
+    assert call["force_branch"] == "joint"
+    assert call["num_inference_steps"] == 4
+    assert out["aux"]["mode"] == "latent"
 
 
 # ======================================================================== #

@@ -13,7 +13,7 @@ spend per call via `mode`.
 - world_feat   : the cheap current-context latent (gate input), computed in ALL
                  modes BEFORE the mode-specific compute
 - cost         : relative FLOPs of the chosen mode, cost(FULL)=1
-- aux          : {mode, branch, num_inference_steps, routing}
+- aux          : {mode, branch, video_inference_steps, action_inference_steps, routing}
 
 No-leakage: the future the action conditions on is the model's OWN self-generated
 latent (the dual-regime model denoises from noise; only frame-0 is clamped to the
@@ -29,7 +29,7 @@ from typing import Any, Optional
 import torch
 
 from .cost import default_cost_table, load_cost_table
-from .modes import WAMMode, mode_to_branch_steps
+from .modes import coerce_mode, mode_to_branch_step_counts
 
 
 class WAMModeAdapter:
@@ -110,12 +110,12 @@ class WAMModeAdapter:
         world_feat: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
     ) -> dict[str, Any]:
-        mode = WAMMode(mode)
+        mode = coerce_mode(mode)
         # world_feat is computed in ALL modes, BEFORE the mode-specific compute.
         if world_feat is None:
             world_feat = self.encode_world_feat(input_image)
 
-        branch, steps = mode_to_branch_steps(
+        branch, video_steps, action_steps = mode_to_branch_step_counts(
             mode,
             backbone_kind=self.backbone_kind,
             k_lo=self.k_lo,
@@ -126,7 +126,7 @@ class WAMModeAdapter:
         # SAME frozen weights, and bypasses the model's internal routing metric.
         # `_filter_kwargs_for_method` drops `num_video_frames` for the base branch
         # (FastWAM.infer_action has no such arg) and passes it for joint/idm.
-        out = self.model.infer_action(
+        infer_kwargs = dict(
             prompt=prompt,
             input_image=input_image,
             action_horizon=int(action_horizon or self.action_horizon),
@@ -134,11 +134,16 @@ class WAMModeAdapter:
             proprio=proprio,
             context=context,
             context_mask=context_mask,
-            num_inference_steps=int(steps),
+            num_inference_steps=int(action_steps),
             seed=seed if seed is not None else self.default_seed,
             force_branch=branch,
             return_routing_info=True,
         )
+        if video_steps is not None and int(video_steps) != int(action_steps):
+            infer_kwargs["video_inference_steps"] = int(video_steps)
+            infer_kwargs["action_inference_steps"] = int(action_steps)
+
+        out = self.model.infer_action(**infer_kwargs)
         return {
             "action_chunk": out["action"],
             "world_feat": world_feat,
@@ -146,7 +151,9 @@ class WAMModeAdapter:
             "aux": {
                 "mode": mode.value,
                 "branch": branch,
-                "num_inference_steps": int(steps),
+                "video_inference_steps": None if video_steps is None else int(video_steps),
+                "action_inference_steps": int(action_steps),
+                "num_inference_steps": int(action_steps),
                 "routing": out.get("_routing"),
             },
         }
