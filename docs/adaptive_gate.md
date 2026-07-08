@@ -74,14 +74,49 @@ gate economizes). The dominant variable is the video denoising loop
 Latency is recorded for reference but the reward defaults to FLOPs. A flat per-step
 constant is intentionally avoided — it would erase LATENT's genuine saving over FULL.
 
+## Oracle labels for BC warm-start (M3, no annotation)
+
+The gate is trained "SFT → RL". The SFT targets are **self-generated** from the
+raw VLA training set (which already pairs each state with a ground-truth action
+chunk) — no human labeling:
+
+1. For each sampled state, run the FROZEN dual-regime WAM once per mode with
+   **paired seeds** (same initial action noise per mode, so error differences come
+   from the conditioning, not the draw).
+2. Score each mode's action chunk against the dataset chunk in the NORMALIZED
+   action space (masked by `action_is_pad`; optionally only the executed prefix
+   `--exec-horizon` = the eval `replan_steps`).
+3. Label = **cheapest sufficient mode**:
+   `min{ i : err(i) <= err(FULL)·(1+tol_rel) + tol_abs }` — prediction compute is
+   only "necessary" where imagining the future actually improves the action.
+
+```bash
+cd FastWAM
+python scripts/generate_gate_oracle_labels.py \
+  --task libero_metric_adaptive_joint_2cam224_1e-4 --backbone-kind joint \
+  --ckpt /path/to/dual_regime_joint.pt --dataset-stats /path/to/dataset_stats.json \
+  --stride 20 --exec-horizon 10 --num-seeds 1 \
+  --out data/gate_oracle/libero_joint          # + --num-shards/--shard-index per GPU
+```
+
+Each shard stores the gate inputs (`world_feat`, `proprio`), the label, AND the
+per-step error curves, so tolerances/metric/horizon can be changed OFFLINE via
+`fastwam.adaptive_gate.relabel_from_steps` without re-running the WAM. Inspect
+`label_distribution` first: near-100% SKIP means tolerances are too loose (or the
+dual-regime checkpoint makes prediction genuinely unnecessary); near-100% FULL
+means too tight. The shards feed `RLinf/examples/embodiment/train_gate_bc.py`.
+
 ## Files
 
 - `src/fastwam/adaptive_gate/modes.py` — `WAMMode`, `MODE_ORDER`, mode→(branch,steps).
 - `src/fastwam/adaptive_gate/cost.py` — cost table (default / load / save / normalize).
 - `src/fastwam/adaptive_gate/wam_mode_adapter.py` — `WAMModeAdapter`.
+- `src/fastwam/adaptive_gate/oracle.py` — oracle-label math + shard IO + offline relabel (M3).
 - `scripts/profile_wam_modes.py` — FLOPs/latency profiler → cost YAML.
+- `scripts/generate_gate_oracle_labels.py` — oracle-label shards from raw VLA data (M3).
 - `configs/adaptive_gate/wam_cost.yaml` — analytical default cost table.
 - `tests/test_wam_mode_adapter.py` — modes/cost/dispatch (pure) + gated real-model tests.
+- `tests/test_gate_oracle.py` — oracle selection/relabel/shard-IO tests (pure).
 
 ## Run / verify (Milestone 1)
 
@@ -101,7 +136,7 @@ RUN_FASTWAM_MODEL_TESTS=1 FASTWAM_TEST_TASK=libero_metric_adaptive_joint_2cam224
 
 ## Roadmap
 
-- **M1 (this) — done:** `WAMModeAdapter` (3 modes, both backbones, one interface) + FLOPs profiler + cost; SKIP reproduces fastwam.
-- **M2 (RLinf):** gate policy (3-way categorical MLP) registered as a custom RLinf policy; env/rollout wiring (LIBERO + RoboTwin) calling the adapter; multi-component reward (terminal success; `-lambda*cost`; optional dense agreement-with-FULL) with per-component logging; forced-mode smoke tests.
-- **M3:** oracle-label generation + BC warm-start.
+- **M1 — done:** `WAMModeAdapter` (3 modes, both backbones, one interface) + FLOPs profiler + cost; SKIP reproduces fastwam.
+- **M2 (RLinf) — done:** gate policy (3-way categorical MLP) registered as a custom RLinf policy; env/rollout wiring (LIBERO + RoboTwin) calling the adapter; multi-component reward (terminal success; `-lambda*cost`; optional dense agreement-with-FULL) with per-component logging; forced-mode smoke tests.
+- **M3 (this) — done:** oracle-label generation (fastwam side, no annotation) + BC warm-start & KL-to-BC prior (RLinf side, `train_gate_bc.py`).
 - **M4:** GRPO training (LIBERO then RoboTwin); collapse checks + per-setting (in-domain/OOD) mode-usage logging; then PPO config (TODO).
