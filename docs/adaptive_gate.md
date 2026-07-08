@@ -74,11 +74,17 @@ gate economizes). The dominant variable is the video denoising loop
 Latency is recorded for reference but the reward defaults to FLOPs. A flat per-step
 constant is intentionally avoided — it would erase LATENT's genuine saving over FULL.
 
-## Oracle labels for BC warm-start (M3, no annotation)
+## Oracle labels (M3, no annotation) — analysis tool + OPTIONAL warm-start
 
-The gate is trained "SFT → RL". The SFT targets are **self-generated** from the
-raw VLA training set (which already pairs each state with a ground-truth action
-chunk) — no human labeling:
+The gate's default training is **pure RL with zero supervision** (RLinf side;
+entropy bonus + λ-warmup + `explore_eps` uniform-mixture rollouts keep it
+stable). The oracle labels below are therefore NOT required by any training
+path. They serve two purposes: (a) an offline **analysis** of when prediction
+actually helps — the label distribution over states/task-phases is the
+project's core evidence — and (b) an optional BC warm-start / "oracle vs
+learned gate" ablation. The targets are **self-generated** from the raw VLA
+training set (which already pairs each state with a ground-truth action chunk)
+— no human labeling:
 
 1. For each sampled state, run the FROZEN dual-regime WAM once per mode with
    **paired seeds** (same initial action noise per mode, so error differences come
@@ -138,5 +144,5 @@ RUN_FASTWAM_MODEL_TESTS=1 FASTWAM_TEST_TASK=libero_metric_adaptive_joint_2cam224
 
 - **M1 — done:** `WAMModeAdapter` (3 modes, both backbones, one interface) + FLOPs profiler + cost; SKIP reproduces fastwam.
 - **M2 (RLinf) — done:** gate policy (3-way categorical MLP) registered as a custom RLinf policy; env/rollout wiring (LIBERO + RoboTwin) calling the adapter; multi-component reward (terminal success; `-lambda*cost`; optional dense agreement-with-FULL) with per-component logging; forced-mode smoke tests.
-- **M3 (this) — done:** oracle-label generation (fastwam side, no annotation) + BC warm-start & KL-to-BC prior (RLinf side, `train_gate_bc.py`).
+- **M3 (this) — done:** zero-supervision RL path hardened (RLinf `explore_eps`); oracle-label generation (fastwam side, no annotation; analysis tool) + OPTIONAL BC warm-start & KL-to-BC prior (RLinf `train_gate_bc.py`, off by default).
 - **M4:** GRPO training (LIBERO then RoboTwin); collapse checks + per-setting (in-domain/OOD) mode-usage logging; then PPO config (TODO).
