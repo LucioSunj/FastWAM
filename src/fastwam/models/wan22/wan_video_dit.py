@@ -508,14 +508,21 @@ class WanVideoDiT(torch.nn.Module):
 
     def pre_dit(
         self,
-        x: torch.Tensor,
-        timestep: torch.Tensor,
-        context: torch.Tensor,
-        context_mask: Optional[torch.Tensor] = None,
-        action: Optional[torch.Tensor] = None,
-        fuse_vae_embedding_in_latents: bool = False,
-        control_camera_latents_input: Optional[torch.Tensor] = None,
-    ) -> Dict[str, Any]:
+        x: torch.Tensor,                              # 输入潜空间视频张量,形状 (B, C, T, H, W)
+        timestep: torch.Tensor,                       # 扩散时间步,形状 (B,),每样本一个标量
+        context: torch.Tensor,                        # 文本条件嵌入,形状 (B, L, D_text)
+        context_mask: Optional[torch.Tensor] = None,  # 文本 padding/有效 token 的 mask,形状 (B, L)
+        action: Optional[torch.Tensor] = None,       # 动作序列,形状 (B, action_len, D_action);可选
+        fuse_vae_embedding_in_latents: bool = False,  # 是否把首帧 VAE 嵌入 fuse 到 latents(条件化模式)
+        control_camera_latents_input: Optional[torch.Tensor] = None,  # 相机控制信号(controlnet 风格)
+    ) -> Dict[str, Any]:                             # 返回一个 dict,供主 forward 循环使用
+        # ---------- 输入校验 ----------
+        # _validate_forward_inputs 会做以下检查:
+        #   - x 必须 5D [B, C, T, H, W]
+        #   - timestep 必须 1D [B]
+        #   - context 必须 3D [B, L, D]
+        #   - 当 action_conditioned=True 时,action 必须有合法形状
+        # 同时会把 context_mask 规范化为 (B, L) 的 bool 张量
         x, timestep, context_mask = self._validate_forward_inputs(
             x=x,
             timestep=timestep,
@@ -524,56 +531,111 @@ class WanVideoDiT(torch.nn.Module):
             action=action,
         )
 
-        batch_size = x.shape[0]
-        patch_h = int(self.patch_size[1])
-        patch_w = int(self.patch_size[2])
+        # ---------- 1) 计算每帧的 token 数 ----------
+        batch_size = x.shape[0]                        # 批大小 B
+        patch_h = int(self.patch_size[1])              # H 方向每个 patch 占据多少潜空间像素
+        patch_w = int(self.patch_size[2])              # W 方向每个 patch 占据多少潜空间像素
+        # 强约束: 潜空间 H/W 必须能被 patch 整除,否则 patchify 后出现非整尾
         if x.shape[3] % patch_h != 0 or x.shape[4] % patch_w != 0:
             raise ValueError(
                 "Latent spatial shape must be divisible by DiT patch size, "
                 f"got HxW=({x.shape[3]}, {x.shape[4]}), patch=({patch_h}, {patch_w})"
             )
+        # tokens_per_frame = 一帧切出的 patch 总数 = (H/ph) * (W/pw)
+        # 例: H=30, W=52, patch=(1,2,2) -> 15*26 = 390
+        # 后续所有 mask 形状推导都依赖这个中间量
         tokens_per_frame = (x.shape[3] // patch_h) * (x.shape[4] // patch_w)
 
+        # ---------- 2) 逐 token 的 Separated Timestep 嵌入 ----------
+        # 这是 FastWAM 的核心特性: 不同帧可以有不同的 timestep
+        # 进入该分支的两个条件:
+        #   - seperated_timestep=True: 构造 DiT 时显式开启
+        #   - fuse_vae_embedding_in_latents=True: 首帧是干净条件,需"从 t=0 起步"做扩散
         if self.seperated_timestep and fuse_vae_embedding_in_latents:
+            # 防御性检查 patch_size 形状是否正确
             if not hasattr(self, "patch_size") or len(self.patch_size) < 3:
                 raise ValueError(f"Invalid dit.patch_size: {getattr(self, 'patch_size', None)}")
-            
-            token_timesteps = torch.ones(
+
+            # 构造一个逐 token 的 timestep 张量,形状 (B, T, tokens_per_frame)
+            # 全部初始化为该样本的 timestep 标量 (broadcast)
+            token_timesteps = torch.ones( 
                 (batch_size, x.shape[2], tokens_per_frame),
                 dtype=timestep.dtype,
                 device=timestep.device,
             ) * timestep.view(batch_size, 1, 1)
+            # 关键一行: 第 0 帧(通常是 fuse 进去的干净 VAE 条件帧)的 timestep 强制置 0
+            # 设计意图: 首帧作为"条件",其扩散前向/反向都从 t=0 出发,不参与加噪去噪,作为静态视觉锚点
+            # 后续 T-1 帧仍按 timestep 去噪,实现"以首帧为条件生成后续帧"
             token_timesteps[:, 0, :] = 0
+            # 拉平为 (B, T * tokens_per_frame),与接下来进入主循环的视频 token 序列一一对应
             token_timesteps = token_timesteps.reshape(batch_size, -1)
+            # 对每个 token 的 timestep 单独做正弦位置式编码
+            # 输入 (B*T*tokens_per_frame,), 输出 (B*T*tokens_per_frame, freq_dim)
+            # 这样不同位置的 token 拿到不同的时间嵌入,实现 per-token 的 adaLN 调制
             token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))
+            # 经 MLP 投影到 hidden_dim,再 reshape 为 (B, T*tokens_per_frame, hidden_dim)
             t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)
+            # 投影出 6 组调制向量,形状 (B, seq_len, 6, hidden_dim)
+            # 对应 DiT 中 adaln-zero 的 (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+            # 在每个 block 中按需拆出来对 Q/K/V 与 MLP 做调制
             t_mod = self.time_projection(t).unflatten(2, (6, self.hidden_dim))
         else:
+            # 旧逻辑(整段视频共享 1 个 timestep)被显式禁用
+            # 即使走到 else,raise 已终止;下面两行是死代码,保留作历史参考
             raise NotImplementedError("Only support seperated_timestep with fuse_vae_embedding_in_latents for now.")
             t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
             t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
+
+        # ---------- 3) Patchify: 把潜空间切成 token 序列 ----------
+        # self.patch_embedding 是 Conv3d(in_C, hidden_dim, kernel=patch_size, stride=patch_size)
+        # 输出形状 (B, hidden_dim, T, H/ph, W/pw)
+        # 若有 control_adapter 且给了相机控制信号,会注入控制条件(controlnet 风格),形状不变
         x = self.patchify(x, control_camera_latents_input=control_camera_latents_input)
+        # 解构出 f, h, w: patch 化之后的"时空网格三个维度"
+        # 注意此处的 f 已是 patch 网格的"帧数"(通常等于 T),不是原始像素帧数
         f, h, w = x.shape[2:]
 
+        # ---------- 4) Context 构造: 文本 + 可选动作 + 分组因果 mask ----------
+        # 把原始文本特征(通常来自 T5 / UMT5)投影到 hidden_dim
         context = self.text_embedding(context) # (B, L, dim)
-        context_len = context.shape[1]
+        context_len = context.shape[1]         # 文本 token 数(已过 text embed,不是原始字符长度)
+
+        # ---- 情形 A: 有动作输入(action-conditioned + action 不为空) ----
         if self.action_conditioned and action is not None:
+            # 取动作序列长度,经过 self.action_embedding(通常是一个 MLP)把动作投影到 hidden_dim
             action_len = action.shape[1]
             action_emb = self.action_embedding(action) # (B, action_len, dim)
-            action_pos_embed = sinusoidal_embedding_1d(self.hidden_dim, 
+            # 给每个动作 token 加 1D 正弦位置编码
+            # 让模型区分"第几个动作"以及捕捉动作序列内部的时序关系
+            # unsqueeze(0) 把 (action_len, dim) -> (1, action_len, dim) 以便 broadcast 加到 batch 维
+            action_pos_embed = sinusoidal_embedding_1d(self.hidden_dim,
                 torch.arange(action_len, device=action_emb.device)) # (action_len, dim)
             action_emb = action_emb + action_pos_embed.unsqueeze(0) # (B, action_len, dim)
+            # 把动作 token 拼到文本 token 之后
+            # 后续跨注意力的 key/value 序列就是"前 L 个文本 + 后 action_len 个动作"
             context = torch.cat([context, action_emb], dim=1) # (B, context_len + action_len, dim)
 
-            # new mask
+            # ---- 构造"分组因果 mask" ----
+            # 关键设计: 把 patch 化后的视频分成 f 段,对应原始 T 个 latent 帧
+            # 第 0 帧是干净条件帧(由 token_timesteps[:, 0, :] = 0 标记),不参与动作交叉注意力
+            # 因此"需要看动作"的时间组数 = f - 1
             num_temporal_groups = f - 1 # first latent frame do not attend to actions
+            # 必须至少有 2 个 latent 帧(1 条件 + 至少 1 生成),否则提供 action 没有意义
             if num_temporal_groups <= 0:
                 raise ValueError(
                     "Action-conditioned context mask requires at least 2 latent frames when `action` is provided."
                 )
+            # 约束: 总动作 token 数必须能被"生成帧数 f-1"整除
+            # 即每个生成帧平均分配到相同数量的动作 token
+            # 例: f=4(1 条件 + 3 生成), action_len=30 -> 每生成帧 10 个动作 token
             assert action_emb.shape[1] % num_temporal_groups == 0, \
                 f"Action embedding length {action_emb.shape[1]} must be divisible by number of temporal groups {num_temporal_groups}"
-            # Each latent frame (from the 2nd one) attends to the corresponding group of action tokens
+            # 调用工厂函数 create_group_causal_attn_mask(64-144 行)生成布尔 mask
+            # 形状: (num_temporal_groups * tokens_per_frame, num_temporal_groups * key_per_group)
+            #     = ((f-1)*tokens_per_frame, action_len)
+            # 两种 mode:
+            #   "causal": 第 i 帧所有 patch query 可 attend 第 0..i 帧对应组的所有动作 key(时间因果)
+            #   "group_diagonal": 第 i 帧 query 只能 attend 第 i 帧对应组的那一小段动作 key(严格 1-to-1)
             action_group_mask = create_group_causal_attn_mask(
                 num_temporal_groups=num_temporal_groups,
                 num_query_per_group=tokens_per_frame,
@@ -581,41 +643,85 @@ class WanVideoDiT(torch.nn.Module):
                 mode=self.action_group_causal_mask_mode,
             ).to(context.device) # ((f-1)*tokens_per_frame, action_len)
 
+            # ---- 拼装最终 mask ----
+            # seq_len = patch 化后所有视频 token 数 = f * h * w
             seq_len = f * h * w # query length
+            # 初始化全 False 的三维 bool mask,形状 (B, seq_len, L + action_len)
+            #   维度 1 (query): 视频 token 序列
+            #   维度 2 (key):   文本 + 动作 token 序列
+            #   False = 不可 attend, True = 可 attend
             final_context_mask = torch.zeros((batch_size, seq_len, context.shape[1]), dtype=torch.bool, device=context.device) # (B, seq_len, L + action_len)
-            # all latent frames attend to text tokens
+            # 文本部分: 每个视频 token(含第 0 条件帧)都可 attend 文本,沿用原 context_mask
+            # unsqueeze(1) 把 (B, L) -> (B, 1, L), 再 expand 到 (B, seq_len, L)
+            # 写入 mask 的前 context_len 列(即"文本段"对应的 key 列)
             final_context_mask[:, :, :context_len] = context_mask.unsqueeze(1).expand(-1, seq_len, -1) # (B, seq_len, L)
-            # latent frames from the 2nd one attend to action tokens
+            # 动作部分: 只让第 1..f-1 帧(query 索引 tokens_per_frame 到 seq_len)attend 动作
+            # [:, tokens_per_frame:, :] 切片跳过第 0 帧的 tokens_per_frame 个 query token
+            # 写入 mask 的后 action_len 列(即"动作段"对应的 key 列)
+            # 第 0 帧 query 在动作段上保持 False(由全 0 初始化),符合"条件帧不与动作耦合"的设计
             final_context_mask[:, tokens_per_frame:, context_len:] = action_group_mask.unsqueeze(0).expand(batch_size, -1, -1) # (B, seq_len, action_len)
+            # 用新 mask 替换原 context_mask,供后续 CrossAttention 使用
             context_mask = final_context_mask
+
+        # ---- 情形 B: action-conditioned 但没给 action(单帧文本模式) ----
         elif self.action_conditioned and action is None:
+            # 仅在单 latent 帧模式下允许"无动作"推理(等价于纯文本 -> 单帧图像生成)
+            # f != 1 时拒绝: 多帧生成无动作无意义(模型没学过该分布)
             if f != 1:
                 raise ValueError(
                     "Action-conditioned model requires `action` unless running single-frame text-only mode with num_latent_frames=1."
                 )
-            context_mask = context_mask.unsqueeze(1).expand(-1, f * h * w, -1) # (B, seq_len, L)
-        else:
+            # mask 形状 (B, 1, L) -> expand 成 (B, seq_len, L),让所有视频 token attend 文本
             context_mask = context_mask.unsqueeze(1).expand(-1, f * h * w, -1) # (B, seq_len, L)
 
+        # ---- 情形 C: 非 action-conditioned(纯文生视频) ----
+        else:
+            # 标准文生视频路径,直接把 (B, L) 广播成 (B, seq_len, L),无动作参与
+            context_mask = context_mask.unsqueeze(1).expand(-1, f * h * w, -1) # (B, seq_len, L)
+
+        # ---------- 5) 重排 video tokens 为 Transformer 期望的序列形式 ----------
+        # patchify 后的 x 形状 (B, hidden_dim, f, h, w)
+        # 重排为 (B, f*h*w, hidden_dim),即 Transformer 标准的 (B, seq_len, dim)
+        # .contiguous() 保证内存连续,后续 attention/linear 算子不会因 stride 异常回退到慢路径
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 
+        # ---------- 6) 构造 3D RoPE 频率表 ----------
+        # self.freqs 是在 DiT 构造时预计算好的 3 组 1D RoPE 频率(complex 张量)
+        # 分别对应 T/H/W 三轴(由 precompute_freqs_cis_3d 生成,见 38-52 行)
+        # 取各自的前 f/h/w 个位置(因为当前 batch 的网格可能比预计算的最大长度小)
         freqs = torch.cat([
+            # T 轴: (f, 1, 1, d_t) -> (f, h, w, d_t),T 轴频率在 (h, w) 上复制
             self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            # H 轴: (1, h, 1, d_h) -> (f, h, w, d_h),H 轴频率在 (f, w) 上复制
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            # W 轴: (1, 1, w, d_w) -> (f, h, w, d_w),W 轴频率在 (f, h) 上复制
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x_tokens.device)
+        # cat 后形状 (f, h, w, d_t + d_h + d_w),即"全网格 RoPE 频率表"
+        # reshape(f*h*w, 1, -1) 拉平为 token 序列形式
+        # 前缀维度 1 用于后续 rope_apply 的 broadcast 到多头
+        # .to(x_tokens.device) 把频率张量搬到和 video tokens 同一设备
+        # (初始化时可能落在 CPU 上)
 
+        # ---------- 7) 返回 pre_state ----------
+        # 字典中的所有 key 都会在 forward 的主循环(628-666 行)里被消费:
+        #   tokens         -> self-attention 的 QKV 输入
+        #   freqs          -> SelfAttention 中通过 rope_apply 应用到 Q/K
+        #   t_mod          -> 在每个 WanAttentionBlock 里被拆成 6 份,做 adaLN 调制
+        #   context + mask -> 喂给 CrossAttention
+        #   meta.grid_size -> 用于 post_dit 的 unpatchify
+        #   meta.tokens_per_frame -> 用于 build_video_to_video_mask(self-attn 的时序 mask)
         return {
-            "tokens": x_tokens,
-            "freqs": freqs,
-            "t": t,
-            "t_mod": t_mod,
-            "context": context,
-            "context_mask": context_mask,
+            "tokens": x_tokens,            # (B, f*h*w, hidden_dim)         patch 化后的视频序列
+            "freqs": freqs,                # (f*h*w, 1, rope_dim)            3D RoPE 频率
+            "t": t,                        # (B, f*h*w, hidden_dim)          逐 token 的时间嵌入
+            "t_mod": t_mod,                # (B, f*h*w, 6, hidden_dim)       adaln-zero 6 组调制向量
+            "context": context,            # (B, L+action_len, hidden_dim)   文本(+动作)条件序列
+            "context_mask": context_mask,  # (B, f*h*w, L+action_len)        跨注意力 mask
             "meta": {
-                "grid_size": (f, h, w),
-                "tokens_per_frame": tokens_per_frame,
-                "batch_size": batch_size,
+                "grid_size": (f, h, w),    # patch 网格,供 post_dit unpatchify 使用
+                "tokens_per_frame": tokens_per_frame,  # 每帧 patch 数,供 video self-attn mask 使用
+                "batch_size": batch_size,  # 批大小,便于 debug / reshape
             },
         }
 
