@@ -112,11 +112,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.lerobot_dataset)
 
-    def _get(self, idx):
+    def _get(self, idx, *, strict: bool = False):
         sample_idx = idx
         sample = None
-        for attempt in range(self.max_padding_retry + 1):
-            sample = self.lerobot_dataset[sample_idx]
+        retries = 0 if strict else self.max_padding_retry
+        for attempt in range(retries + 1):
+            sample = (
+                self.lerobot_dataset.get_strict(sample_idx)
+                if strict
+                else self.lerobot_dataset[sample_idx]
+            )
 
             if not self.skip_padding_as_possible:
                 break
@@ -132,7 +137,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if bool(proprio_is_pad.any().item()):
                 has_pad = True
 
-            if not has_pad or attempt >= self.max_padding_retry:
+            if not has_pad or attempt >= retries:
                 break
 
             sample_idx = np.random.randint(len(self.lerobot_dataset))
@@ -231,6 +236,12 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        # Preserve grouping metadata for leakage-free oracle train/val splits.
+        for key in ("dataset_index", "episode_index", "task_index"):
+            if key in sample:
+                value = torch.as_tensor(sample[key]).reshape(-1)
+                if value.numel() > 0:
+                    data[key] = value[0].long()
         return data
 
     def _get_cached_text_context(self, prompt: str):
@@ -277,3 +288,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             random_idx = np.random.randint(len(self))
             data = self._get(random_idx)
         return data
+
+    def get_strict(self, idx):
+        """Return exactly ``idx`` or raise; never substitute another record."""
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds {len(self)}.")
+        return self._get(idx, strict=True)

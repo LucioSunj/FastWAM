@@ -1,13 +1,4 @@
-"""Milestone-3 tests: self-supervised oracle mode labels (fastwam side).
-
-Pure logic, no Wan weights / GPU: error reduction + cheapest-sufficient label
-selection + offline relabeling + shard IO, and `compute_mode_step_errors`
-exercised with a stub adapter whose per-mode action offsets are known.
-
-Run:
-    cd FastWAM
-    pytest tests/test_gate_oracle.py -v
-"""
+"""Binary oracle semantics, shared text features and strict shard IO."""
 from __future__ import annotations
 
 import pytest
@@ -15,284 +6,266 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from fastwam.adaptive_gate import (  # noqa: E402
-    FULL_INDEX,
+    IDM_INDEX,
     MODE_ORDER,
     NUM_MODES,
     SHARD_DATA_KEYS,
+    EncodedWorldState,
     chunk_errors_from_steps,
+    all_mode_errors_finite,
+    compose_group_id,
     coerce_mode,
     compute_mode_step_errors,
     label_distribution,
     load_label_shards,
     per_step_errors,
+    pool_text_context,
+    quality_metadata,
     relabel_from_steps,
     resolve_shard_paths,
-    select_cheapest_sufficient,
+    select_cheapest_near_best,
     write_label_shard,
 )
 
 
-# ======================================================================== #
-# error reduction
-# ======================================================================== #
-def test_per_step_errors_known_values():
+def test_text_pooling_is_masked_deterministic_and_batched():
+    context = torch.arange(2 * 4 * 8, dtype=torch.float32).reshape(2, 4, 8)
+    mask = torch.tensor([[1, 1, 0, 0], [0, 1, 1, 1]], dtype=torch.bool)
+    out = pool_text_context(context, mask, output_dim=4)
+    assert out.shape == (2, 4) and out.dtype == torch.float32
+    assert torch.equal(out, pool_text_context(context, mask, output_dim=4))
+    changed = context.clone()
+    changed[0, 2:] = 1e6
+    assert torch.equal(out[0], pool_text_context(changed, mask, output_dim=4)[0])
+    with pytest.raises(ValueError):
+        pool_text_context(context, torch.zeros_like(mask))
+
+
+def test_per_step_and_chunk_errors():
     pred = torch.tensor([[1.0, 1.0], [2.0, 0.0]])
-    gt = torch.tensor([[0.0, 0.0], [0.0, 0.0]])
+    gt = torch.zeros_like(pred)
     l1, l2 = per_step_errors(pred, gt)
     assert torch.allclose(l1, torch.tensor([1.0, 1.0]))
-    assert torch.allclose(l2, torch.tensor([1.0, (4.0 / 2) ** 0.5]))
-    with pytest.raises(ValueError):
-        per_step_errors(pred, gt[:1])
+    assert torch.allclose(l2, torch.tensor([1.0, 2.0**0.5]))
 
-
-def test_chunk_errors_masking_and_exec_horizon():
-    # 3 modes x 4 steps; mode i has constant error i+1
-    step = torch.stack([torch.full((4,), float(i + 1)) for i in range(NUM_MODES)])
-    valid = torch.tensor([True, True, True, False])
-    chunk, has_valid = chunk_errors_from_steps(step, valid)
-    assert bool(has_valid)
-    assert torch.allclose(chunk, torch.tensor([1.0, 2.0, 3.0]))
-
-    # exec_horizon truncates *before* the mask mean
-    step2 = step.clone()
-    step2[:, 2:] = 100.0
-    chunk2, _ = chunk_errors_from_steps(step2, torch.ones(4, dtype=torch.bool), exec_horizon=2)
-    assert torch.allclose(chunk2, torch.tensor([1.0, 2.0, 3.0]))
-
-    # empty window -> +inf and has_valid False
-    chunk3, has_valid3 = chunk_errors_from_steps(step, torch.zeros(4, dtype=torch.bool))
-    assert not bool(has_valid3)
-    assert torch.isinf(chunk3).all()
-
-    with pytest.raises(ValueError):
-        chunk_errors_from_steps(step, valid, exec_horizon=0)
-    with pytest.raises(ValueError):
-        chunk_errors_from_steps(step[:2], valid)  # wrong mode dim
-
-
-def test_chunk_errors_batched():
-    step = torch.rand(5, NUM_MODES, 8)
-    valid = torch.ones(5, 8, dtype=torch.bool)
-    valid[3] = False
-    chunk, has_valid = chunk_errors_from_steps(step, valid)
-    assert chunk.shape == (5, NUM_MODES)
-    assert has_valid.tolist() == [True, True, True, False, True]
-    assert torch.isinf(chunk[3]).all()
-    assert torch.allclose(chunk[0], step[0].mean(dim=-1))
-
-
-# ======================================================================== #
-# cheapest-sufficient selection
-# ======================================================================== #
-def test_select_cheapest_sufficient_semantics():
-    # err(FULL)=0.05; thresholds pick out each mode
-    err = torch.tensor([0.30, 0.10, 0.05])
-    assert select_cheapest_sufficient(err, tol_abs=0.0, tol_rel=0.0).item() == FULL_INDEX
-    assert select_cheapest_sufficient(err, tol_abs=0.06, tol_rel=0.0).item() == 1  # LATENT
-    assert select_cheapest_sufficient(err, tol_abs=0.30, tol_rel=0.0).item() == 0  # SKIP
-    # relative tolerance: thr = 0.05 * 3 = 0.15 -> LATENT
-    assert select_cheapest_sufficient(err, tol_abs=0.0, tol_rel=2.0).item() == 1
-
-
-def test_select_skip_can_beat_full():
-    # stochastic inference can make SKIP strictly better than FULL
-    err = torch.tensor([0.01, 0.20, 0.05])
-    assert select_cheapest_sufficient(err).item() == 0
-
-
-def test_select_batched_and_invalid_rows():
-    err = torch.tensor([
-        [0.30, 0.10, 0.05],
-        [float("inf"), float("inf"), float("inf")],  # empty mask row -> FULL
-    ])
-    labels = select_cheapest_sufficient(err, tol_abs=0.06)
-    assert labels.tolist() == [1, FULL_INDEX]
-
-
-def test_select_rejects_negative_tolerance_and_bad_shape():
-    err = torch.tensor([0.3, 0.2, 0.1])
-    with pytest.raises(ValueError):
-        select_cheapest_sufficient(err, tol_abs=-0.1)
-    with pytest.raises(ValueError):
-        select_cheapest_sufficient(err, tol_rel=-0.1)
-    with pytest.raises(ValueError):
-        select_cheapest_sufficient(err[:2])
-
-
-def test_relabel_from_steps_matches_composition():
-    n, t = 6, 8
-    step_l1 = torch.rand(n, NUM_MODES, t)
-    step_l2 = torch.rand(n, NUM_MODES, t)
-    valid = torch.rand(n, t) > 0.2
-    labels, chunk, has_valid = relabel_from_steps(
-        step_l1, step_l2, valid, metric="l2", exec_horizon=4, tol_abs=0.05
+    step = torch.tensor([[1.0, 1.0, 9.0], [2.0, 2.0, 9.0]])
+    chunk, valid = chunk_errors_from_steps(
+        step, torch.ones(3, dtype=torch.bool), exec_horizon=2
     )
-    chunk_ref, has_valid_ref = chunk_errors_from_steps(step_l2, valid, exec_horizon=4)
-    assert torch.equal(chunk, chunk_ref)
-    assert torch.equal(has_valid, has_valid_ref)
-    assert torch.equal(labels, select_cheapest_sufficient(chunk_ref, tol_abs=0.05))
-    with pytest.raises(ValueError):
-        relabel_from_steps(step_l1, step_l2, valid, metric="mse")
+    assert bool(valid)
+    assert torch.allclose(chunk, torch.tensor([1.0, 2.0]))
+    empty, valid = chunk_errors_from_steps(step, torch.zeros(3, dtype=torch.bool))
+    assert not bool(valid) and torch.isinf(empty).all()
 
 
-def test_label_distribution():
-    labels = torch.tensor([0, 0, 1, 2])
-    dist = label_distribution(labels)
-    assert dist == pytest.approx({"skip": 0.5, "latent": 0.25, "full": 0.25})
+def test_near_best_not_idm_relative():
+    # IDM is worse: UNCOND is correctly selected even with zero tolerance.
+    assert select_cheapest_near_best(torch.tensor([0.10, 0.50])).item() == 0
+    # IDM is best by more than tolerance.
+    assert select_cheapest_near_best(torch.tensor([0.30, 0.10]), tol_abs=0.05).item() == IDM_INDEX
+    # UNCOND becomes near-best and wins on compute.
+    assert select_cheapest_near_best(torch.tensor([0.30, 0.10]), tol_abs=0.21).item() == 0
+    # Measured costs, rather than categorical position, drive cheapest selection.
+    label = select_cheapest_near_best(
+        torch.tensor([0.10, 0.10]), costs=torch.tensor([2.0, 1.0])
+    )
+    assert label.item() == IDM_INDEX
+    invalid = select_cheapest_near_best(torch.tensor([float("inf"), float("nan")]))
+    assert invalid.item() == IDM_INDEX
 
 
-# ======================================================================== #
-# compute_mode_step_errors with a stub adapter
-# ======================================================================== #
+def test_quality_metadata_exposes_bad_idm_reference():
+    quality = quality_metadata(torch.tensor([[0.1, 0.6], [0.3, 0.2]]))
+    assert torch.allclose(quality["best_err"], torch.tensor([0.1, 0.2]))
+    assert torch.allclose(quality["idm_err"], torch.tensor([0.6, 0.2]))
+    assert torch.allclose(quality["idm_regret"], torch.tensor([0.5, 0.0]))
+    invalid = quality_metadata(torch.tensor([[float("inf"), float("inf")]]))
+    assert torch.isinf(invalid["idm_regret"]).all()
+    assert not torch.isnan(invalid["idm_regret"]).any()
+    assert all_mode_errors_finite(torch.zeros(2, 3))
+    assert not all_mode_errors_finite(torch.tensor([0.0, float("nan")]))
+
+
+def test_group_id_includes_dataset_identity():
+    assert compose_group_id(0, 7) != compose_group_id(1, 7)
+    assert compose_group_id(torch.tensor([2]), torch.tensor([9])) == (2 << 32) | 9
+    assert compose_group_id(-1, 9) == -1
+
+
+def test_relabel_from_steps():
+    step_l1 = torch.tensor([[[0.3, 0.3], [0.1, 0.1]]])
+    step_l2 = step_l1 + 0.1
+    labels, chunk, valid = relabel_from_steps(
+        step_l1, step_l2, torch.ones(1, 2, dtype=torch.bool), tol_abs=0.05
+    )
+    assert labels.tolist() == [IDM_INDEX]
+    assert chunk.shape == (1, NUM_MODES) and valid.tolist() == [True]
+    assert label_distribution(torch.tensor([0, 0, 1])) == pytest.approx(
+        {"uncond": 2 / 3, "idm": 1 / 3}
+    )
+
+
 class _OracleStubAdapter:
-    """Per-mode constant action offsets -> exactly known per-step L1 errors."""
+    OFFSETS = {"uncond": 0.30, "idm": 0.05}
+    COSTS = {"uncond": 0.2, "idm": 1.0}
 
-    OFFSETS = {"skip": 0.30, "latent": 0.10, "full": 0.05}
-    COSTS = {"skip": 0.1, "latent": 0.4, "full": 1.0}
-
-    def __init__(self, seed_jitter: float = 0.0):
-        self.seed_jitter = seed_jitter
+    def __init__(self):
         self.encode_calls = 0
-        self.act_calls: list[tuple[str, int]] = []
+        self.calls = []
 
-    def encode_world_feat(self, input_image):
+    def encode_world_state(self, image):
         self.encode_calls += 1
-        return torch.ones(6)
+        return EncodedWorldState(torch.ones(10), torch.ones(1, 2, 1, 2, 2))
 
-    def act(self, *, input_image, mode, proprio=None, context=None, context_mask=None,
-            prompt=None, action_horizon=None, world_feat=None, seed=None, **kw):
+    def act(
+        self,
+        *,
+        mode,
+        generation_horizon,
+        encoded_state,
+        seed,
+        **kwargs,
+    ):
         mode = coerce_mode(mode)
-        self.act_calls.append((mode.value, int(seed)))
-        offset = self.OFFSETS[mode.value] + self.seed_jitter * int(seed)
-        chunk = torch.zeros(int(action_horizon), 7) + offset
-        return {"action_chunk": chunk, "world_feat": world_feat,
-                "cost": self.COSTS[mode.value], "aux": {"mode": mode.value}}
+        self.calls.append((mode.value, int(seed), encoded_state))
+        return {
+            "action_chunk": torch.full((generation_horizon, 7), self.OFFSETS[mode.value]),
+            "world_feat": encoded_state.world_feat,
+            "cost": self.COSTS[mode.value],
+        }
 
 
-def _state(horizon=4):
-    return dict(
+def test_compute_mode_errors_pairs_seeds_and_reuses_encoding():
+    adapter = _OracleStubAdapter()
+    context = torch.randn(1, 8, 32)
+    out = compute_mode_step_errors(
+        adapter,
         input_image=torch.rand(1, 3, 16, 16),
-        gt_action=torch.zeros(horizon, 7),
-        proprio=torch.randn(1, 5),
-        context=torch.randn(1, 8, 32),
+        gt_action=torch.zeros(4, 7),
+        context=context,
         context_mask=torch.ones(1, 8, dtype=torch.bool),
+        seeds=(3, 4),
     )
-
-
-def test_compute_mode_step_errors_known_offsets():
-    adapter = _OracleStubAdapter()
-    out = compute_mode_step_errors(adapter, seeds=(0,), **_state())
-    assert out["step_l1"].shape == (NUM_MODES, 4)
-    for i, mode in enumerate(MODE_ORDER):
-        assert torch.allclose(out["step_l1"][i], torch.full((4,), adapter.OFFSETS[mode.value]))
-        assert out["costs"][i].item() == pytest.approx(adapter.COSTS[mode.value])
-    # constant offsets: L2 over the action dim == L1
-    assert torch.allclose(out["step_l1"], out["step_l2"])
-    # world_feat encoded exactly once and reused for every mode call
     assert adapter.encode_calls == 1
-    assert out["world_feat"].shape == (6,)
-
-
-def test_compute_mode_step_errors_pairs_seeds_across_modes():
-    adapter = _OracleStubAdapter(seed_jitter=0.01)
-    out = compute_mode_step_errors(adapter, seeds=(3, 4), **_state())
-    # every mode sees the SAME seed list (paired comparison)
+    assert out["world_feat"].shape == (10,)
+    assert out["text_feat"].shape == (64,)
+    assert out["step_l1"].shape == (2, 4)
     for mode in MODE_ORDER:
-        assert [s for m, s in adapter.act_calls if m == mode.value] == [3, 4]
-    # per-seed errors are averaged: offset + jitter * mean(seeds)
-    expected = _OracleStubAdapter.OFFSETS["skip"] + 0.01 * 3.5
-    assert torch.allclose(out["step_l1"][0], torch.full((4,), expected), atol=1e-6)
+        assert [seed for name, seed, _ in adapter.calls if name == mode.value] == [3, 4]
+    assert len({id(state) for _, _, state in adapter.calls}) == 1
 
 
-def test_compute_mode_step_errors_validates_inputs():
-    adapter = _OracleStubAdapter()
-    state = _state()
-    with pytest.raises(ValueError):
-        compute_mode_step_errors(adapter, seeds=(), **state)
-    state["gt_action"] = torch.zeros(4)
-    with pytest.raises(ValueError):
-        compute_mode_step_errors(adapter, seeds=(0,), **state)
+def _meta(**overrides):
+    base = {
+        "task": "libero",
+        "backbone_kind": "idm",
+        "ckpt_fingerprint": "ckpt-sha",
+        "ckpt_file_sha256": "ckpt-file-sha",
+        "dataset_stats_fingerprint": "stats-sha",
+        "num_video_frames": 9,
+        "inference_steps": 20,
+        "context_len": 128,
+        "model_dtype": "torch.bfloat16",
+        "cost_table": {"uncond": 0.2, "idm": 1.0},
+        "metric": "l1",
+        "exec_horizon": 10,
+        "tol_rel": 0.1,
+        "tol_abs": 0.02,
+        "num_seeds": 1,
+        "seed_base": 0,
+        "stride": 20,
+        "skip_padded": False,
+        "max_samples": None,
+        "num_shards": 1,
+        "shard_index": 0,
+        "world_feat_layout": "spatial_2x2_plus_channel_std_v1",
+        "world_feat_dim": 10,
+        "text_feat_dim": 64,
+        "text_feat_layout": "masked_mean_adaptive_avg_pool_v1",
+        "proprio_dim": 5,
+        "action_horizon": 4,
+        "group_id_layout": "dataset_index_u31_episode_index_u32_v1",
+    }
+    return {**base, **overrides}
 
 
-def test_oracle_end_to_end_with_stub():
-    """stub errors (skip .30 / latent .10 / full .05) + tol_abs=.06 -> LATENT."""
-    adapter = _OracleStubAdapter()
-    state = _state()
-    out = compute_mode_step_errors(adapter, seeds=(0,), **state)
-    valid = torch.ones(4, dtype=torch.bool)
-    chunk, has_valid = chunk_errors_from_steps(out["step_l1"], valid)
-    assert bool(has_valid)
-    assert select_cheapest_sufficient(chunk, tol_abs=0.06).item() == 1
-
-
-# ======================================================================== #
-# shard IO
-# ======================================================================== #
-def _shard_data(n=4, z=6, p=5, t=4):
+def _shard_data(n=3, t=4):
+    chunk = torch.rand(n, 2)
+    quality = quality_metadata(chunk)
     return {
-        "world_feat": torch.rand(n, z),
-        "proprio": torch.rand(n, p),
-        "label": torch.randint(0, NUM_MODES, (n,)),
-        "chunk_err": torch.rand(n, NUM_MODES),
-        "step_l1": torch.rand(n, NUM_MODES, t),
-        "step_l2": torch.rand(n, NUM_MODES, t),
+        "world_feat": torch.randn(n, 10),
+        "text_feat": torch.randn(n, 64),
+        "proprio": torch.randn(n, 5),
+        "label": torch.randint(0, 2, (n,)),
+        "chunk_err": chunk,
+        "step_l1": torch.rand(n, 2, t),
+        "step_l2": torch.rand(n, 2, t),
         "valid_steps": torch.ones(n, t, dtype=torch.bool),
         "sample_idx": torch.arange(n),
+        "group_id": torch.arange(n),
+        **quality,
     }
 
 
-def test_shard_roundtrip_and_concat(tmp_path):
-    d1, d2 = _shard_data(n=4), _shard_data(n=3)
-    write_label_shard(str(tmp_path / "shard_0_of_2.pt"), data=d1, meta={"task": "t", "tol_abs": 0.02})
-    write_label_shard(str(tmp_path / "shard_1_of_2.pt"), data=d2, meta={"task": "t", "tol_abs": 0.02})
-    data, meta = load_label_shards(str(tmp_path / "shard_*.pt"))
-    assert set(SHARD_DATA_KEYS) <= set(data)
-    assert data["label"].shape == (7,)
-    assert torch.equal(data["world_feat"][:4], d1["world_feat"])
-    assert torch.equal(data["world_feat"][4:], d2["world_feat"])
+def test_shard_roundtrip_and_strict_fingerprint(tmp_path):
+    a, b = tmp_path / "a.pt", tmp_path / "b.pt"
+    write_label_shard(str(a), data=_shard_data(2), meta=_meta(num_shards=2, shard_index=0))
+    write_label_shard(str(b), data=_shard_data(3), meta=_meta(num_shards=2, shard_index=1))
+    data, meta = load_label_shards([str(a), str(b)])
+    assert set(data) == set(SHARD_DATA_KEYS)
+    assert data["label"].shape == (5,)
+    assert meta["mode_order"] == ["uncond", "idm"]
     assert meta["num_shards"] == 2
-    assert meta["num_samples"] == 7
-    assert meta["mode_order"] == [m.value for m in MODE_ORDER]
+
+    incompatible = tmp_path / "other.pt"
+    write_label_shard(
+        str(incompatible), data=_shard_data(1),
+        meta=_meta(task="robotwin", num_shards=2, shard_index=1),
+    )
+    with pytest.raises(ValueError, match="fingerprint"):
+        load_label_shards([str(a), str(incompatible)])
+
+    payload = torch.load(a, weights_only=False)
+    payload["meta"]["tol_abs"] = 999
+    tampered = tmp_path / "tampered.pt"
+    torch.save(payload, tampered)
+    with pytest.raises(ValueError, match="stale"):
+        load_label_shards(str(tampered))
+
+    payload = torch.load(a, weights_only=False)
+    payload["data"]["text_feat"][0, 0] = float("inf")
+    corrupted = tmp_path / "corrupted.pt"
+    torch.save(payload, corrupted)
+    with pytest.raises(ValueError, match="non-finite"):
+        load_label_shards(str(corrupted), allow_partial=True)
+
+    with pytest.raises(ValueError, match="incomplete"):
+        load_label_shards(str(a))
+    partial, partial_meta = load_label_shards(str(a), allow_partial=True)
+    assert partial["label"].shape == (2,) and partial_meta["num_loaded_shards"] == 1
 
 
-def test_shard_write_validates(tmp_path):
+def test_shard_loader_rejects_duplicate_indices(tmp_path):
+    for name in ("a.pt", "b.pt"):
+        write_label_shard(
+            str(tmp_path / name), data=_shard_data(1),
+            meta=_meta(num_shards=2, shard_index=0),
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        load_label_shards(str(tmp_path / "*.pt"), allow_partial=True)
+
+
+def test_shard_validation_and_path_resolution(tmp_path):
     data = _shard_data()
-    bad = {k: v for k, v in data.items() if k != "label"}
+    data.pop("text_feat")
     with pytest.raises(ValueError):
-        write_label_shard(str(tmp_path / "x.pt"), data=bad, meta={})
-    data_bad = dict(data, label=torch.zeros(99, dtype=torch.long))
-    with pytest.raises(ValueError):
-        write_label_shard(str(tmp_path / "x.pt"), data=data_bad, meta={})
-
-
-def test_shard_load_rejects_incompatible(tmp_path):
-    write_label_shard(str(tmp_path / "a.pt"), data=_shard_data(t=4), meta={})
-    write_label_shard(str(tmp_path / "b.pt"), data=_shard_data(t=8), meta={})
-    with pytest.raises(ValueError):
-        load_label_shards([str(tmp_path / "a.pt"), str(tmp_path / "b.pt")])
-
-    # tampered mode_order must be rejected
-    payload = torch.load(str(tmp_path / "a.pt"), weights_only=False)
-    payload["meta"]["mode_order"] = ["full", "latent", "skip"]
-    torch.save(payload, str(tmp_path / "c.pt"))
-    with pytest.raises(ValueError):
-        load_label_shards(str(tmp_path / "c.pt"))
-
-    # wrong version must be rejected
-    payload = torch.load(str(tmp_path / "a.pt"), weights_only=False)
-    payload["version"] = 999
-    torch.save(payload, str(tmp_path / "d.pt"))
-    with pytest.raises(ValueError):
-        load_label_shards(str(tmp_path / "d.pt"))
-
-
-def test_resolve_shard_paths(tmp_path):
+        write_label_shard(str(tmp_path / "bad.pt"), data=data, meta=_meta())
     for name in ("s1.pt", "s0.pt"):
-        write_label_shard(str(tmp_path / name), data=_shard_data(n=2), meta={})
+        write_label_shard(str(tmp_path / name), data=_shard_data(), meta=_meta())
     paths = resolve_shard_paths(str(tmp_path / "s*.pt"))
-    assert [p.split("/")[-1] for p in paths] == ["s0.pt", "s1.pt"]  # sorted
-    # list of explicit paths + de-dupe
-    paths2 = resolve_shard_paths([str(tmp_path / "s0.pt"), str(tmp_path / "s0.pt")])
-    assert len(paths2) == 1
-    with pytest.raises(FileNotFoundError):
-        resolve_shard_paths(str(tmp_path / "nothing_*.pt"))
+    assert [path.split("/")[-1] for path in paths] == ["s0.pt", "s1.pt"]
+
+    nonfinite = _shard_data()
+    nonfinite["world_feat"][0, 0] = float("nan")
+    with pytest.raises(ValueError, match="non-finite"):
+        write_label_shard(str(tmp_path / "nonfinite.pt"), data=nonfinite, meta=_meta())

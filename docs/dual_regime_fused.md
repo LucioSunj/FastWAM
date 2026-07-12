@@ -111,25 +111,24 @@ two smaller squares, ~+4%), which is negligible against the FFN savings.
 
 Model configs: `configs/model/fastwam_dual_regime_fused[_joint].yaml`
 (identical to the metric-adaptive ones except `_target_` and the `train:`
-block — `share_inputs` no longer exists; `action_regime_weight_base` keeps its
-meaning and default).
+block — `share_inputs` no longer exists; use
+`action_regime_weight_uncond`, default 1.0).
 
 Task configs: `{libero,robotwin}_dual_regime_fused[_joint]_*` mirror the
 metric-adaptive task configs.
 
 ```bash
 cd FastWAM
-python scripts/precompute_text_embeds.py task=libero_dual_regime_fused_joint_2cam224_1e-4
-bash scripts/train_zero1.sh 8 task=libero_dual_regime_fused_joint_2cam224_1e-4
+python scripts/precompute_text_embeds.py task=libero_dual_regime_fused_2cam224_1e-4
+bash scripts/train_zero1.sh 8 task=libero_dual_regime_fused_2cam224_1e-4
 ```
 
-Loss-dict keys match the inherited implementation (`loss_video`,
-`loss_action_joint`/`loss_action_idm`, `loss_action_base`), so W&B curves stay
-comparable across the two implementations.
+Loss dictionaries report `loss_video`, the normalized main-regime contribution,
+`loss_action_uncond`, and `loss_action_combined`.
 
 For the adaptive gate (RLinf workstream), point the gate config's `wam.task`
-at the fused task name; `backbone_kind` semantics are unchanged
-(joint variant ↔ `joint`, idm variant ↔ `idm`).
+at the fused IDM task and set `backbone_kind=idm`. Joint classes remain training
+ablations but are not choices exposed by the adaptive gate.
 
 ## Constraints
 
@@ -138,9 +137,9 @@ at the fused task name; `backbone_kind` semantics are unchanged
   that isolates first-frame rows (`first_frame_causal` or `per_frame_causal`).
   Violations raise immediately with a pointed message — the exactness of the
   base-regime replica depends on them, and the guard checks the actual mask,
-  not the mode string.
-- `action_regime_weight_base=0` removes the base term from the objective but
-  (as in the inherited implementation) still computes the base draft.
+  not the mode string. Temporal `patch_size[0]` must also equal 1 and is checked.
+- Model factories reject `action_regime_weight_uncond<=0`; a checkpoint exposed
+  to the gate must actually have trained both regimes.
 
 ## Verification
 
@@ -158,11 +157,3 @@ parent-style separate forwards and asserts per-regime predictions match
 (bf16 tolerances; tighten after the first GPU run if headroom allows). Run
 this before any real training run, exactly as with the inherited
 implementation's gated tests.
-
-## Extension: more than two regimes
-
-`build_multi_regime_attention_mask` accepts K drafts with arbitrary video-column
-spans. A future LATENT-style regime (action conditioned on a partially-denoised
-future) is one more draft whose span points at an appropriately-noised cond
-block — for the idm variant, the existing cond branch (`video_cond_noise_prob`)
-already covers much of that distribution.

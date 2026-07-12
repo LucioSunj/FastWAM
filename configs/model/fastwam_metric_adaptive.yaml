@@ -63,29 +63,13 @@ train:
   #   - idm  regime: action conditions on the teacher-forced cond-video
   #   - base regime: action conditions on the clean first frame
   # The video-denoising loss is computed ONCE (in the idm forward only).
-  action_regime_weight_base: 1.0   # w_base; 1.0 = equal idm/base action weight
+  # The two action losses are normalized by (1 + w_uncond), preserving the
+  # original lambda_action-to-video scale.
+  action_regime_weight_uncond: 1.0
   share_inputs: true               # true = single VAE encode/step (recommended)
 
 adaptive:
   annotate_outputs: true
-  metric:
-    _target_: fastwam.routing.metrics.PolicyEntropyMetric
-    probe_branch: base
-    num_samples: 4
-    bandwidth: silverman
-    min_bandwidth: 1.0e-03
-    leave_one_out: true
-    reduction: mean
-    normalize_by_dim: true
-    seed_stride: 1009
-    # Optional: make entropy probing cheaper than the final selected branch.
-    # probe_overrides:
-    #   num_inference_steps: 8
-  selector:
-    _target_: fastwam.routing.metrics.ThresholdSelector
-    # Tune from logged `_routing.metric_value` on validation rollouts.
-    threshold: 0.0
-    low_branch: base
-    high_branch: idm
-    # High entropy means policy uncertainty, so choose IDM; low entropy uses base.
-    mode: ge
+  # The external GatePolicy is the only default router. The old entropy-probe
+  # router remains available only as an explicit legacy ablation.
+  allow_internal_routing: false

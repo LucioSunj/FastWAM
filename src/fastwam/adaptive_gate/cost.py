@@ -1,123 +1,150 @@
-"""Per-mode compute cost for the adaptive-prediction gate.
-
-The reward has a per-step compute penalty `-lambda * cost(mode)`, with
-`cost(FULL) = 1` by definition. `cost(mode)` is the RELATIVE compute of running
-the world-action model in that mode.
-
-DESIGN (what "cost" means; decision #6)
----------------------------------------
-"Compute" is best measured as FLOPs, because it is hardware-independent and is
-exactly the quantity the gate is meant to economize. The dominant *variable*
-cost across modes is the video-branch denoising loop: SKIP runs 0 video-denoise
-steps, LATENT runs `k_lo`, FULL runs `k_hi`. All modes share a roughly-fixed
-overhead (the single VAE encode + the action-denoising loop). So:
-
-    total(mode) ~= C_fixed + C_video_step * video_steps(mode)
-    cost(mode)   = total(mode) / total(FULL)            # normalized, cost(FULL)=1
-
-We provide cost in two ways:
-  1. MEASURED (preferred): `scripts/profile_wam_modes.py` runs each mode once with
-     a FLOP counter (and also times wall-clock), normalizes by FULL, and writes a
-     cost YAML. The reward then reads `source: flops` (or `latency`) from it.
-  2. ANALYTICAL FALLBACK: when no measured table exists, `default_cost_table`
-     approximates the formula above with a single `fixed_fraction` knob
-     (C_fixed / total(FULL)). This keeps everything runnable out-of-the-box; the
-     numbers are placeholders until profiling is run.
-
-Why not just wall-clock latency? Latency is hardware/implementation specific and
-noisier; we record it for reference but default the *reward* to FLOPs. Why not a
-flat per-step constant? Because LATENT genuinely costs less than FULL, and the
-gate should be able to prefer it — a flat constant would erase that signal.
-"""
+"""Validated per-mode compute costs for the binary adaptive gate."""
 from __future__ import annotations
 
+import math
 import os
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .modes import MODE_ORDER, WAMMode
 
 
+def validate_cost_table(table: Mapping[str, float]) -> dict[str, float]:
+    """Validate and canonicalize a normalized ``UNCOND``/``IDM`` table."""
+    expected = {m.value for m in MODE_ORDER}
+    missing = expected.difference(table)
+    extra = set(table).difference(expected)
+    if missing or extra:
+        raise ValueError(
+            f"cost table keys must be exactly {sorted(expected)}; "
+            f"missing={sorted(missing)}, extra={sorted(extra)}"
+        )
+    result = {m.value: float(table[m.value]) for m in MODE_ORDER}
+    for name, value in result.items():
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"cost({name}) must be finite and positive, got {value}.")
+    if not math.isclose(result[WAMMode.IDM.value], 1.0, rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError(
+            f"normalized cost(idm) must equal 1, got {result[WAMMode.IDM.value]}."
+        )
+    if result[WAMMode.UNCOND.value] >= result[WAMMode.IDM.value]:
+        raise ValueError(
+            "UNCOND must be cheaper than IDM; got "
+            f"{result[WAMMode.UNCOND.value]} >= {result[WAMMode.IDM.value]}."
+        )
+    return result
+
+
 def default_cost_table(
-    k_lo: int,
-    k_hi: int,
+    inference_steps: int = 20,
     *,
-    fixed_fraction: float = 0.15,
+    uncond_fraction: float = 0.15,
 ) -> dict[str, float]:
-    """Analytical fallback cost table (normalized so cost(FULL)=1).
+    """Analytical placeholder normalized to ``cost(IDM)=1``.
 
-    cost(mode) = fixed_fraction + (1 - fixed_fraction) * video_steps(mode) / k_hi
-    with video_steps = {SKIP: 0, LATENT: k_lo, FULL: k_hi}.
-
-    `fixed_fraction` ~= the share of FULL's compute that is NOT the video loop
-    (VAE encode + action denoising). It is a rough placeholder; run the profiler
-    to replace these with measured FLOPs.
-
-    # TODO(measure): replace the analytical default with measured FLOPs from
-    #   scripts/profile_wam_modes.py for the specific backbone / resolution / K.
+    ``inference_steps`` is validated and recorded by callers, but the ratio
+    cannot be inferred from step count alone because both modes run the full
+    action solver.  Profile the exact checkpoint/resolution for reward use.
     """
-    k_lo = int(k_lo)
-    k_hi = int(k_hi)
-    if k_hi <= 0:
-        raise ValueError(f"k_hi must be positive, got {k_hi}.")
-    if not 0.0 <= float(fixed_fraction) < 1.0:
-        raise ValueError(f"fixed_fraction must be in [0, 1), got {fixed_fraction}.")
-    var = 1.0 - float(fixed_fraction)
-    video_steps = {WAMMode.SKIP: 0, WAMMode.LATENT: k_lo, WAMMode.FULL: k_hi}
-    table = {
-        m.value: float(fixed_fraction) + var * (video_steps[m] / k_hi)
-        for m in MODE_ORDER
-    }
-    # cost(FULL) is exactly 1.0 by construction.
-    table[WAMMode.FULL.value] = 1.0
-    return table
+    if int(inference_steps) <= 0:
+        raise ValueError(f"inference_steps must be positive, got {inference_steps}.")
+    fraction = float(uncond_fraction)
+    return validate_cost_table({"uncond": fraction, "idm": 1.0})
 
 
-def normalize_cost_table(raw: dict[str, float]) -> dict[str, float]:
-    """Normalize a raw per-mode measure (FLOPs or latency) so cost(FULL)=1."""
-    full = float(raw[WAMMode.FULL.value])
-    if full <= 0:
-        raise ValueError("FULL-mode raw cost must be positive to normalize.")
-    return {m.value: float(raw[m.value]) / full for m in MODE_ORDER}
+def normalize_cost_table(raw: Mapping[str, float]) -> dict[str, float]:
+    """Normalize raw FLOPs/latency so ``cost(IDM)=1`` and validate it."""
+    expected = {m.value for m in MODE_ORDER}
+    missing = expected.difference(raw)
+    extra = set(raw).difference(expected)
+    if missing or extra:
+        raise ValueError(
+            f"raw cost keys must be exactly {sorted(expected)}; "
+            f"missing={sorted(missing)}, extra={sorted(extra)}"
+        )
+    idm = float(raw[WAMMode.IDM.value])
+    if not math.isfinite(idm) or idm <= 0.0:
+        raise ValueError("IDM raw cost must be finite and positive to normalize.")
+    return validate_cost_table({m.value: float(raw[m.value]) / idm for m in MODE_ORDER})
 
 
 def save_cost_table(
     path: str,
     *,
-    normalized: dict[str, float],
+    normalized: Mapping[str, float],
     source: str = "flops",
     raw: Optional[dict[str, dict[str, float]]] = None,
     meta: Optional[dict[str, Any]] = None,
 ) -> None:
-    """Write a cost YAML consumed by the reward / adapter."""
-    import yaml  # local import: only needed when actually profiling/writing
+    """Write a validated cost YAML consumed by the adapter/reward."""
+    import yaml
 
+    normalized = validate_cost_table(normalized)
     payload: dict[str, Any] = {
+        "version": 3,
         "source": str(source),
-        "modes": {k: float(v) for k, v in normalized.items()},
+        "mode_order": [m.value for m in MODE_ORDER],
+        "modes": normalized,
     }
     if raw is not None:
+        for raw_name, raw_table in raw.items():
+            normalize_cost_table(raw_table)
         payload["raw"] = raw
     if meta is not None:
         payload["meta"] = meta
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w") as handle:
+    with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
 
 
-def load_cost_table(path: Optional[str], *, source: Optional[str] = None) -> Optional[dict[str, float]]:
-    """Load a normalized per-mode cost table from a YAML written by the profiler.
+def load_cost_table(
+    path: Optional[str],
+    *,
+    source: Optional[str] = None,
+    return_meta: bool = False,
+):
+    """Load a cost YAML.
 
-    Returns None if `path` is None or missing (caller should fall back to
-    `default_cost_table`). `source` overrides which raw measure to normalize
-    ("flops" | "latency"); if None, uses the file's `modes` block as-is.
+    ``None`` means "use the analytical placeholder".  Supplying an invalid or
+    missing path is an error rather than a silent change in the RL objective.
+    ``source='latency'`` is accepted as an alias for the profiler key
+    ``latency_ms``.
     """
-    if not path or not os.path.isfile(path):
-        return None
+    if path is None:
+        return (None, None) if return_meta else None
+    expanded = os.path.expanduser(str(path))
+    if not os.path.isfile(expanded):
+        raise FileNotFoundError(f"cost table does not exist: {expanded}")
+
     import yaml
 
-    with open(path) as handle:
+    with open(expanded, encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
-    if source is not None and "raw" in payload and source in payload["raw"]:
-        return normalize_cost_table(payload["raw"][source])
-    modes = payload["modes"]
-    return {m.value: float(modes[m.value]) for m in MODE_ORDER}
+    if not isinstance(payload, dict):
+        raise ValueError(f"{expanded}: cost YAML must contain a mapping.")
+    if int(payload.get("version", -1)) != 3:
+        raise ValueError(
+            f"{expanded}: unsupported cost profile version {payload.get('version')!r}; expected 3."
+        )
+    expected_order = [m.value for m in MODE_ORDER]
+    if payload.get("mode_order") != expected_order:
+        raise ValueError(
+            f"{expanded}: mode_order {payload.get('mode_order')!r} does not match "
+            f"{expected_order}."
+        )
+
+    if source is not None:
+        source_key = "latency_ms" if str(source) == "latency" else str(source)
+        raw = payload.get("raw")
+        if not isinstance(raw, dict) or source_key not in raw:
+            available = sorted(raw) if isinstance(raw, dict) else []
+            raise ValueError(
+                f"{expanded}: requested raw cost source {source!r} is unavailable; "
+                f"available={available}."
+            )
+        table = normalize_cost_table(raw[source_key])
+        return (table, dict(payload.get("meta") or {})) if return_meta else table
+
+    if "modes" not in payload:
+        raise ValueError(f"{expanded}: cost YAML is missing the `modes` block.")
+    table = validate_cost_table(payload["modes"])
+    return (table, dict(payload.get("meta") or {})) if return_meta else table

@@ -48,11 +48,13 @@ computation and assert numerical parity (see ``tests/test_dual_regime_fused.py``
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
 
 from fastwam.utils.logging_config import get_logger
+from fastwam.adaptive_gate.training import normalized_dual_regime_action_loss
 
 from .dual_regime_masks import build_multi_regime_attention_mask, merge_action_draft_payloads
 from .fastwam_metric_adaptive import (
@@ -141,6 +143,15 @@ class _FusedDualRegimeTrainingMixin:
                 "ensure `seperated_timestep=true` and `fuse_vae_embedding_in_latents=true`."
             )
 
+    @staticmethod
+    def _require_temporal_patch_size(video_expert) -> None:
+        patch_size = getattr(video_expert, "patch_size", None)
+        if patch_size is None or len(patch_size) < 1 or int(patch_size[0]) != 1:
+            raise ValueError(
+                "Fused dual-regime equivalence requires temporal patch_size[0] == 1; "
+                f"got {patch_size!r}."
+            )
+
     # ---- fused forward (deterministic given `draws`) ------------------------
     def _fused_dual_regime_forward(self, inputs: dict, draws: dict) -> dict[str, Any]:
         context = inputs["context"]
@@ -214,6 +225,7 @@ class _FusedDualRegimeTrainingMixin:
     # ---- training loss -------------------------------------------------------
     def training_loss(self, sample, tiled: bool = False):
         """Single fused forward training BOTH action regimes; video loss once."""
+        self._require_temporal_patch_size(self.video_expert)
         inputs = self.build_inputs(sample, tiled=tiled)
         if inputs["first_frame_latents"] is None:
             raise ValueError(
@@ -248,22 +260,28 @@ class _FusedDualRegimeTrainingMixin:
             )
             regime_losses[draft["name"]] = (per_sample * action_weight).mean()
 
-        w_base = float(getattr(self, "action_regime_weight_base", 1.0))
+        w_base = float(
+            getattr(self, "action_regime_weight_uncond", getattr(self, "action_regime_weight_base", 1.0))
+        )
         loss_action_main = regime_losses[self.main_regime_name]
         loss_action_base = regime_losses["base"]
 
+        combined_action, main_raw_contribution, base_raw_contribution = (
+            normalized_dual_regime_action_loss(loss_action_main, loss_action_base, w_base)
+        )
         loss_total = (
             self.loss_lambda_video * loss_video
-            + self.loss_lambda_action * loss_action_main
-            + self.loss_lambda_action * w_base * loss_action_base
+            + self.loss_lambda_action * combined_action
         )
+        main_contribution = self.loss_lambda_action * main_raw_contribution
+        base_contribution = self.loss_lambda_action * base_raw_contribution
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
-            f"loss_action_{self.main_regime_name}": self.loss_lambda_action
-            * float(loss_action_main.detach().item()),
-            "loss_action_base": self.loss_lambda_action
-            * w_base
-            * float(loss_action_base.detach().item()),
+            f"loss_action_{self.main_regime_name}": float(main_contribution.detach().item()),
+            "loss_action_uncond": float(base_contribution.detach().item()),
+            "loss_action_combined": self.loss_lambda_action
+            * float(combined_action.detach().item()),
+            "action_regime_weight_uncond": w_base,
         }
         return loss_total, loss_dict
 
@@ -478,14 +496,29 @@ def _create_fused_dual_regime(
     adaptive=None,
     router=None,
     train=None,
+    checkpoint_task: str | None = None,
 ):
     adaptive_cfg = _to_plain_dict(adaptive if adaptive is not None else router)
     routing_metric = _maybe_instantiate(adaptive_cfg.get("metric"))
     routing_selector = _maybe_instantiate(adaptive_cfg.get("selector"))
     annotate_outputs = bool(adaptive_cfg.get("annotate_outputs", True))
+    allow_internal_routing = bool(adaptive_cfg.get("allow_internal_routing", False))
 
     train_cfg = _to_plain_dict(train)
-    action_regime_weight_base = float(train_cfg.get("action_regime_weight_base", 1.0))
+    if "action_regime_weight_uncond" in train_cfg:
+        action_regime_weight_base = float(train_cfg["action_regime_weight_uncond"])
+    else:
+        action_regime_weight_base = float(train_cfg.get("action_regime_weight_base", 1.0))
+        if "action_regime_weight_base" in train_cfg:
+            logger.warning(
+                "`train.action_regime_weight_base` is deprecated; use "
+                "`train.action_regime_weight_uncond`."
+            )
+    if not math.isfinite(action_regime_weight_base) or action_regime_weight_base <= 0.0:
+        raise ValueError(
+            "train.action_regime_weight_uncond must be finite and > 0 for a dual-regime checkpoint, got "
+            f"{action_regime_weight_base}."
+        )
     if "share_inputs" in train_cfg:
         logger.info(
             "`train.share_inputs` is ignored by the fused dual-regime training "
@@ -524,10 +557,12 @@ def _create_fused_dual_regime(
         routing_metric=routing_metric,
         routing_selector=routing_selector,
         annotate_outputs=annotate_outputs,
+        allow_internal_routing=allow_internal_routing,
     )
     # Set training knobs AFTER construction (the FastWAM base signature has no
     # **kwargs to thread them through) — same pattern as the inherited factories.
-    model.action_regime_weight_base = action_regime_weight_base
+    model.action_regime_weight_uncond = action_regime_weight_base
+    model.checkpoint_task = checkpoint_task
     return model
 
 

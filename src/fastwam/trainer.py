@@ -1,4 +1,5 @@
 import logging
+import hashlib
 import json
 import inspect
 import os
@@ -21,8 +22,22 @@ from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
+from .adaptive_gate.eval_routing import explicit_eval_branch
 
 logger = get_logger(__name__)
+
+
+def _forward_prepared_model(model, sample):
+    """Enter through the accelerator-prepared wrapper, never an unwrapped method."""
+    return model(sample)
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class Wan22Trainer:
@@ -419,6 +434,15 @@ class Wan22Trainer:
         else:
             infer_kwargs["prompt"] = prompt
 
+        infer_kwargs.update(
+            explicit_eval_branch(
+                model,
+                "infer",
+                getattr(model, "adaptive_backbone_kind", "idm"),
+                require_video=True,
+            )
+        )
+
         pred = model.infer(
             **infer_kwargs,
         )
@@ -566,6 +590,14 @@ class Wan22Trainer:
 
     def _save_weights_checkpoint(self, step_tag: str):
         model = self.accelerator.unwrap_model(self.model)
+        stats_path = os.path.join(self.output_dir, "dataset_stats.json")
+        if os.path.isfile(stats_path):
+            model.dataset_stats_fingerprint = _sha256_file(stats_path)
+        elif getattr(model, "adaptive_regimes", None):
+            raise FileNotFoundError(
+                "Adaptive checkpoint provenance requires training dataset stats at "
+                f"{stats_path}."
+            )
         ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
         model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
         return ckpt_path
@@ -646,8 +678,6 @@ class Wan22Trainer:
     def train(self):
         self._set_dit_only_train_mode()
 
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
 
@@ -668,10 +698,10 @@ class Wan22Trainer:
                 continue
 
             with self.accelerator.accumulate(self.model):
-                train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
-
                 with self.accelerator.autocast():
-                    loss, loss_dict = train_model.training_loss(sample)
+                    # Always enter through the prepared wrapper's forward so
+                    # DDP/DeepSpeed hooks and reducers observe every iteration.
+                    loss, loss_dict = _forward_prepared_model(self.model, sample)
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:

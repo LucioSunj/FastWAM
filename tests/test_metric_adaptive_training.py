@@ -33,6 +33,7 @@ fma = pytest.importorskip(
 
 MetricAdaptiveFastWAM = fma.MetricAdaptiveFastWAM
 _to_plain_dict = fma._to_plain_dict
+from fastwam.adaptive_gate import normalized_dual_regime_action_loss
 
 RUN_MODEL = os.environ.get("RUN_FASTWAM_MODEL_TESTS", "0") == "1"
 needs_model = pytest.mark.skipif(
@@ -55,12 +56,24 @@ def test_to_plain_dict_passthrough_mapping():
 def test_train_knob_parsing_matches_factory_defaults():
     # Mirrors create_metric_adaptive_fastwam's parsing of the `train:` block.
     cfg = _to_plain_dict(None)
-    assert float(cfg.get("action_regime_weight_base", 1.0)) == 1.0
+    assert float(cfg.get("action_regime_weight_uncond", 1.0)) == 1.0
     assert bool(cfg.get("share_inputs", True)) is True
 
-    cfg2 = _to_plain_dict({"action_regime_weight_base": 0.5, "share_inputs": False})
-    assert float(cfg2["action_regime_weight_base"]) == 0.5
+    cfg2 = _to_plain_dict({"action_regime_weight_uncond": 0.5, "share_inputs": False})
+    assert float(cfg2["action_regime_weight_uncond"]) == 0.5
     assert bool(cfg2["share_inputs"]) is False
+
+
+def test_dual_regime_action_objective_is_normalized_and_validated():
+    combined, main, uncond = normalized_dual_regime_action_loss(
+        torch.tensor(2.0), torch.tensor(4.0), 1.0
+    )
+    assert combined.item() == pytest.approx(3.0)
+    assert main.item() == pytest.approx(1.0)
+    assert uncond.item() == pytest.approx(2.0)
+    for bad in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            normalized_dual_regime_action_loss(torch.tensor(1.0), torch.tensor(1.0), bad)
 
 
 def test_action_loss_per_sample_no_pad():
@@ -113,12 +126,11 @@ def adaptive_model():
     configs_dir = _configs_dir()
     if not os.path.isdir(configs_dir):
         pytest.skip(f"configs dir not found: {configs_dir}")
-    try:
-        with initialize_config_dir(version_base="1.3", config_dir=configs_dir):
-            cfg = compose(config_name="train", overrides=[f"task={task}"])
-        model = instantiate(cfg.model, model_dtype=torch.bfloat16, device=device)
-    except Exception as exc:  # missing weights / GPU / data stats etc.
-        pytest.skip(f"could not build adaptive model: {type(exc).__name__}: {exc}")
+    if str(device).startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    with initialize_config_dir(version_base="1.3", config_dir=configs_dir):
+        cfg = compose(config_name="train", overrides=[f"task={task}"])
+    model = instantiate(cfg.model, model_dtype=torch.bfloat16, device=device)
 
     # Replicate the trainer's dit-only train mode (trainer.py:281-295).
     model.eval()
@@ -163,7 +175,13 @@ class TestDualRegimeTraining:
         loss, loss_dict = m.training_loss(_synthetic_sample(m))
         assert loss.ndim == 0 and loss.requires_grad
         assert torch.isfinite(loss)
-        assert set(loss_dict.keys()) == {"loss_video", "loss_action_idm", "loss_action_base"}
+        assert set(loss_dict.keys()) == {
+            "loss_video", "loss_action_idm", "loss_action_uncond",
+            "loss_action_combined", "action_regime_weight_uncond",
+        }
+        assert loss_dict["loss_action_combined"] == pytest.approx(
+            loss_dict["loss_action_idm"] + loss_dict["loss_action_uncond"]
+        )
         loss.backward()  # must not raise
 
     def test_gradient_covers_all_trained_params(self, adaptive_model):
@@ -192,13 +210,13 @@ class TestDualRegimeTraining:
 
     def test_w_base_zero_drops_base_action_term(self, adaptive_model):
         m = adaptive_model
-        old = m.action_regime_weight_base
-        m.action_regime_weight_base = 0.0
+        old = m.action_regime_weight_uncond
+        m.action_regime_weight_uncond = 0.0
         try:
             _, loss_dict = m.training_loss(_synthetic_sample(m))
         finally:
-            m.action_regime_weight_base = old
-        assert loss_dict["loss_action_base"] == pytest.approx(0.0)
+            m.action_regime_weight_uncond = old
+        assert loss_dict["loss_action_uncond"] == pytest.approx(0.0)
 
     def test_share_inputs_false_delegated_path(self, adaptive_model):
         m = adaptive_model
@@ -209,7 +227,7 @@ class TestDualRegimeTraining:
             loss.backward()
         finally:
             m.train_share_inputs = old
-        assert set(loss_dict.keys()) == {"loss_video", "loss_action_idm", "loss_action_base"}
+        assert "loss_action_uncond" in loss_dict and "loss_action_combined" in loss_dict
 
     @pytest.mark.parametrize("branch", ["base", "idm"])
     def test_force_branch_inference(self, adaptive_model, branch):
@@ -233,13 +251,18 @@ class TestDualRegimeTraining:
         assert out["action"].shape[0] == horizon
         assert out["_routing"]["selected_branch"] == branch
 
-    def test_checkpoint_format_unchanged(self, adaptive_model, tmp_path):
+    def test_checkpoint_records_adaptive_provenance(self, adaptive_model, tmp_path):
         m = adaptive_model
+        m.dataset_stats_fingerprint = "test-stats-sha256"
         path = tmp_path / "step_test.pt"
         m.save_checkpoint(str(path))
         payload = torch.load(str(path), map_location="cpu")
         assert "mot" in payload
         assert "step" in payload
         assert "torch_dtype" in payload
+        assert payload["fastwam_provenance"]["adaptive_regimes"] == ["uncond", "idm"]
+        assert payload["fastwam_provenance"]["adaptive_backbone_kind"] == "idm"
+        assert payload["fastwam_provenance"]["action_regime_weight_uncond"] > 0
+        assert payload["fastwam_provenance"]["checkpoint_id"]
         has_proprio = getattr(m, "proprio_encoder", None) is not None
         assert ("proprio_encoder" in payload) == has_proprio

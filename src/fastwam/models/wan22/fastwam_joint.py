@@ -146,7 +146,8 @@ class FastWAMJoint(FastWAM):
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
 
-        video_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        video_seed = self._video_seed(seed)
+        video_generator = None if video_seed is None else torch.Generator(device=rand_device).manual_seed(video_seed)
         action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_video = torch.randn(
             (1, self.vae.model.z_dim, latent_t, latent_h, latent_w),

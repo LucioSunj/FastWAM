@@ -1,18 +1,12 @@
-# Per-mode compute cost for the adaptive-prediction gate reward (-lambda * cost(mode)).
-# cost(FULL) = 1 by definition.
-#
-# THESE ARE ANALYTICAL PLACEHOLDERS (default_cost_table, k_lo=4, k_hi=20,
-# fixed_fraction=0.15). Replace with MEASURED FLOPs by running:
-#   python scripts/profile_wam_modes.py --task <task> --backbone-kind <joint|idm> \
-#     --k-lo 4 --k-hi 20 --out configs/adaptive_gate/wam_cost_<suite>_<backbone>.yaml
-# then point the reward at that file.
-source: steps          # steps (analytical) | flops | latency  (profiler writes flops)
+# Analytical placeholder for the binary adaptive gate.
+# Replace this file with measured FLOPs from scripts/profile_wam_modes.py before
+# training; both entries include the one shared VAE encode per gate decision.
+version: 3
+source: analytical
+mode_order: [uncond, idm]
 modes:
-  skip: 0.15
-  latent: 0.32
-  full: 1.0
+  uncond: 0.15
+  idm: 1.0
 meta:
-  note: analytical default; run scripts/profile_wam_modes.py to measure real FLOPs
-  k_lo: 4
-  k_hi: 20
-  fixed_fraction: 0.15
+  note: placeholder only; profile the exact checkpoint, resolution and horizon
+  inference_steps: 20

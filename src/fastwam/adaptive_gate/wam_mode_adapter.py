@@ -1,100 +1,286 @@
-"""WAMModeAdapter — mode-switched inference wrapper around a FROZEN fastwam model.
-
-One interface over BOTH dual-regime backbones (decision #2):
-- backbone_kind="joint" -> a MetricAdaptiveFastWAMJoint checkpoint (routes base/joint)
-- backbone_kind="idm"   -> a MetricAdaptiveFastWAM    checkpoint (routes base/idm)
-
-The same `act(...)` is used in training and inference. The adapter never trains
-the WAM (it must arrive frozen); it only selects how much prediction compute to
-spend per call via `mode`.
-
-`act(...) -> {action_chunk, world_feat, cost, aux}`:
-- action_chunk : [action_horizon, action_dim] tensor (cpu float32, as fastwam returns)
-- world_feat   : the cheap current-context latent (gate input), computed in ALL
-                 modes BEFORE the mode-specific compute
-- cost         : relative FLOPs of the chosen mode, cost(FULL)=1
-- aux          : {mode, branch, video_inference_steps, action_inference_steps, routing}
-
-No-leakage: the future the action conditions on is the model's OWN self-generated
-latent (the dual-regime model denoises from noise; only frame-0 is clamped to the
-encoded current image). LATENT/FULL never decode pixels (infer_action returns the
-action only). `force_branch` also bypasses the model's internal PolicyEntropy
-probe so the gate is the sole decision-maker.
-"""
+"""Binary mode adapter around one frozen dual-regime IDM FastWAM."""
 from __future__ import annotations
 
 import inspect
+import math
+import warnings
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 
-from .cost import default_cost_table, load_cost_table
-from .modes import coerce_mode, mode_to_branch_step_counts
+from .cost import default_cost_table, load_cost_table, validate_cost_table
+from .modes import WAMMode, coerce_mode, mode_to_branch_steps
+
+
+WORLD_FEAT_LAYOUT = "spatial_2x2_plus_channel_std_v1"
+
+
+@dataclass(frozen=True)
+class EncodedWorldState:
+    """One VAE encoding reused by both gate features and WAM inference."""
+
+    world_feat: torch.Tensor
+    first_frame_latents: torch.Tensor
+    layout: str = WORLD_FEAT_LAYOUT
+    image_shape: Optional[tuple[int, int]] = None
 
 
 class WAMModeAdapter:
+    """Choose between reactive ``UNCOND`` and complete future-conditioned ``IDM``."""
+
     def __init__(
         self,
         model,
         *,
         backbone_kind: str,
+        task: Optional[str] = None,
         num_video_frames: int,
-        action_horizon: int,
-        # TODO(make-variable, decision #3): k_lo/k_hi/action_steps are fixed
-        #   defaults for now; expose them as runtime/config variables later so the
-        #   gate (or a schedule) can pick the LATENT/FULL depth dynamically.
-        k_lo: int = 4,
-        k_hi: int = 20,
-        action_steps: Optional[int] = None,
+        generation_horizon: int,
+        inference_steps: int = 20,
+        context_len: int = 128,
+        dataset_stats_fingerprint: Optional[str] = None,
         cost_table: Optional[dict[str, float]] = None,
         cost_table_path: Optional[str] = None,
         cost_source: Optional[str] = None,
         default_seed: Optional[int] = None,
+        allow_legacy_checkpoint: bool = False,
+        allow_unloaded_model: bool = False,
     ):
+        if str(backbone_kind) != "idm":
+            raise ValueError(
+                "The adaptive gate supports only the dual-regime IDM backbone; "
+                f"got backbone_kind={backbone_kind!r}."
+            )
         if not hasattr(model, "infer_action"):
             raise TypeError("`model` must expose `infer_action`.")
         sig = inspect.signature(model.infer_action)
-        if "force_branch" not in sig.parameters:
+        required = {"force_branch", "first_frame_latents"}
+        missing = required.difference(sig.parameters)
+        if missing:
             raise TypeError(
-                "WAMModeAdapter requires a routing-capable model (MetricAdaptiveFastWAM or "
-                "MetricAdaptiveFastWAMJoint) whose `infer_action` accepts `force_branch`. "
-                "Pass a dual-regime checkpoint loaded into one of those classes."
+                "WAMModeAdapter requires a current dual-regime IDM model whose "
+                f"`infer_action` accepts {sorted(required)}; missing={sorted(missing)}."
             )
+
         self.model = model
-        self.backbone_kind = str(backbone_kind)
+        self.task = None if task is None else str(task)
+        self.backbone_kind = "idm"
         self.num_video_frames = int(num_video_frames)
-        self.action_horizon = int(action_horizon)
-        self.k_lo = int(k_lo)
-        self.k_hi = int(k_hi)
-        # SKIP drives only the ACTION denoising loop (video is not denoised); use
-        # the full action schedule by default so SKIP == current fastwam behavior.
-        self.action_steps = int(action_steps) if action_steps is not None else int(k_hi)
+        self.generation_horizon = int(generation_horizon)
+        self.inference_steps = int(inference_steps)
+        self.context_len = int(context_len)
+        self.dataset_stats_fingerprint = dataset_stats_fingerprint
+        self.cost_source = None if cost_source is None else str(cost_source)
         self.default_seed = default_seed
+        if (
+            self.num_video_frames <= 0
+            or self.generation_horizon <= 0
+            or self.inference_steps <= 0
+            or self.context_len <= 0
+        ):
+            raise ValueError(
+                "num_video_frames, generation_horizon and inference_steps must be positive; "
+                f"got {self.num_video_frames}, {self.generation_horizon}, {self.inference_steps}."
+            )
 
+        self._validate_checkpoint_provenance(
+            allow_legacy_checkpoint=allow_legacy_checkpoint,
+            allow_unloaded_model=allow_unloaded_model,
+        )
+        if cost_table is not None and cost_table_path is not None:
+            raise ValueError("Pass either cost_table or cost_table_path, not both.")
+        if cost_source is not None and cost_table_path is None:
+            raise ValueError("cost_source requires cost_table_path.")
         if cost_table is not None:
-            self.cost_table = {k: float(v) for k, v in cost_table.items()}
+            self.cost_table = validate_cost_table(cost_table)
         else:
-            loaded = load_cost_table(cost_table_path, source=cost_source)
-            self.cost_table = loaded if loaded is not None else default_cost_table(self.k_lo, self.k_hi)
+            loaded, cost_meta = load_cost_table(
+                cost_table_path, source=cost_source, return_meta=True
+            )
+            self.cost_table = loaded if loaded is not None else default_cost_table(self.inference_steps)
+            self._cost_meta = cost_meta
+            if loaded is not None:
+                self._validate_cost_profile_meta(cost_meta)
+        if cost_table is not None:
+            self._cost_meta = None
 
-    # ----- gate input ---------------------------------------------------- #
+    def _validate_cost_profile_meta(self, meta: Optional[dict[str, Any]]) -> None:
+        if not meta:
+            raise ValueError("Profiled cost YAML must contain a non-empty `meta` block.")
+        if self.task is None:
+            raise ValueError("`task` is required when loading a profiled cost table.")
+        expected = {
+            "task": self.task,
+            "backbone_kind": "idm",
+            "ckpt_fingerprint": getattr(self.model, "_loaded_checkpoint_fingerprint", None),
+            "inference_steps": self.inference_steps,
+            "num_video_frames": self.num_video_frames,
+            "action_horizon": self.generation_horizon,
+            "context_len": self.context_len,
+            "model_dtype": str(getattr(self.model, "torch_dtype", None)),
+            "proprio_dim": getattr(self.model, "proprio_dim", None),
+        }
+        if expected["ckpt_fingerprint"] is None:
+            raise ValueError(
+                "A profiled cost table requires a loaded checkpoint with a verifiable fingerprint."
+            )
+        mismatches = {
+            key: (meta.get(key), value)
+            for key, value in expected.items()
+            if meta.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(
+                "Cost profile metadata does not match this adapter "
+                f"(actual, expected): {mismatches}."
+            )
+        if self.cost_source in {"latency", "latency_ms"}:
+            expected_device = self._device_name()
+            if meta.get("device_name") != expected_device:
+                raise ValueError(
+                    "Latency profile hardware does not match this model device: "
+                    f"profile={meta.get('device_name')!r}, current={expected_device!r}."
+                )
+
+    def _device_name(self) -> str:
+        device = torch.device(getattr(self.model, "device", "cpu"))
+        if device.type == "cuda" and torch.cuda.is_available():
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            return torch.cuda.get_device_name(index)
+        return device.type
+
+    def _validate_cost_resolution(self, input_image: torch.Tensor) -> None:
+        if self._cost_meta is None:
+            return
+        if input_image.ndim not in (3, 4):
+            raise ValueError(f"input_image must be 3D/4D, got {tuple(input_image.shape)}")
+        height, width = map(int, input_image.shape[-2:])
+        expected = (self._cost_meta.get("height"), self._cost_meta.get("width"))
+        if expected[0] is None or expected[1] is None:
+            raise ValueError("Cost profile meta must include height and width.")
+        if (height, width) != tuple(map(int, expected)):
+            raise ValueError(
+                f"Cost profile resolution {expected} does not match input {(height, width)}."
+            )
+
+    def _validate_checkpoint_provenance(
+        self,
+        *,
+        allow_legacy_checkpoint: bool,
+        allow_unloaded_model: bool,
+    ) -> None:
+        live_regimes = tuple(getattr(self.model, "adaptive_regimes", ()))
+        live_kind = getattr(self.model, "adaptive_backbone_kind", None)
+        if live_regimes != ("uncond", "idm") or live_kind != "idm":
+            raise ValueError(
+                "Live model is not the dual-regime IDM implementation: "
+                f"adaptive_regimes={live_regimes!r}, adaptive_backbone_kind={live_kind!r}."
+            )
+        provenance = getattr(self.model, "_loaded_checkpoint_provenance", "not_loaded")
+        if provenance == "not_loaded":
+            if allow_unloaded_model:
+                return
+            raise ValueError(
+                "WAMModeAdapter requires a loaded dual-regime checkpoint. Pass "
+                "allow_unloaded_model=True only for tests/development."
+            )
+        if provenance is None:
+            message = (
+                "The loaded checkpoint predates FastWAM provenance metadata, so dual-regime "
+                "IDM training cannot be verified. Pass allow_legacy_checkpoint=True only after "
+                "manually confirming the checkpoint."
+            )
+            if not allow_legacy_checkpoint:
+                raise ValueError(message)
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+            return
+        schema_version = provenance.get("schema_version")
+        checkpoint_id = provenance.get("checkpoint_id")
+        if schema_version != 2 or not isinstance(checkpoint_id, str) or not checkpoint_id:
+            message = (
+                "Checkpoint provenance is incomplete or uses an unsupported schema: "
+                f"schema_version={schema_version!r}, checkpoint_id={checkpoint_id!r}. "
+                "Treat it as legacy and verify it manually."
+            )
+            if not allow_legacy_checkpoint:
+                raise ValueError(message)
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+            return
+        regimes = tuple(provenance.get("adaptive_regimes", ()))
+        if regimes != ("uncond", "idm"):
+            raise ValueError(
+                "Checkpoint is not a dual-regime UNCOND+IDM checkpoint: "
+                f"adaptive_regimes={regimes!r}."
+            )
+        regime_weight = provenance.get("action_regime_weight_uncond")
+        regime_weight_value = None if regime_weight is None else float(regime_weight)
+        if (
+            regime_weight_value is None
+            or not math.isfinite(regime_weight_value)
+            or regime_weight_value <= 0.0
+        ):
+            raise ValueError(
+                "Checkpoint does not prove that the UNCOND regime was trained with positive "
+                f"weight: action_regime_weight_uncond={regime_weight!r}."
+            )
+        if self.task is not None and provenance.get("task") != self.task:
+            raise ValueError(
+                "Checkpoint task does not match the adaptive gate task: "
+                f"checkpoint={provenance.get('task')!r}, gate={self.task!r}."
+            )
+        checkpoint_stats = provenance.get("dataset_stats_fingerprint")
+        if checkpoint_stats is None:
+            if not allow_legacy_checkpoint:
+                raise ValueError(
+                    "Checkpoint has no dataset_stats_fingerprint; use an explicitly verified "
+                    "legacy escape hatch or regenerate the checkpoint."
+                )
+        elif (
+            self.dataset_stats_fingerprint is not None
+            and checkpoint_stats != self.dataset_stats_fingerprint
+        ):
+            raise ValueError(
+                "Dataset-stats fingerprint does not match the checkpoint: "
+                f"checkpoint={checkpoint_stats}, provided={self.dataset_stats_fingerprint}."
+            )
+
     @property
     def world_feat_dim(self) -> int:
-        """Channel dim of the current-context latent (= gate world_feat dim)."""
-        return int(self.model.vae.model.z_dim)
+        """Coarse 2x2 layout (4C) plus channel standard deviation (C)."""
+        return 5 * int(self.model.vae.model.z_dim)
+
+    @torch.no_grad()
+    def encode_world_state(self, input_image: torch.Tensor) -> EncodedWorldState:
+        """Encode the current image once and construct a fixed spatial feature."""
+        dtype = getattr(self.model, "torch_dtype", input_image.dtype)
+        device = getattr(self.model, "device", input_image.device)
+        image = input_image.to(device=device, dtype=dtype)
+        latent = self.model._encode_input_image_latents_tensor(image)
+        if latent.ndim != 5 or latent.shape[0] != 1:
+            raise ValueError(
+                "first-frame VAE latent must be [1,C,T,H,W], got "
+                f"{tuple(latent.shape)}."
+            )
+        coarse = F.adaptive_avg_pool3d(latent.float(), (1, 2, 2)).flatten(1)
+        spread = latent.float().std(dim=(2, 3, 4), unbiased=False)
+        world_feat = torch.cat([coarse, spread], dim=-1).squeeze(0).detach()
+        if world_feat.numel() != self.world_feat_dim:
+            raise RuntimeError(
+                f"world feature dim mismatch: expected {self.world_feat_dim}, got {world_feat.numel()}."
+            )
+        return EncodedWorldState(
+            world_feat=world_feat,
+            first_frame_latents=latent.detach(),
+            image_shape=tuple(map(int, input_image.shape[-2:])),
+        )
 
     @torch.no_grad()
     def encode_world_feat(self, input_image: torch.Tensor) -> torch.Tensor:
-        """Cheap current-context latent, pooled to a fixed [z_dim] vector.
+        """Compatibility helper; prefer ``encode_world_state`` to reuse the latent."""
+        return self.encode_world_state(input_image).world_feat
 
-        This is the SINGLE encoder forward, computed before any mode-specific
-        compute, and is the gate's input in every mode.
-        """
-        latent = self.model._encode_input_image_latents_tensor(input_image)  # [1, C, t, h, w]
-        feat = latent.mean(dim=tuple(range(2, latent.ndim)))  # pool over (t,h,w) -> [1, C]
-        return feat.squeeze(0).detach().float()
-
-    # ----- mode-switched action ------------------------------------------ #
     @torch.no_grad()
     def act(
         self,
@@ -105,55 +291,97 @@ class WAMModeAdapter:
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
         prompt: Optional[str] = None,
-        action_horizon: Optional[int] = None,
+        generation_horizon: Optional[int] = None,
         num_video_frames: Optional[int] = None,
-        world_feat: Optional[torch.Tensor] = None,
+        encoded_state: Optional[EncodedWorldState] = None,
         seed: Optional[int] = None,
     ) -> dict[str, Any]:
-        mode = coerce_mode(mode)
-        # world_feat is computed in ALL modes, BEFORE the mode-specific compute.
-        if world_feat is None:
-            world_feat = self.encode_world_feat(input_image)
-
-        branch, video_steps, action_steps = mode_to_branch_step_counts(
-            mode,
-            backbone_kind=self.backbone_kind,
-            k_lo=self.k_lo,
-            k_hi=self.k_hi,
-            action_steps=self.action_steps,
+        selected = coerce_mode(mode)
+        self._validate_cost_resolution(input_image)
+        expected_proprio_dim = getattr(self.model, "proprio_dim", None)
+        if expected_proprio_dim is not None:
+            if proprio is None:
+                raise ValueError(
+                    f"proprio is required because model.proprio_dim={expected_proprio_dim}."
+                )
+            if int(proprio.shape[-1]) != int(expected_proprio_dim):
+                raise ValueError(
+                    f"proprio last dim must be {expected_proprio_dim}, got {proprio.shape[-1]}."
+                )
+        if context is not None:
+            if context.ndim not in (2, 3) or int(context.shape[-2]) != self.context_len:
+                raise ValueError(
+                    f"context length must be {self.context_len}, got {tuple(context.shape)}."
+                )
+            if context_mask is None or int(context_mask.shape[-1]) != self.context_len:
+                raise ValueError(
+                    f"context_mask length must be {self.context_len}."
+                )
+        requested_horizon = (
+            self.generation_horizon if generation_horizon is None else int(generation_horizon)
         )
-        # `force_branch` routes to FastWAM (base) / FastWAMJoint|IDM (future) on the
-        # SAME frozen weights, and bypasses the model's internal routing metric.
-        # `_filter_kwargs_for_method` drops `num_video_frames` for the base branch
-        # (FastWAM.infer_action has no such arg) and passes it for joint/idm.
-        infer_kwargs = dict(
+        requested_frames = (
+            self.num_video_frames if num_video_frames is None else int(num_video_frames)
+        )
+        if requested_horizon <= 0 or requested_frames <= 0:
+            raise ValueError(
+                "generation_horizon and num_video_frames must be positive, got "
+                f"{requested_horizon}, {requested_frames}."
+            )
+        if self._cost_meta is not None:
+            if requested_horizon != self.generation_horizon:
+                raise ValueError(
+                    "generation_horizon override is incompatible with the profiled cost: "
+                    f"{requested_horizon} != {self.generation_horizon}."
+                )
+            if requested_frames != self.num_video_frames:
+                raise ValueError(
+                    "num_video_frames override is incompatible with the profiled cost: "
+                    f"{requested_frames} != {self.num_video_frames}."
+                )
+        if encoded_state is None:
+            encoded_state = self.encode_world_state(input_image)
+        if encoded_state.layout != WORLD_FEAT_LAYOUT:
+            raise ValueError(
+                f"encoded state layout {encoded_state.layout!r} does not match {WORLD_FEAT_LAYOUT!r}."
+            )
+        image_shape = tuple(map(int, input_image.shape[-2:]))
+        if encoded_state.image_shape is not None and encoded_state.image_shape != image_shape:
+            raise ValueError(
+                f"encoded state image shape {encoded_state.image_shape} does not match "
+                f"input image shape {image_shape}."
+            )
+        if encoded_state.world_feat.numel() != self.world_feat_dim:
+            raise ValueError(
+                f"encoded world feature must have {self.world_feat_dim} elements, got "
+                f"{encoded_state.world_feat.numel()}."
+            )
+
+        branch, steps = mode_to_branch_steps(selected, inference_steps=self.inference_steps)
+        out = self.model.infer_action(
             prompt=prompt,
             input_image=input_image,
-            action_horizon=int(action_horizon or self.action_horizon),
-            num_video_frames=int(num_video_frames or self.num_video_frames),
+            first_frame_latents=encoded_state.first_frame_latents,
+            action_horizon=requested_horizon,
+            num_video_frames=requested_frames,
             proprio=proprio,
             context=context,
             context_mask=context_mask,
-            num_inference_steps=int(action_steps),
+            num_inference_steps=steps,
             seed=seed if seed is not None else self.default_seed,
             force_branch=branch,
             return_routing_info=True,
         )
-        if video_steps is not None and int(video_steps) != int(action_steps):
-            infer_kwargs["video_inference_steps"] = int(video_steps)
-            infer_kwargs["action_inference_steps"] = int(action_steps)
-
-        out = self.model.infer_action(**infer_kwargs)
         return {
             "action_chunk": out["action"],
-            "world_feat": world_feat,
-            "cost": float(self.cost_table[mode.value]),
+            "world_feat": encoded_state.world_feat,
+            "cost": float(self.cost_table[selected.value]),
             "aux": {
-                "mode": mode.value,
+                "mode": selected.value,
                 "branch": branch,
-                "video_inference_steps": None if video_steps is None else int(video_steps),
-                "action_inference_steps": int(action_steps),
-                "num_inference_steps": int(action_steps),
+                "video_inference_steps": steps if selected is WAMMode.IDM else None,
+                "action_inference_steps": steps,
+                "num_inference_steps": steps,
                 "routing": out.get("_routing"),
             },
         }

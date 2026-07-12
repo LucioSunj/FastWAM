@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 from typing import Any, Optional
 
 import torch
@@ -8,6 +9,7 @@ import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 
 from fastwam.routing.metrics import MetricResult, PolicyEntropyMetric, RoutingDecision, ThresholdSelector
+from fastwam.adaptive_gate.training import normalized_dual_regime_action_loss
 from fastwam.utils.logging_config import get_logger
 
 from .fastwam import FastWAM
@@ -45,12 +47,16 @@ class MetricAdaptiveFastWAMJoint(FastWAMJoint):
     video-denoising loss computed exactly once (in the joint forward).
     """
 
+    adaptive_regimes = ("uncond", "joint")
+    adaptive_backbone_kind = "joint"
+
     def __init__(
         self,
         *args,
         routing_metric=None,
         routing_selector=None,
         annotate_outputs: bool = True,
+        allow_internal_routing: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -58,6 +64,7 @@ class MetricAdaptiveFastWAMJoint(FastWAMJoint):
             routing_metric=routing_metric,
             routing_selector=routing_selector,
             annotate_outputs=annotate_outputs,
+            allow_internal_routing=allow_internal_routing,
         )
 
     @classmethod
@@ -67,6 +74,7 @@ class MetricAdaptiveFastWAMJoint(FastWAMJoint):
         routing_metric=None,
         routing_selector=None,
         annotate_outputs: bool = True,
+        allow_internal_routing: bool = False,
         **kwargs,
     ):
         model = super().from_wan22_pretrained(**kwargs)
@@ -74,6 +82,7 @@ class MetricAdaptiveFastWAMJoint(FastWAMJoint):
             routing_metric=routing_metric,
             routing_selector=routing_selector,
             annotate_outputs=annotate_outputs,
+            allow_internal_routing=allow_internal_routing,
         )
         return model
 
@@ -82,6 +91,7 @@ class MetricAdaptiveFastWAMJoint(FastWAMJoint):
         routing_metric=None,
         routing_selector=None,
         annotate_outputs: bool = True,
+        allow_internal_routing: bool = False,
     ) -> None:
         self.routing_metric = routing_metric if routing_metric is not None else PolicyEntropyMetric(probe_branch="base")
         self.routing_selector = (
@@ -90,6 +100,7 @@ class MetricAdaptiveFastWAMJoint(FastWAMJoint):
             else ThresholdSelector(threshold=0.0, low_branch="base", high_branch="joint", mode="ge")
         )
         self.annotate_outputs = bool(annotate_outputs)
+        self.allow_internal_routing = bool(allow_internal_routing)
         self.last_routing_decision: dict[str, Any] | None = None
 
     # ---- inference routing (identical to the base/idm variant) -----------
@@ -193,11 +204,16 @@ class MetricAdaptiveFastWAMJoint(FastWAMJoint):
                 low_branch=str(getattr(self.routing_selector, "low_branch", "")),
                 high_branch=str(getattr(self.routing_selector, "high_branch", "")),
             )
-        else:
+        elif self.allow_internal_routing:
             metric_result = self.routing_metric(context)
             decision = self.routing_selector.select(metric_result)
             selected_branch = decision.selected_branch
             self._validate_branch_name(selected_branch)
+        else:
+            raise ValueError(
+                "Adaptive inference requires an explicit `force_branch`; set "
+                "allow_internal_routing=True only for the legacy entropy-router ablation."
+            )
 
         output = dict(context.run_branch(selected_branch))
         routing_info = decision.as_dict()
@@ -258,7 +274,7 @@ class MetricAdaptiveFastWAMJoint(FastWAMJoint):
     #
     # Knobs are set by create_metric_adaptive_fastwam_joint (read via getattr so
     # the model still runs if wiring is omitted):
-    #   self.action_regime_weight_base : float = 1.0   # w_base
+    #   self.action_regime_weight_uncond : float = 1.0
     #   self.train_share_inputs        : bool  = True   # single VAE encode/step
 
     def _action_loss_per_sample(
@@ -464,7 +480,9 @@ class MetricAdaptiveFastWAMJoint(FastWAMJoint):
     def training_loss(self, sample, tiled: bool = False):
         """Dual-regime training: action expert sees BOTH the joint and base
         conditioning regimes every step; video loss is computed exactly once."""
-        w_base = float(getattr(self, "action_regime_weight_base", 1.0))
+        w_base = float(
+            getattr(self, "action_regime_weight_uncond", getattr(self, "action_regime_weight_base", 1.0))
+        )
         share_inputs = bool(getattr(self, "train_share_inputs", True))
 
         if share_inputs:
@@ -472,34 +490,25 @@ class MetricAdaptiveFastWAMJoint(FastWAMJoint):
             inputs = self.build_inputs(sample, tiled=tiled)
             loss_video, loss_action_joint = self._joint_regime_losses(inputs)
             loss_action_base = self._base_regime_action_loss(inputs)
-            loss_main_total = (
-                self.loss_lambda_video * loss_video
-                + self.loss_lambda_action * loss_action_joint
-            )
         else:
-            # Pure zero-drift path: delegate verbatim to the unmodified base
-            # FastWAM.training_loss. Because `self` is a FastWAMJoint subclass,
-            # self._build_mot_attention_mask is the joint mask, so this computes
-            # the JOINT regime (video + joint-conditioned action). Then add a
-            # base-regime action term from a second build_inputs.
-            loss_main_total, main_dict = FastWAM.training_loss(self, sample, tiled=tiled)
-            inputs = self.build_inputs(sample, tiled=tiled)
-            loss_action_base = self._base_regime_action_loss(inputs)
+            joint_inputs = self.build_inputs(sample, tiled=tiled)
+            loss_video, loss_action_joint = self._joint_regime_losses(joint_inputs)
+            base_inputs = self.build_inputs(sample, tiled=tiled)
+            loss_action_base = self._base_regime_action_loss(base_inputs)
 
-        loss_total = loss_main_total + self.loss_lambda_action * w_base * loss_action_base
-
-        if share_inputs:
-            loss_dict = {
-                "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
-                "loss_action_joint": self.loss_lambda_action * float(loss_action_joint.detach().item()),
-                "loss_action_base": self.loss_lambda_action * w_base * float(loss_action_base.detach().item()),
-            }
-        else:
-            loss_dict = {
-                "loss_video": float(main_dict["loss_video"]),
-                "loss_action_joint": float(main_dict["loss_action"]),
-                "loss_action_base": self.loss_lambda_action * w_base * float(loss_action_base.detach().item()),
-            }
+        combined_action, joint_raw_contribution, base_raw_contribution = (
+            normalized_dual_regime_action_loss(loss_action_joint, loss_action_base, w_base)
+        )
+        loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * combined_action
+        joint_contribution = self.loss_lambda_action * joint_raw_contribution
+        base_contribution = self.loss_lambda_action * base_raw_contribution
+        loss_dict = {
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            "loss_action_joint": float(joint_contribution.detach().item()),
+            "loss_action_uncond": float(base_contribution.detach().item()),
+            "loss_action_combined": self.loss_lambda_action * float(combined_action.detach().item()),
+            "action_regime_weight_uncond": w_base,
+        }
         return loss_total, loss_dict
 
 
@@ -523,16 +532,31 @@ def create_metric_adaptive_fastwam_joint(
     adaptive=None,
     router=None,
     train=None,
+    checkpoint_task: str | None = None,
 ):
     adaptive_cfg = _to_plain_dict(adaptive if adaptive is not None else router)
     routing_metric = _maybe_instantiate(adaptive_cfg.get("metric"))
     routing_selector = _maybe_instantiate(adaptive_cfg.get("selector"))
     annotate_outputs = bool(adaptive_cfg.get("annotate_outputs", True))
+    allow_internal_routing = bool(adaptive_cfg.get("allow_internal_routing", False))
 
     # Dual-regime training knobs. NOT threaded through from_wan22_pretrained
     # (the FastWAM base signature has no **kwargs); set as attributes post-build.
     train_cfg = _to_plain_dict(train)
-    action_regime_weight_base = float(train_cfg.get("action_regime_weight_base", 1.0))
+    if "action_regime_weight_uncond" in train_cfg:
+        action_regime_weight_base = float(train_cfg["action_regime_weight_uncond"])
+    else:
+        action_regime_weight_base = float(train_cfg.get("action_regime_weight_base", 1.0))
+        if "action_regime_weight_base" in train_cfg:
+            logger.warning(
+                "`train.action_regime_weight_base` is deprecated; use "
+                "`train.action_regime_weight_uncond`."
+            )
+    if not math.isfinite(action_regime_weight_base) or action_regime_weight_base <= 0.0:
+        raise ValueError(
+            "train.action_regime_weight_uncond must be finite and > 0 for a dual-regime checkpoint, got "
+            f"{action_regime_weight_base}."
+        )
     train_share_inputs = bool(train_cfg.get("share_inputs", True))
 
     model = MetricAdaptiveFastWAMJoint.from_wan22_pretrained(
@@ -564,8 +588,10 @@ def create_metric_adaptive_fastwam_joint(
         routing_metric=routing_metric,
         routing_selector=routing_selector,
         annotate_outputs=annotate_outputs,
+        allow_internal_routing=allow_internal_routing,
     )
     # Set training knobs AFTER construction (do NOT pass into from_wan22_pretrained).
-    model.action_regime_weight_base = action_regime_weight_base
+    model.action_regime_weight_uncond = action_regime_weight_base
     model.train_share_inputs = train_share_inputs
+    model.checkpoint_task = checkpoint_task
     return model

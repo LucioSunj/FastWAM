@@ -16,7 +16,7 @@ Three groups:
        RUN_FASTWAM_MODEL_TESTS=1 pytest tests/test_dual_regime_fused.py -v
 
    Optional env:
-       FASTWAM_TEST_TASK     (default: libero_dual_regime_fused_joint_2cam224_1e-4)
+       FASTWAM_TEST_TASK     (default: libero_dual_regime_fused_2cam224_1e-4)
        FASTWAM_TEST_DEVICE   (default: cuda)
        FASTWAM_CONFIGS_DIR   (default: <repo>/configs)
 
@@ -301,6 +301,14 @@ def test_token_wise_t_mod_guard():
         mixin._require_token_wise_t_mod(torch.zeros(1, 6, 4))
 
 
+def test_temporal_patch_size_guard():
+    fdr = _import_fdr()
+    mixin = fdr._FusedDualRegimeTrainingMixin
+    mixin._require_temporal_patch_size(type("V", (), {"patch_size": (1, 2, 2)})())
+    with pytest.raises(ValueError, match=r"patch_size\[0\]"):
+        mixin._require_temporal_patch_size(type("V", (), {"patch_size": (2, 2, 2)})())
+
+
 # ======================================================================== #
 # Group 3 — model integration tests (Wan2.2 weights + GPU)
 # ======================================================================== #
@@ -326,17 +334,16 @@ def fused_model():
     from hydra import compose, initialize_config_dir
     from hydra.utils import instantiate
 
-    task = os.environ.get("FASTWAM_TEST_TASK", "libero_dual_regime_fused_joint_2cam224_1e-4")
+    task = os.environ.get("FASTWAM_TEST_TASK", "libero_dual_regime_fused_2cam224_1e-4")
     device = os.environ.get("FASTWAM_TEST_DEVICE", "cuda")
     configs_dir = _configs_dir()
     if not os.path.isdir(configs_dir):
         pytest.skip(f"configs dir not found: {configs_dir}")
-    try:
-        with initialize_config_dir(version_base="1.3", config_dir=configs_dir):
-            cfg = compose(config_name="train", overrides=[f"task={task}"])
-        model = instantiate(cfg.model, model_dtype=torch.bfloat16, device=device)
-    except Exception as exc:  # missing weights / GPU / data stats etc.
-        pytest.skip(f"could not build fused model: {type(exc).__name__}: {exc}")
+    if str(device).startswith("cuda") and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    with initialize_config_dir(version_base="1.3", config_dir=configs_dir):
+        cfg = compose(config_name="train", overrides=[f"task={task}"])
+    model = instantiate(cfg.model, model_dtype=torch.bfloat16, device=device)
 
     # Replicate the trainer's dit-only train mode (trainer.py:281-295).
     model.eval()
@@ -378,8 +385,14 @@ class TestFusedDualRegimeTraining:
         loss, loss_dict = m.training_loss(_synthetic_sample(m))
         assert loss.ndim == 0 and loss.requires_grad
         assert torch.isfinite(loss)
-        expected_keys = {"loss_video", f"loss_action_{m.main_regime_name}", "loss_action_base"}
+        expected_keys = {
+            "loss_video", f"loss_action_{m.main_regime_name}", "loss_action_uncond",
+            "loss_action_combined", "action_regime_weight_uncond",
+        }
         assert set(loss_dict.keys()) == expected_keys
+        assert loss_dict["loss_action_combined"] == pytest.approx(
+            loss_dict[f"loss_action_{m.main_regime_name}"] + loss_dict["loss_action_uncond"]
+        )
         loss.backward()
 
     def test_gradient_covers_all_trained_params(self, fused_model):
@@ -416,13 +429,13 @@ class TestFusedDualRegimeTraining:
 
     def test_w_base_zero_drops_base_action_term(self, fused_model):
         m = fused_model
-        old = m.action_regime_weight_base
-        m.action_regime_weight_base = 0.0
+        old = m.action_regime_weight_uncond
+        m.action_regime_weight_uncond = 0.0
         try:
             _, loss_dict = m.training_loss(_synthetic_sample(m))
         finally:
-            m.action_regime_weight_base = old
-        assert loss_dict["loss_action_base"] == pytest.approx(0.0)
+            m.action_regime_weight_uncond = old
+        assert loss_dict["loss_action_uncond"] == pytest.approx(0.0)
 
     def test_fused_matches_two_forward_reference(self, fused_model):
         """Replay identical draws through the fused forward and through
@@ -435,6 +448,10 @@ class TestFusedDualRegimeTraining:
         from fastwam.models.wan22.fastwam import FastWAM
 
         m = fused_model
+        assert m.main_regime_name == "idm", (
+            "same-draw parity must run against the fused IDM task; set "
+            "FASTWAM_TEST_TASK=libero_dual_regime_fused_2cam224_1e-4"
+        )
         was_training = m.dit.training
         m.dit.eval()  # disable grad checkpointing for the comparison
         try:
@@ -535,6 +552,122 @@ class TestFusedDualRegimeTraining:
                     assert torch.allclose(
                         out["pred_video"].float(), ref_pred_video.float(), atol=5e-2, rtol=5e-2
                     ), f"video mismatch: max abs diff {(out['pred_video'] - ref_pred_video).abs().max()}"
+                elif m.main_regime_name == "idm":
+                    main_regime = draws["action_regimes"][0]
+                    assert main_regime["name"] == "idm"
+                    input_latents = inputs["input_latents"]
+                    batch_size = input_latents.shape[0]
+
+                    latents_noisy = m.train_video_scheduler.add_noise(
+                        input_latents, draws["noise_video"], draws["timestep_video"]
+                    )
+                    target_video = m.train_video_scheduler.training_target(
+                        input_latents, draws["noise_video"], draws["timestep_video"]
+                    )
+                    latents_noisy[:, :, 0:1] = inputs["first_frame_latents"]
+
+                    cond_mask = draws["cond_noise_mask"]
+                    cond_timestep = torch.where(
+                        cond_mask,
+                        draws["timestep_video_cond_sampled"],
+                        torch.zeros_like(draws["timestep_video_cond_sampled"]),
+                    ).to(dtype=input_latents.dtype)
+                    cond_noisy = m.train_video_scheduler.add_noise(
+                        input_latents,
+                        draws["noise_video_cond"],
+                        draws["timestep_video_cond_sampled"],
+                    )
+                    latents_cond = torch.where(
+                        cond_mask.view(batch_size, 1, 1, 1, 1), cond_noisy, input_latents
+                    ).clone()
+                    latents_cond[:, :, 0:1] = inputs["first_frame_latents"]
+
+                    pre_noisy = m.video_expert.pre_dit(
+                        x=latents_noisy, timestep=draws["timestep_video"], context=context,
+                        context_mask=context_mask, action=None,
+                        fuse_vae_embedding_in_latents=fuse_flag,
+                    )
+                    pre_cond = m.video_expert.pre_dit(
+                        x=latents_cond, timestep=cond_timestep, context=context,
+                        context_mask=context_mask, action=None,
+                        fuse_vae_embedding_in_latents=fuse_flag,
+                    )
+                    noisy_action_m = m.train_action_scheduler.add_noise(
+                        action, main_regime["noise"], main_regime["timestep"]
+                    )
+                    action_pre_m = m.action_expert.pre_dit(
+                        action_tokens=noisy_action_m, timestep=main_regime["timestep"],
+                        context=context, context_mask=context_mask,
+                    )
+                    noisy_len = int(pre_noisy["tokens"].shape[1])
+                    cond_len = int(pre_cond["tokens"].shape[1])
+                    noisy_tpf = int(pre_noisy["meta"]["tokens_per_frame"])
+                    cond_tpf = int(pre_cond["meta"]["tokens_per_frame"])
+                    mask_m = m._build_teacher_forcing_attention_mask(
+                        noisy_video_seq_len=noisy_len,
+                        cond_video_seq_len=cond_len,
+                        action_seq_len=int(action_pre_m["tokens"].shape[1]),
+                        noisy_video_tokens_per_frame=noisy_tpf,
+                        cond_video_tokens_per_frame=cond_tpf,
+                        device=pre_noisy["tokens"].device,
+                    )
+                    ref_m = m.mot(
+                        embeds_all={
+                            "video": torch.cat([pre_noisy["tokens"], pre_cond["tokens"]], dim=1),
+                            "action": action_pre_m["tokens"],
+                        },
+                        attention_mask=mask_m,
+                        freqs_all={
+                            "video": torch.cat([pre_noisy["freqs"], pre_cond["freqs"]], dim=0),
+                            "action": action_pre_m["freqs"],
+                        },
+                        context_all={
+                            "video": {
+                                "context": pre_noisy["context"],
+                                "mask": torch.cat(
+                                    [pre_noisy["context_mask"], pre_cond["context_mask"]], dim=1
+                                ),
+                            },
+                            "action": {
+                                "context": action_pre_m["context"],
+                                "mask": action_pre_m["context_mask"],
+                            },
+                        },
+                        t_mod_all={
+                            "video": torch.cat([pre_noisy["t_mod"], pre_cond["t_mod"]], dim=1),
+                            "action": action_pre_m["t_mod"],
+                        },
+                    )
+                    ref_pred_video = m.video_expert.post_dit(
+                        ref_m["video"][:, :noisy_len], pre_noisy
+                    )
+                    ref_pred_main = m.action_expert.post_dit(ref_m["action"], action_pre_m)
+                    fused_pred_main = out["action_drafts"][0]["pred"]
+                    assert torch.allclose(
+                        fused_pred_main.float(), ref_pred_main.float(), atol=5e-2, rtol=5e-2
+                    ), f"IDM main-draft mismatch: max abs diff {(fused_pred_main - ref_pred_main).abs().max()}"
+                    assert torch.allclose(
+                        out["pred_video"].float(), ref_pred_video.float(), atol=5e-2, rtol=5e-2
+                    ), f"IDM video mismatch: max abs diff {(out['pred_video'] - ref_pred_video).abs().max()}"
+
+                    def video_loss(pred):
+                        per_sample = m._compute_video_loss_per_sample(
+                            pred_video=pred[:, :, 1:],
+                            target_video=target_video[:, :, 1:],
+                            image_is_pad=inputs["image_is_pad"],
+                            include_initial_video_step=False,
+                        )
+                        weight = m.train_video_scheduler.training_weight(
+                            draws["timestep_video"]
+                        ).to(per_sample.device, dtype=per_sample.dtype)
+                        return (per_sample * weight).mean()
+
+                    assert torch.allclose(
+                        video_loss(out["pred_video"]).float(),
+                        video_loss(ref_pred_video).float(),
+                        atol=5e-3,
+                        rtol=5e-3,
+                    )
         finally:
             if was_training:
                 m.dit.train()
@@ -562,13 +695,18 @@ class TestFusedDualRegimeTraining:
         assert out["action"].shape[0] == horizon
         assert out["_routing"]["selected_branch"] == branch
 
-    def test_checkpoint_format_unchanged(self, fused_model, tmp_path):
+    def test_checkpoint_records_provenance(self, fused_model, tmp_path):
         m = fused_model
+        m.dataset_stats_fingerprint = "test-stats-sha256"
         path = tmp_path / "step_test.pt"
         m.save_checkpoint(str(path))
         payload = torch.load(str(path), map_location="cpu")
         assert "mot" in payload
         assert "step" in payload
         assert "torch_dtype" in payload
+        provenance = payload["fastwam_provenance"]
+        assert provenance["checkpoint_id"]
+        assert provenance["adaptive_backbone_kind"] == m.adaptive_backbone_kind
+        assert provenance["action_regime_weight_uncond"] > 0
         has_proprio = getattr(m, "proprio_encoder", None) is not None
         assert ("proprio_encoder" in payload) == has_proprio

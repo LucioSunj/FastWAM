@@ -26,6 +26,7 @@ EVALUATION:
   binarize_gripper: true
   use_action_ensembler: false
   visualize_future_video: false
+  force_branch: base  # adaptive models: base (UNCOND); use idm when visualizing future
 
   # Action inference
   action_horizon: null

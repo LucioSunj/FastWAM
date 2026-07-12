@@ -70,28 +70,8 @@ train:
   # The video-denoising loss is computed exactly once (noisy block only), and
   # inputs are VAE-encoded exactly once (no `share_inputs` trade-off — the
   # knob does not exist here).
-  action_regime_weight_base: 1.0   # w_base; 1.0 = equal idm/base action weight
+  action_regime_weight_uncond: 1.0
 
 adaptive:
   annotate_outputs: true
-  metric:
-    _target_: fastwam.routing.metrics.PolicyEntropyMetric
-    probe_branch: base
-    num_samples: 4
-    bandwidth: silverman
-    min_bandwidth: 1.0e-03
-    leave_one_out: true
-    reduction: mean
-    normalize_by_dim: true
-    seed_stride: 1009
-    # Optional: make entropy probing cheaper than the final selected branch.
-    # probe_overrides:
-    #   num_inference_steps: 8
-  selector:
-    _target_: fastwam.routing.metrics.ThresholdSelector
-    # Tune from logged `_routing.metric_value` on validation rollouts.
-    threshold: 0.0
-    low_branch: base
-    high_branch: idm
-    # High entropy means policy uncertainty, so choose IDM; low entropy uses base.
-    mode: ge
+  allow_internal_routing: false

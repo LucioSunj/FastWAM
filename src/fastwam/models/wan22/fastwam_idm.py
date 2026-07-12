@@ -233,6 +233,7 @@ class FastWAMIDM(FastWAMJoint):
         input_image: torch.Tensor,
         action_horizon: int,
         num_video_frames: int,
+        first_frame_latents: Optional[torch.Tensor] = None,
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
@@ -247,9 +248,13 @@ class FastWAMIDM(FastWAMJoint):
         tiled: bool = False,
     ) -> dict[str, Any]:
         # Reuse infer_joint pipeline and keep infer_action output contract.
-        out = self.infer_joint(
+        # Explicit class dispatch is required for MetricAdaptiveFastWAM: dynamic
+        # `self.infer_joint` would re-enter the router and recurse on the IDM branch.
+        out = FastWAMIDM.infer_joint(
+            self,
             prompt=prompt,
             input_image=input_image,
+            first_frame_latents=first_frame_latents,
             num_video_frames=num_video_frames,
             action_horizon=action_horizon,
             action=None,
@@ -266,6 +271,7 @@ class FastWAMIDM(FastWAMJoint):
             rand_device=rand_device,
             tiled=tiled,
             test_action_with_infer_action=False,
+            decode_video=False,
         )
         return {"action": out["action"]}
 
@@ -276,6 +282,7 @@ class FastWAMIDM(FastWAMJoint):
         input_image: torch.Tensor,
         num_video_frames: int,
         action_horizon: int,
+        first_frame_latents: Optional[torch.Tensor] = None,
         action: Optional[torch.Tensor] = None,
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
@@ -290,6 +297,7 @@ class FastWAMIDM(FastWAMJoint):
         rand_device: str = "cpu",
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
+        decode_video: bool = True,
     ) -> dict[str, Any]:
         del negative_prompt, text_cfg_scale, test_action_with_infer_action
         self.eval()
@@ -336,7 +344,8 @@ class FastWAMIDM(FastWAMJoint):
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
 
-        video_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        video_seed = self._video_seed(seed)
+        video_generator = None if video_seed is None else torch.Generator(device=rand_device).manual_seed(video_seed)
         action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_video = torch.randn(
             (1, self.vae.model.z_dim, latent_t, latent_h, latent_w),
@@ -352,7 +361,11 @@ class FastWAMIDM(FastWAMJoint):
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        first_frame_latents = self._prepare_first_frame_latents(
+            input_image=input_image,
+            first_frame_latents=first_frame_latents,
+            tiled=tiled,
+        )
         latents_video[:, :, 0:1] = first_frame_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
@@ -454,7 +467,9 @@ class FastWAMIDM(FastWAMJoint):
             )
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
-        return {
-            "video": self._decode_latents(latents_video, tiled=tiled),
+        result = {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+        if decode_video:
+            result["video"] = self._decode_latents(latents_video, tiled=tiled)
+        return result

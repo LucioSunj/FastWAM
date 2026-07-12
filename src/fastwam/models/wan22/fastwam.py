@@ -1,3 +1,4 @@
+import os
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -6,6 +7,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from fastwam.utils.logging_config import get_logger
+from fastwam.adaptive_gate.contracts import validate_action_only_attention_mode
 
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
@@ -258,11 +260,51 @@ class FastWAM(torch.nn.Module):
             raise ValueError(
                 f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
-        image = input_image.to(device=self.device)[0].unsqueeze(1)
+        image = input_image.to(device=self.device, dtype=self.torch_dtype)[0].unsqueeze(1)
         z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         if isinstance(z, list):
             z = z[0].unsqueeze(0)
         return z
+
+    def _prepare_first_frame_latents(
+        self,
+        *,
+        input_image: torch.Tensor,
+        first_frame_latents: Optional[torch.Tensor],
+        tiled: bool = False,
+    ) -> torch.Tensor:
+        """Validate/reuse a cached first-frame VAE encoding."""
+        if first_frame_latents is None:
+            return self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        if first_frame_latents.ndim != 5 or first_frame_latents.shape[0] != 1:
+            raise ValueError(
+                "`first_frame_latents` must have shape [1,C,T,H,W], got "
+                f"{tuple(first_frame_latents.shape)}"
+            )
+        if first_frame_latents.shape[1] != int(self.vae.model.z_dim):
+            raise ValueError(
+                f"`first_frame_latents` channel dim must be {self.vae.model.z_dim}, "
+                f"got {first_frame_latents.shape[1]}."
+            )
+        expected_shape = (
+            1,
+            int(input_image.shape[-2]) // int(self.vae.upsampling_factor),
+            int(input_image.shape[-1]) // int(self.vae.upsampling_factor),
+        )
+        if tuple(first_frame_latents.shape[2:]) != expected_shape:
+            raise ValueError(
+                "`first_frame_latents` temporal/spatial shape does not match the input image: "
+                f"got {tuple(first_frame_latents.shape[2:])}, expected {expected_shape}."
+            )
+        return first_frame_latents.to(device=self.device, dtype=self.torch_dtype)
+
+    @staticmethod
+    def _video_seed(seed: Optional[int]) -> Optional[int]:
+        """Derive video noise independently while preserving paired action noise."""
+        if seed is None:
+            return None
+        # SplitMix64's increment gives a deterministic, well-separated stream.
+        return (int(seed) + 0x9E3779B97F4A7C15) % (2**63 - 1)
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
@@ -802,7 +844,8 @@ class FastWAM(torch.nn.Module):
         latent_h = height // self.vae.upsampling_factor
         latent_w = width // self.vae.upsampling_factor
 
-        video_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+        video_seed = self._video_seed(seed)
+        video_generator = None if video_seed is None else torch.Generator(device=rand_device).manual_seed(video_seed)
         action_generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_video = torch.randn(
             (1, self.vae.model.z_dim, latent_t, latent_h, latent_w),
@@ -908,6 +951,7 @@ class FastWAM(torch.nn.Module):
         prompt: Optional[str],
         input_image: torch.Tensor,
         action_horizon: int,
+        first_frame_latents: Optional[torch.Tensor] = None,
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
@@ -920,10 +964,9 @@ class FastWAM(torch.nn.Module):
         tiled: bool = False,
     ) -> dict[str, Any]:
         self.eval()
-        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
-            raise ValueError(
-                "`infer_action` requires `video_attention_mask_mode='first_frame_causal'`."
-            )
+        validate_action_only_attention_mode(
+            getattr(self.video_expert, "video_attention_mask_mode", "")
+        )
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -958,7 +1001,11 @@ class FastWAM(torch.nn.Module):
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        first_frame_latents = self._prepare_first_frame_latents(
+            input_image=input_image,
+            first_frame_latents=first_frame_latents,
+            tiled=tiled,
+        )
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -1086,10 +1133,41 @@ class FastWAM(torch.nn.Module):
         )
 
     def save_checkpoint(self, path, optimizer=None, step=None):
+        import uuid
+
+        adaptive_regimes = tuple(getattr(self, "adaptive_regimes", ()))
+        dataset_stats_fingerprint = getattr(
+            self, "dataset_stats_fingerprint", None
+        )
+        if adaptive_regimes and (
+            not isinstance(dataset_stats_fingerprint, str)
+            or not dataset_stats_fingerprint
+        ):
+            raise ValueError(
+                "Adaptive checkpoints require a non-empty "
+                "dataset_stats_fingerprint before save_checkpoint(). Use the "
+                "Wan22Trainer or hash the exact dataset_stats.json explicitly."
+            )
+        provenance = {
+            "schema_version": 2,
+            "checkpoint_id": uuid.uuid4().hex,
+            "model_class": type(self).__name__,
+            "adaptive_regimes": list(adaptive_regimes),
+            "adaptive_backbone_kind": getattr(self, "adaptive_backbone_kind", None),
+            "task": getattr(self, "checkpoint_task", None),
+            "action_regime_weight_uncond": getattr(
+                self, "action_regime_weight_uncond", None
+            ),
+            "dataset_stats_fingerprint": dataset_stats_fingerprint,
+            "action_dim": int(self.action_expert.action_dim),
+            "proprio_dim": self.proprio_dim,
+            "video_latent_dim": int(self.vae.model.z_dim),
+        }
         payload = {
             "mot": self.mot.state_dict(),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "fastwam_provenance": provenance,
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
@@ -1098,9 +1176,84 @@ class FastWAM(torch.nn.Module):
         torch.save(payload, path)
 
     def load_checkpoint(self, path, optimizer=None):
-        payload = torch.load(path, map_location="cpu")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        provenance = payload.get("fastwam_provenance")
+        if provenance is not None:
+            schema_version = provenance.get("schema_version")
+            checkpoint_id = provenance.get("checkpoint_id")
+            if (
+                schema_version != 2
+                or not isinstance(checkpoint_id, str)
+                or not checkpoint_id
+            ):
+                raise ValueError(
+                    "Malformed FastWAM checkpoint provenance: expected "
+                    "schema_version=2 and a non-empty checkpoint_id, got "
+                    f"schema_version={schema_version!r}, "
+                    f"checkpoint_id={checkpoint_id!r}."
+                )
+        self._loaded_checkpoint_provenance = provenance
+        self._loaded_checkpoint_path = os.path.abspath(os.fspath(path))
+        if provenance is not None and provenance.get("checkpoint_id"):
+            self._loaded_checkpoint_fingerprint = str(provenance["checkpoint_id"])
+        else:
+            stat = os.stat(path)
+            self._loaded_checkpoint_fingerprint = (
+                f"legacy:{int(stat.st_size)}:{int(stat.st_mtime_ns)}"
+            )
+        expected_regimes = tuple(getattr(self, "adaptive_regimes", ()))
+        if provenance is None:
+            logger.warning(
+                "Checkpoint `%s` has no FastWAM provenance metadata; architecture and "
+                "dual-regime training cannot be verified.",
+                path,
+            )
+        else:
+            actual_regimes = tuple(provenance.get("adaptive_regimes", ()))
+            if actual_regimes != expected_regimes:
+                raise ValueError(
+                    "Checkpoint adaptive regimes do not match the model: "
+                    f"checkpoint={actual_regimes}, model={expected_regimes}."
+                )
+            expected_kind = getattr(self, "adaptive_backbone_kind", None)
+            actual_kind = provenance.get("adaptive_backbone_kind")
+            if actual_kind != expected_kind:
+                raise ValueError(
+                    "Checkpoint adaptive backbone does not match the model: "
+                    f"checkpoint={actual_kind!r}, model={expected_kind!r}."
+                )
+            expected_task = getattr(self, "checkpoint_task", None)
+            actual_task = provenance.get("task")
+            if actual_task != expected_task:
+                raise ValueError(
+                    "Checkpoint task does not match the configured model: "
+                    f"checkpoint={actual_task!r}, model={expected_task!r}."
+                )
+            expected_dims = {
+                "action_dim": int(self.action_expert.action_dim),
+                "proprio_dim": self.proprio_dim,
+                "video_latent_dim": int(self.vae.model.z_dim),
+            }
+            dim_mismatches = {
+                key: (provenance.get(key), value)
+                for key, value in expected_dims.items()
+                if provenance.get(key) != value
+            }
+            if dim_mismatches:
+                raise ValueError(
+                    "Checkpoint dimensions do not match the configured model "
+                    f"(checkpoint, model): {dim_mismatches}."
+                )
         if "mot" in payload:
-            self.mot.load_state_dict(payload["mot"], strict=False)
+            # New checkpoints are self-describing and therefore load strictly.
+            # Legacy payloads retain permissive loading for compatibility.
+            incompatible = self.mot.load_state_dict(payload["mot"], strict=provenance is not None)
+            if provenance is None and (incompatible.missing_keys or incompatible.unexpected_keys):
+                logger.warning(
+                    "Legacy checkpoint loaded non-strictly: missing=%s unexpected=%s",
+                    incompatible.missing_keys,
+                    incompatible.unexpected_keys,
+                )
         elif "dit" in payload:
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
             self.video_expert.load_state_dict(payload["dit"], strict=False)

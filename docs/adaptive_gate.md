@@ -1,148 +1,138 @@
-# Adaptive-prediction gate (fastwam side)
+# Binary adaptive world-model reasoning
 
-An RL-trained controller that, at each action-chunk step, picks how much
-forward-prediction compute the frozen world-action model spends:
+The external RL gate makes exactly one categorical decision per generated action
+chunk. The public mode order is stable:
 
-| mode | meaning | code path (frozen model) |
-|---|---|---|
-| **SKIP** | no future prediction (reactive); action conditions on current-context latent only | `force_branch="base"` → `FastWAM.infer_action` (first-frame, no video denoise) |
-| **LATENT** | run future branch a few steps (`k_lo`), condition action on intermediate self-generated latent (no pixel decode) | `joint`: native coupled `video/action=k_lo`; `idm`: `video=k_lo`, `action=k_hi` |
-| **FULL** | full future schedule (`k_hi`), condition action on refined self-generated latent | `force_branch=<joint|idm>` → full action schedule (`k_hi`) |
+| index | mode | frozen WAM path |
+|---:|---|---|
+| 0 | `UNCOND` | `force_branch="base"`: current-frame action inference, no future denoising |
+| 1 | `IDM` | `force_branch="idm"`: complete future-latent generation followed by the full action solver |
 
-The gate is trained with RLinf (GRPO first, PPO later); **fastwam stays frozen**;
-only the gate trains. This doc covers the **fastwam side** (Milestone 1). The gate
-policy, env/rollout wiring, reward, and RL configs live in the RLinf repo.
+There is no low-step or joint choice. A low-NFE solve is a different numerical
+solver, not an intermediate state of the complete trajectory, and would confound
+world reasoning with solver quality.
 
-## Backbone requirement (one interface, two backbones)
+## Required checkpoint
 
-`WAMModeAdapter` needs a **dual-regime checkpoint** loaded into a routing model so
-the SAME action expert is in-distribution for both SKIP and future conditioning:
+Train the fused dual-regime IDM model so one shared action expert is
+in-distribution under both conditioning distributions:
 
-- `backbone_kind="joint"` → a `MetricAdaptiveFastWAMJoint` checkpoint (routes base/joint)
-- `backbone_kind="idm"`   → a `MetricAdaptiveFastWAM` checkpoint (routes base/idm)
+```bash
+python scripts/precompute_text_embeds.py task=libero_dual_regime_fused_2cam224_1e-4
+bash scripts/train_zero1.sh 8 task=libero_dual_regime_fused_2cam224_1e-4
+```
 
-Both are driven through the identical `WAMModeAdapter.act(...)` interface (decision
-#2), used the same way in training and inference. A vanilla base `FastWAM`
-checkpoint supports SKIP only (LATENT/FULL would be OOD) — train a dual-regime
-checkpoint first (see `docs/metric_adaptive*.md`).
+The action objective is
 
-## API
+```text
+L_action = (L_idm + w_uncond * L_uncond) / (1 + w_uncond)
+```
+
+so adding the second regime does not silently double the action/video gradient
+ratio. Configure `train.action_regime_weight_uncond`; model factories require a
+finite, strictly positive value so provenance cannot certify an untrained
+UNCOND branch. The fused equivalence additionally requires temporal
+`patch_size[0] == 1`, a clean timestep-zero first frame, token-wise timestep
+modulation and an attention mode that isolates frame zero
+(`first_frame_causal` or `per_frame_causal`). These are checked at runtime.
+
+New weight files record a checkpoint id, model class, dimensions,
+`adaptive_regimes=[uncond,idm]` and `adaptive_backbone_kind=idm`. Adaptive
+inference also records the training `dataset_stats.json` SHA256 and positive
+UNCOND training weight. The adapter rejects unloaded models and mismatched live
+classes or metadata. `allow_unloaded_model=True` is development/test-only; old
+weights require the explicit `allow_legacy_checkpoint=True` escape hatch after
+manual verification.
+
+## Cached gate feature
+
+The VAE is run once per decision:
 
 ```python
-from fastwam.adaptive_gate import WAMModeAdapter, WAMMode
-
-adapter = WAMModeAdapter(
-    model,                       # frozen MetricAdaptiveFastWAMJoint / MetricAdaptiveFastWAM
-    backbone_kind="joint",       # or "idm"
-    num_video_frames=9, action_horizon=32,
-    k_lo=4, k_hi=20,             # TODO: make runtime variables (decision #3)
-    cost_table_path="configs/adaptive_gate/wam_cost.yaml",
+state = adapter.encode_world_state(input_image)
+decision_input = state.world_feat
+result = adapter.act(
+    input_image=input_image,
+    encoded_state=state,
+    mode=mode,
+    context=context,
+    context_mask=context_mask,
 )
-
-world_feat = adapter.encode_world_feat(input_image)         # cheap, once, [z_dim]
-mode = gate(world_feat, proprio)                            # RLinf policy decides
-out = adapter.act(input_image=img, proprio=proprio,
-                  context=ctx, context_mask=mask,
-                  mode=mode, world_feat=world_feat)
-# out = {action_chunk [Ta,a_dim], world_feat [z_dim], cost (FULL=1), aux{mode,branch,steps,routing}}
 ```
 
-No-leakage: the conditioned future is the model's own self-generated latent (the
-dual-regime model denoises from noise; only frame-0 is the encoded current image).
-LATENT/FULL never decode pixels. `force_branch` bypasses the model's internal
-PolicyEntropy probe so the gate is the sole decision-maker.
+`EncodedWorldState.first_frame_latents` remains on the WAM device/dtype and is
+passed directly into either inference path. `world_feat` is fixed-size float32:
+a `1x2x2` adaptive spatial pool (`4*C`) plus per-channel spatial standard
+deviation (`C`), or `5*C` total. It retains coarse camera layout rather than
+collapsing the latent to one global mean. Text is represented separately by
+`pool_text_context`: masked token mean followed by deterministic adaptive
+average pooling to 64 dimensions. Oracle BC and online RL use the same helper.
 
-Backbone semantic note: `FastWAMJoint` denoises video and action synchronously in
-one MoT sequence, so its LATENT mode remains coupled at `k_lo` action steps. The
-IDM branch is already two-stage (video then action), so LATENT can use
-`video_inference_steps=k_lo` while keeping `action_inference_steps=k_hi`.
+`FastWAMIDM.infer_action` sets `decode_video=False`; adaptive action inference
+never pays for pixel decoding. With a fixed seed, UNCOND and IDM share exactly
+the same initial action-noise stream, while IDM video noise uses a deterministic
+derived seed and is therefore independent.
 
-## Cost / reward unit (decision #6)
+## Compute cost
 
-The reward's per-step compute penalty is `-lambda * cost(mode)`, `cost(FULL)=1`.
-"Cost" = **relative FLOPs** of the mode (hardware-independent; the quantity the
-gate economizes). The dominant variable is the video denoising loop
-(SKIP=0, LATENT=`k_lo`, FULL=`k_hi` steps) on top of a fixed encode+action cost:
-
-    total(mode) ≈ C_fixed + C_video_step · video_steps(mode);  cost = total/total(FULL)
-
-- **Measured (preferred):** `scripts/profile_wam_modes.py` runs each mode once with
-  a FLOP counter (and times latency), normalizes by FULL, writes a cost YAML.
-- **Analytical fallback** (`default_cost_table`, used when no file): a single
-  `fixed_fraction` knob; see `configs/adaptive_gate/wam_cost.yaml`.
-
-Latency is recorded for reference but the reward defaults to FLOPs. A flat per-step
-constant is intentionally avoided — it would erase LATENT's genuine saving over FULL.
-
-## Oracle labels (M3, no annotation) — analysis tool + OPTIONAL warm-start
-
-The gate's default training is **pure RL with zero supervision** (RLinf side;
-entropy bonus + λ-warmup + `explore_eps` uniform-mixture rollouts keep it
-stable). The oracle labels below are therefore NOT required by any training
-path. They serve two purposes: (a) an offline **analysis** of when prediction
-actually helps — the label distribution over states/task-phases is the
-project's core evidence — and (b) an optional BC warm-start / "oracle vs
-learned gate" ablation. The targets are **self-generated** from the raw VLA
-training set (which already pairs each state with a ground-truth action chunk)
-— no human labeling:
-
-1. For each sampled state, run the FROZEN dual-regime WAM once per mode with
-   **paired seeds** (same initial action noise per mode, so error differences come
-   from the conditioning, not the draw).
-2. Score each mode's action chunk against the dataset chunk in the NORMALIZED
-   action space (masked by `action_is_pad`; optionally only the executed prefix
-   `--exec-horizon` = the eval `replan_steps`).
-3. Label = **cheapest sufficient mode**:
-   `min{ i : err(i) <= err(FULL)·(1+tol_rel) + tol_abs }` — prediction compute is
-   only "necessary" where imagining the future actually improves the action.
+Reward cost is normalized to `cost(IDM)=1`. Profile the exact checkpoint and
+deployment shape:
 
 ```bash
-cd FastWAM
+python scripts/profile_wam_modes.py \
+  --task libero_dual_regime_fused_2cam224_1e-4 \
+  --backbone-kind idm --ckpt /path/to/checkpoint.pt \
+  --inference-steps 20 --height 224 --width 448 \
+  --num-video-frames 9 --action-horizon 32 \
+  --out configs/adaptive_gate/wam_cost_libero_idm.yaml
+```
+
+Both measurements include the one shared VAE encode. Loading an explicit cost
+path is strict: missing files, invalid keys, non-finite/non-monotonic values,
+unavailable raw sources, or mismatched task/checkpoint/backbone/steps/frames/
+horizon/resolution fail instead of silently changing the RL objective.
+Profiles additionally bind context length, model dtype and proprio dimension;
+latency rewards bind the accelerator model name.
+`source=latency` aliases the profiler's `latency_ms` field.
+
+## Offline oracle analysis
+
+The optional oracle runs both modes with paired action seeds and stores complete
+per-step L1/L2 curves. Its corrected label is the cheapest measured-cost mode
+within tolerance of the **best observed mode**, rather than treating IDM as an
+infallible reference. Every record also stores `best_err`, absolute `idm_err`
+and `idm_regret`, allowing BC to filter states where the expensive model itself
+is poor. Samples with any non-finite per-step or chunk error are dropped and
+counted as `num_nonfinite_dropped`; they are never silently labeled IDM.
+
+Shards include the 64-D text feature and `group_id` (dataset id plus episode id)
+for leakage-free train/validation splits without cross-dataset id collisions. Version-2 shards carry a strict
+compatibility fingerprint over checkpoint, dataset stats, task, inference,
+feature and relabeling settings; three-mode or incompatible shards must be
+regenerated and cannot be concatenated. Loading also rejects duplicate or
+incomplete shard-index sets unless `allow_partial=True` is explicitly requested.
+
+```bash
 python scripts/generate_gate_oracle_labels.py \
-  --task libero_metric_adaptive_joint_2cam224_1e-4 --backbone-kind joint \
-  --ckpt /path/to/dual_regime_joint.pt --dataset-stats /path/to/dataset_stats.json \
-  --stride 20 --exec-horizon 10 --num-seeds 1 \
-  --out data/gate_oracle/libero_joint          # + --num-shards/--shard-index per GPU
+  --task libero_dual_regime_fused_2cam224_1e-4 \
+  --backbone-kind idm --ckpt /path/to/checkpoint.pt \
+  --dataset-stats /path/to/dataset_stats.json \
+  --exec-horizon 10 --out data/gate_oracle/libero_idm
 ```
 
-Each shard stores the gate inputs (`world_feat`, `proprio`), the label, AND the
-per-step error curves, so tolerances/metric/horizon can be changed OFFLINE via
-`fastwam.adaptive_gate.relabel_from_steps` without re-running the WAM. Inspect
-`label_distribution` first: near-100% SKIP means tolerances are too loose (or the
-dual-regime checkpoint makes prediction genuinely unnecessary); near-100% FULL
-means too tight. The shards feed `RLinf/examples/embodiment/train_gate_bc.py`.
+Padded tails are retained by default and removed by `valid_steps`; use
+`--skip-padded` only for a deliberate complete-window subset. Oracle labels use
+dataset ground-truth actions and are optional analysis/BC data, not part of the
+default zero-supervision GRPO path.
 
-## Files
+## Routing ownership
 
-- `src/fastwam/adaptive_gate/modes.py` — `WAMMode`, `MODE_ORDER`, mode→(branch,steps).
-- `src/fastwam/adaptive_gate/cost.py` — cost table (default / load / save / normalize).
-- `src/fastwam/adaptive_gate/wam_mode_adapter.py` — `WAMModeAdapter`.
-- `src/fastwam/adaptive_gate/oracle.py` — oracle-label math + shard IO + offline relabel (M3).
-- `scripts/profile_wam_modes.py` — FLOPs/latency profiler → cost YAML.
-- `scripts/generate_gate_oracle_labels.py` — oracle-label shards from raw VLA data (M3).
-- `configs/adaptive_gate/wam_cost.yaml` — analytical default cost table.
-- `tests/test_wam_mode_adapter.py` — modes/cost/dispatch (pure) + gated real-model tests.
-- `tests/test_gate_oracle.py` — oracle selection/relabel/shard-IO tests (pure).
+Adaptive model inference requires explicit `force_branch` by default. The old
+four-probe KDE entropy router is retained only behind
+`allow_internal_routing=True` as a legacy ablation; because it performs repeated
+action probes before its final branch, it is not a compute-saving mechanism.
 
-## Run / verify (Milestone 1)
-
-```bash
-cd FastWAM
-# pure-logic tests (anywhere with torch + pyyaml)
-pytest tests/test_wam_mode_adapter.py -v -k "not TestRealModel"
-
-# profile real per-mode FLOPs (needs Wan weights + GPU)
-python scripts/profile_wam_modes.py --task libero_metric_adaptive_joint_2cam224_1e-4 \
-  --backbone-kind joint --out configs/adaptive_gate/wam_cost_libero_joint.yaml
-
-# real-model checks incl. "SKIP reproduces base-branch fastwam"
-RUN_FASTWAM_MODEL_TESTS=1 FASTWAM_TEST_TASK=libero_metric_adaptive_joint_2cam224_1e-4 \
-  pytest tests/test_wam_mode_adapter.py::TestRealModel -v
-```
-
-## Roadmap
-
-- **M1 — done:** `WAMModeAdapter` (3 modes, both backbones, one interface) + FLOPs profiler + cost; SKIP reproduces fastwam.
-- **M2 (RLinf) — done:** gate policy (3-way categorical MLP) registered as a custom RLinf policy; env/rollout wiring (LIBERO + RoboTwin) calling the adapter; multi-component reward (terminal success; `-lambda*cost`; optional dense agreement-with-FULL) with per-component logging; forced-mode smoke tests.
-- **M3 (this) — done:** zero-supervision RL path hardened (RLinf `explore_eps`); oracle-label generation (fastwam side, no annotation; analysis tool) + OPTIONAL BC warm-start & KL-to-BC prior (RLinf `train_gate_bc.py`, off by default).
-- **M4:** GRPO training (LIBERO then RoboTwin); collapse checks + per-setting (in-domain/OOD) mode-usage logging; then PPO config (TODO).
+Standalone LIBERO/RoboTwin evaluation reads `EVALUATION.force_branch` (default
+`base`, i.e. UNCOND). Future-video visualization requires `idm`. Trainer video
+validation always forces the model's complete future branch so periodic
+`eval_every` remains valid while external routing is mandatory.

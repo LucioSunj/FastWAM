@@ -63,30 +63,9 @@ train:
   #   - joint regime: action conditions on the full (jointly-denoised) video
   #   - base  regime: action conditions on the clean first frame
   # The video-denoising loss is computed ONCE (in the joint forward only).
-  action_regime_weight_base: 1.0   # w_base; 1.0 = equal joint/base action weight
+  action_regime_weight_uncond: 1.0
   share_inputs: true               # true = single VAE encode/step (recommended)
 
 adaptive:
   annotate_outputs: true
-  metric:
-    _target_: fastwam.routing.metrics.PolicyEntropyMetric
-    probe_branch: base
-    num_samples: 4
-    bandwidth: silverman
-    min_bandwidth: 1.0e-03
-    leave_one_out: true
-    reduction: mean
-    normalize_by_dim: true
-    seed_stride: 1009
-    # Optional: make entropy probing cheaper than the final selected branch.
-    # probe_overrides:
-    #   num_inference_steps: 8
-  selector:
-    _target_: fastwam.routing.metrics.ThresholdSelector
-    # Tune from logged `_routing.metric_value` on validation rollouts.
-    threshold: 0.0
-    low_branch: base
-    high_branch: joint
-    # High entropy means policy uncertainty, so choose JOINT (full future
-    # imagination); low entropy uses the fast base path.
-    mode: ge
+  allow_internal_routing: false

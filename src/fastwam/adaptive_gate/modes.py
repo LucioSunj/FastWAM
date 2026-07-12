@@ -1,39 +1,38 @@
-"""Mode definitions for the adaptive-prediction gate.
+"""Canonical modes for the adaptive world-model gate.
 
-Three prediction modes the gate chooses among, in increasing compute:
-- SKIP   : no future-video prediction (reactive); action conditions on the
-           current-context latent only. Maps to the frozen model's `base` branch
-           (FastWAM.infer_action; first-frame conditioning, no video denoising).
-- LATENT : run the video branch for a FEW denoising steps (`k_lo`); action
-           conditions on the intermediate self-generated future latent (no pixel
-           decode). IDM can keep full action refinement; joint keeps its native
-           coupled video/action schedule.
-- FULL   : run the video branch for the FULL schedule (`k_hi`); action conditions
-           on the refined self-generated future latent. Same branch, `k_hi` steps.
+The gate deliberately exposes only two choices:
 
-The gate is a 3-way categorical; `MODE_ORDER` fixes the index<->mode mapping so the
-policy logits, the cost table, and logging all agree.
+``UNCOND``
+    The reactive/base FastWAM action path.  It conditions on the encoded current
+    frame and performs no future-video denoising.
+
+``IDM``
+    The complete IDM path.  It generates the full future latent with the frozen
+    world model and then conditions the action expert on that latent.
+
+Keeping this surface binary is intentional: a low-NFE solver is not an
+"intermediate latent" from the full trajectory, and mixing solver quality with
+the routing decision makes the learned gate difficult to interpret.
 """
 from __future__ import annotations
 
 import enum
+import numbers
 
 
 class WAMMode(str, enum.Enum):
-    SKIP = "skip"
-    LATENT = "latent"
-    FULL = "full"
+    UNCOND = "uncond"
+    IDM = "idm"
 
 
-# Canonical categorical order: logit index i  <->  MODE_ORDER[i].
-# SKIP=0, LATENT=1, FULL=2. Do not reorder (configs/logs/labels depend on it).
-MODE_ORDER: tuple[WAMMode, ...] = (WAMMode.SKIP, WAMMode.LATENT, WAMMode.FULL)
+# Stable categorical contract shared by FastWAM, RLinf, cost files and labels.
+MODE_ORDER: tuple[WAMMode, ...] = (WAMMode.UNCOND, WAMMode.IDM)
 NUM_MODES = len(MODE_ORDER)
-
-_VALID_BACKBONES = {"joint", "idm"}
 
 
 def mode_from_index(index: int) -> WAMMode:
+    if isinstance(index, bool) or not isinstance(index, numbers.Integral):
+        raise ValueError(f"mode index must be an integer, got {index!r}.")
     idx = int(index)
     if idx < 0 or idx >= NUM_MODES:
         raise ValueError(f"mode index {idx} out of range [0, {NUM_MODES}).")
@@ -41,88 +40,32 @@ def mode_from_index(index: int) -> WAMMode:
 
 
 def coerce_mode(mode) -> WAMMode:
-    """Accept canonical mode values or categorical indices."""
+    """Accept canonical string/enum values or categorical indices."""
     if isinstance(mode, WAMMode):
         return mode
-    try:
-        return WAMMode(mode)
-    except ValueError:
-        try:
+    if isinstance(mode, str):
+        if mode in {"0", "1"}:
             return mode_from_index(int(mode))
-        except (TypeError, ValueError) as index_exc:
-            raise ValueError(
-                f"Unknown WAM mode `{mode}`. Expected one of {[m.value for m in MODE_ORDER]} "
-                f"or an index in [0, {NUM_MODES})."
-            ) from index_exc
+        try:
+            return WAMMode(mode)
+        except ValueError:
+            pass
+    elif isinstance(mode, numbers.Integral) and not isinstance(mode, bool):
+        return mode_from_index(mode)
+    raise ValueError(
+        f"Unknown WAM mode `{mode}`. Expected one of "
+        f"{[m.value for m in MODE_ORDER]} or an integer index in [0, {NUM_MODES})."
+    )
 
 
 def mode_to_index(mode) -> int:
     return MODE_ORDER.index(coerce_mode(mode))
 
 
-def future_branch_for(backbone_kind: str) -> str:
-    """The frozen model's branch name used by the LATENT/FULL modes.
-
-    backbone_kind="joint" -> MetricAdaptiveFastWAMJoint's "joint" branch.
-    backbone_kind="idm"   -> MetricAdaptiveFastWAM's "idm" branch.
-    SKIP always uses the "base" branch on either model.
-    """
-    backbone_kind = str(backbone_kind)
-    if backbone_kind not in _VALID_BACKBONES:
-        raise ValueError(
-            f"Unknown backbone_kind `{backbone_kind}`. Expected one of {sorted(_VALID_BACKBONES)}."
-        )
-    return "joint" if backbone_kind == "joint" else "idm"
-
-
-def mode_to_branch_steps(
-    mode,
-    *,
-    backbone_kind: str,
-    k_lo: int,
-    k_hi: int,
-    action_steps: int,
-) -> tuple[str, int]:
-    """Backward-compatible mode mapping to a single inference-step count.
-
-    Prefer `mode_to_branch_step_counts` for new adaptive-gate code.
-    """
-    branch, video_steps, action_step_count = mode_to_branch_step_counts(
-        mode,
-        backbone_kind=backbone_kind,
-        k_lo=k_lo,
-        k_hi=k_hi,
-        action_steps=action_steps,
-    )
-    return branch, int(action_step_count if video_steps is None else video_steps)
-
-
-def mode_to_branch_step_counts(
-    mode,
-    *,
-    backbone_kind: str,
-    k_lo: int,
-    k_hi: int,
-    action_steps: int,
-) -> tuple[str, int | None, int]:
-    """Map a mode to (force_branch, video_steps, action_steps).
-
-    - SKIP   -> ("base", None, action_steps)
-    - LATENT -> (future, k_lo, action_steps) for IDM
-                (future, k_lo, k_lo) for joint, whose native inference is coupled
-    - FULL   -> (future, k_hi, action_steps)
-
-    `video_steps=None` means the selected branch does not run future-video
-    denoising. For IDM, `action_steps` defaults to k_hi so LATENT changes only
-    future-prediction compute while keeping action refinement full length. Joint
-    inference denoises video/action together, so LATENT remains coupled.
-    """
-    mode = coerce_mode(mode)
-    future = future_branch_for(backbone_kind)
-    if mode is WAMMode.SKIP:
-        return "base", None, int(action_steps)
-    if mode is WAMMode.LATENT:
-        if str(backbone_kind) == "joint":
-            return future, int(k_lo), int(k_lo)
-        return future, int(k_lo), int(action_steps)
-    return future, int(k_hi), int(action_steps)  # FULL
+def mode_to_branch_steps(mode, *, inference_steps: int) -> tuple[str, int]:
+    """Map a categorical mode to the frozen model branch and solver depth."""
+    steps = int(inference_steps)
+    if steps <= 0:
+        raise ValueError(f"inference_steps must be positive, got {inference_steps}.")
+    selected = coerce_mode(mode)
+    return ("base", steps) if selected is WAMMode.UNCOND else ("idm", steps)

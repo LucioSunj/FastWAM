@@ -36,6 +36,10 @@ from experiments.libero.libero_utils import (
     save_rollout_video,
 )
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
+from fastwam.adaptive_gate import (
+    explicit_eval_branch,
+    validate_dataset_stats_fingerprint,
+)
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
@@ -409,6 +413,14 @@ def _predict_action_chunk(
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
     elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
+    infer_kwargs.update(
+        explicit_eval_branch(
+            model,
+            "infer_joint" if visualize_future_video else "infer_action",
+            str(cfg.EVALUATION.get("force_branch", "base")),
+            require_video=visualize_future_video,
+        )
+    )
 
     with torch.no_grad():
         if visualize_future_video:
@@ -702,6 +714,7 @@ def eval_single_process(cfg: DictConfig):
     model = model.to(model_device).eval()
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
+    validate_dataset_stats_fingerprint(model, dataset_stats_path)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
     processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
     processor.set_normalizer_from_stats(dataset_stats)

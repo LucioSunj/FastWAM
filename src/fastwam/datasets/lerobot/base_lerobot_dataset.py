@@ -177,7 +177,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         return sample
 
     def __getitem__(self, idx):
-        if idx >= len(self):
+        if idx < 0 or idx >= len(self):
             raise IndexError(f"Index {idx} out of bounds {len(self)}.")
 
         # Retry with random indices until we successfully load a frame.
@@ -204,6 +204,19 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 f"Failed to load a valid sample after {MAX_GETITEM_ATTEMPT} attempts "
                 f"for index {idx}."
             ) from last_exception
+
+        return self._process_lerobot_sample(sample_idx, lerobot_sample)
+
+    def get_strict(self, idx):
+        """Load exactly ``idx`` without retrying with a different sample."""
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds {len(self)}.")
+        lerobot_sample = self.multi_dataset[idx]
+        lerobot_sample = self._split_lerobot_sample(lerobot_sample)
+        return self._process_lerobot_sample(idx, lerobot_sample)
+
+    def _process_lerobot_sample(self, sample_idx, lerobot_sample):
+        """Convert an already loaded LeRobot record into the public sample."""
 
         # Get data from lerobot, organized in nested dict
         sample = {

@@ -26,6 +26,10 @@ if str(SRC_ROOT) not in sys.path:
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from fastwam.adaptive_gate import (
+    explicit_eval_branch,
+    validate_dataset_stats_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +159,7 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        force_branch: str = "base",
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -164,6 +169,7 @@ class WorldActionRobotWinPolicy:
         self.model = self.model.to(device).eval()
 
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
+        validate_dataset_stats_fingerprint(self.model, dataset_stats_path)
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
         self.processor.set_normalizer_from_stats(dataset_stats)
 
@@ -178,6 +184,9 @@ class WorldActionRobotWinPolicy:
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
         self._num_video_frames = int(num_video_frames)
+        self.force_branch = str(force_branch)
+        # Validate once at construction; vanilla models return an empty mapping.
+        explicit_eval_branch(self.model, "infer_action", self.force_branch)
 
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
@@ -254,6 +263,9 @@ class WorldActionRobotWinPolicy:
         }
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
+        infer_kwargs.update(
+            explicit_eval_branch(self.model, "infer_action", self.force_branch)
+        )
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
@@ -368,6 +380,7 @@ def get_model(usr_args: Dict[str, Any]):
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
+    force_branch = str(usr_args.get("force_branch", cfg.EVALUATION.get("force_branch", "base")))
 
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
@@ -387,6 +400,7 @@ def get_model(usr_args: Dict[str, Any]):
         tiled=tiled,
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        force_branch=force_branch,
     )
     return policy
 

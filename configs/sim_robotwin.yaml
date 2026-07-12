@@ -33,6 +33,7 @@ EVALUATION:
   tiled: false
   timing_enabled: false
   skip_get_obs_within_replan: true
+  force_branch: base  # adaptive models: base (UNCOND) or idm
 
   # Runtime inputs
   dataset_stats_path: null
