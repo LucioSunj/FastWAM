@@ -2,6 +2,7 @@ import logging
 import hashlib
 import json
 import inspect
+import math
 import os
 import re
 from math import ceil
@@ -11,9 +12,9 @@ import time
 import numpy as np
 import torch
 from accelerate import Accelerator
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image
-from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
 from .utils.fs import ensure_dir
@@ -23,6 +24,19 @@ from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 from .adaptive_gate.eval_routing import explicit_eval_branch
+from .adaptive_gate.training import (
+    advance_successful_optimizer_steps,
+    build_optimizer_parameter_groups,
+    canonicalize_uncond_weight_schedule,
+    classify_training_resume_source,
+    raw_loss_gradient_statistics,
+    uncond_weight_at_step,
+    validate_dual_regime_trainer_state,
+)
+from .adaptive_gate.warm_start import (
+    strict_standalone_idm_warm_start,
+    warm_start_is_enabled,
+)
 
 logger = get_logger(__name__)
 
@@ -38,6 +52,62 @@ def _sha256_file(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _final_video_block_parameters(
+    model, count: int
+) -> list[torch.nn.Parameter]:
+    video = getattr(model, "video_expert", None)
+    blocks = list(getattr(video, "blocks", ())) if video is not None else []
+    count = int(count)
+    if count <= 0 or count > len(blocks):
+        raise ValueError(
+            "gradient_diagnostic_video_final_blocks must select a non-empty "
+            f"suffix of video_expert.blocks; requested={count}, available={len(blocks)}."
+        )
+    return [param for block in blocks[-count:] for param in block.parameters()]
+
+
+def dual_regime_gradient_parameter_groups(
+    model, *, video_final_blocks: int = 1
+) -> dict[str, list[torch.nn.Parameter]]:
+    """Diagnostic views over the action path; overlapping views are intentional."""
+    action = getattr(model, "action_expert", None)
+    if action is None:
+        raise ValueError("Dual-regime gradient diagnostics require action_expert.")
+    blocks = list(getattr(action, "blocks", ()))
+    groups: dict[str, list[torch.nn.Parameter]] = {
+        "action_all": list(action.parameters()),
+    }
+    action_encoder = getattr(action, "action_encoder", None)
+    if action_encoder is not None:
+        groups["action_embedding"] = list(action_encoder.parameters())
+    attention_params = [
+        param
+        for block in blocks
+        for param in getattr(block, "self_attn", torch.nn.Module()).parameters()
+    ]
+    if attention_params:
+        groups["action_attention"] = attention_params
+    if blocks:
+        third = max(len(blocks) // 3, 1)
+        groups["action_blocks_early"] = [
+            param for block in blocks[:third] for param in block.parameters()
+        ]
+        groups["action_blocks_middle"] = [
+            param for block in blocks[third : max(2 * third, third + 1)]
+            for param in block.parameters()
+        ]
+        groups["action_blocks_final"] = [
+            param for block in blocks[max(2 * third, third + 1) :] for param in block.parameters()
+        ]
+    proprio = getattr(model, "proprio_encoder", None)
+    if proprio is not None:
+        groups["proprio_all"] = list(proprio.parameters())
+    video_final = _final_video_block_parameters(model, video_final_blocks)
+    if any(param.requires_grad for param in video_final):
+        groups["video_final"] = video_final
+    return {name: params for name, params in groups.items() if params}
 
 
 class Wan22Trainer:
@@ -63,6 +133,59 @@ class Wan22Trainer:
         self.seed = int(cfg.seed)
         
         self.resume = cfg.resume
+        self.warm_start_cfg = cfg.get("warm_start")
+        self.warm_start_enabled = warm_start_is_enabled(self.warm_start_cfg)
+        if self.resume and self.warm_start_enabled:
+            raise ValueError(
+                "`resume` and `warm_start` are mutually exclusive: resume restores an "
+                "adaptive training lineage, while warm_start creates a new lineage."
+            )
+        self.is_dual_regime = (
+            tuple(getattr(model, "adaptive_regimes", ())) == ("uncond", "idm")
+            and getattr(model, "adaptive_backbone_kind", None) == "idm"
+        )
+        dual_cfg = cfg.get("dual_regime_training") or {}
+        if isinstance(dual_cfg, DictConfig):
+            dual_cfg = OmegaConf.to_container(dual_cfg, resolve=True)
+        self.dual_regime_cfg = dict(dual_cfg)
+        optimizer_group_cfg = dict(self.dual_regime_cfg.get("optimizer", {}))
+        self.action_lr_scale = float(optimizer_group_cfg.get("action_lr_scale", 1.0))
+        self.proprio_lr_scale = float(optimizer_group_cfg.get("proprio_lr_scale", 1.0))
+        raw_video_lr_scale = optimizer_group_cfg.get("video_lr_scale", None)
+        self.video_lr_scale = (
+            0.0 if self.is_dual_regime else 1.0
+        ) if raw_video_lr_scale is None else float(raw_video_lr_scale)
+        raw_video_final_blocks = optimizer_group_cfg.get("video_final_blocks", None)
+        self.video_final_blocks = (
+            None
+            if raw_video_final_blocks is None
+            else int(raw_video_final_blocks)
+        )
+        if self.is_dual_regime and self.video_lr_scale > 0.0 and (
+            self.video_final_blocks is None or self.video_final_blocks <= 0
+        ):
+            raise ValueError(
+                "Dual-regime video updates must name a positive "
+                "optimizer.video_final_blocks suffix."
+            )
+        self.video_train_start_fraction = float(
+            optimizer_group_cfg.get("video_train_start_fraction", 0.0)
+        )
+        if not 0.0 <= self.video_train_start_fraction <= 1.0:
+            raise ValueError("video_train_start_fraction must be in [0, 1].")
+        self.gradient_diagnostics_every = int(
+            self.dual_regime_cfg.get("gradient_diagnostics_every", 0)
+        )
+        if self.gradient_diagnostics_every < 0:
+            raise ValueError("gradient_diagnostics_every must be non-negative.")
+        self.gradient_diagnostic_video_final_blocks = int(
+            self.dual_regime_cfg.get("gradient_diagnostic_video_final_blocks", 1)
+        )
+        if self.is_dual_regime and self.gradient_diagnostics_every > 0:
+            # Validate the diagnostic view before any distributed workers start.
+            _final_video_block_parameters(
+                self.model, self.gradient_diagnostic_video_final_blocks
+            )
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
         if self.mixed_precision not in {"no", "fp16", "bf16"}:
             raise ValueError(
@@ -94,16 +217,39 @@ class Wan22Trainer:
         if self.val_dataset is not None:
             self._assert_dataset_length_consistent(self.val_dataset, "val_dataset")
 
-        # Freeze non-trainable modules before optimizer/deepspeed initialization.
-        # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
-        self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
-        proprio_encoder = getattr(self.model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+        if self.warm_start_enabled:
+            warm_record = strict_standalone_idm_warm_start(
+                self.model,
+                self.warm_start_cfg,
+                target_model_config=cfg.model,
+                target_dataset_stats=os.path.join(self.output_dir, "dataset_stats.json"),
+            )
+            logger.info(
+                "Strict standalone-IDM warm start accepted: parent_id=%s sha256=%s",
+                warm_record["parent_checkpoint_id"],
+                warm_record["parent_checkpoint_sha256"],
+            )
+        if self.is_dual_regime and not hasattr(self.model, "dual_regime_optimizer_steps"):
+            self.model.dual_regime_optimizer_steps = 0
+        self.dual_regime_optimizer_steps = int(
+            getattr(self.model, "dual_regime_optimizer_steps", 0)
+        )
+        self.warm_start_provenance = getattr(
+            self.model, "warm_start_provenance", None
+        )
+
+        # Configure disjoint expert groups before optimizer/DeepSpeed creation.
+        optimizer_groups = build_optimizer_parameter_groups(
+            self.model,
+            base_learning_rate=self.learning_rate,
+            action_lr_scale=self.action_lr_scale,
+            proprio_lr_scale=self.proprio_lr_scale,
+            video_lr_scale=self.video_lr_scale,
+            video_final_blocks=self.video_final_blocks,
+        )
+        self.trainable_group_names = tuple(group["name"] for group in optimizer_groups)
         self.optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=self.learning_rate,
+            optimizer_groups,
             weight_decay=self.weight_decay,
             betas=(0.9, 0.95),
         )
@@ -111,6 +257,40 @@ class Wan22Trainer:
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
         self.max_steps = total_train_steps
+        schedule_points = self.dual_regime_cfg.get("uncond_weight_schedule")
+        if self.is_dual_regime:
+            if schedule_points is None:
+                fixed_weight = float(getattr(self.model, "action_regime_weight_uncond", 1.0))
+                schedule_points = ((0.0, fixed_weight), (1.0, fixed_weight))
+            self.uncond_weight_schedule = canonicalize_uncond_weight_schedule(
+                schedule_points
+            )
+            self.dual_regime_training_contract = {
+                "uncond_weight_schedule": [list(point) for point in self.uncond_weight_schedule],
+                "base_learning_rate": self.learning_rate,
+                "weight_decay": self.weight_decay,
+                "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                "mixed_precision": self.mixed_precision,
+                "max_grad_norm": self.max_grad_norm,
+                "action_lr_scale": self.action_lr_scale,
+                "proprio_lr_scale": self.proprio_lr_scale,
+                "video_lr_scale": self.video_lr_scale,
+                "video_final_blocks": self.video_final_blocks,
+                "video_train_start_fraction": self.video_train_start_fraction,
+                "gradient_diagnostics_every": self.gradient_diagnostics_every,
+                "gradient_diagnostic_video_final_blocks": (
+                    self.gradient_diagnostic_video_final_blocks
+                ),
+                "total_optimizer_steps": self.max_steps,
+            }
+            self.model.dual_regime_training_contract = self.dual_regime_training_contract
+        else:
+            if schedule_points is not None:
+                raise ValueError(
+                    "uncond_weight_schedule is only valid for the dual-regime IDM model."
+                )
+            self.uncond_weight_schedule = None
+            self.dual_regime_training_contract = None
         warmup_steps = int(total_train_steps * 0.05)
         self.scheduler = self._build_scheduler(
             scheduler_type=cfg.lr_scheduler_type,
@@ -139,6 +319,14 @@ class Wan22Trainer:
         self.wandb_run = None
         self._init_wandb()
         self._resume_or_load_checkpoint()
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        self.dual_regime_optimizer_steps = int(
+            getattr(unwrapped, "dual_regime_optimizer_steps", self.dual_regime_optimizer_steps)
+        )
+        self.warm_start_provenance = getattr(
+            unwrapped, "warm_start_provenance", self.warm_start_provenance
+        )
+        self._validate_loaded_training_contract(unwrapped)
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
@@ -236,36 +424,24 @@ class Wan22Trainer:
         scheduler_type = str(scheduler_type).strip().lower()
         total_train_steps = max(int(total_train_steps), 1)
         warmup_steps = min(max(int(warmup_steps), 0), total_train_steps - 1)
-
-        remaining_steps = max(total_train_steps - warmup_steps, 1)
-        if scheduler_type == "cosine":
-            main_scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=remaining_steps,
-                eta_min=self.learning_rate * 0.01,
-            )
-        elif scheduler_type == "constant":
-            main_scheduler = ConstantLR(self.optimizer, factor=1.0, total_iters=remaining_steps)
-        else:
+        if scheduler_type not in {"cosine", "constant"}:
             raise ValueError(
                 f"Unsupported lr_scheduler_type: {scheduler_type}. "
                 "Expected one of: ['cosine', 'constant']."
             )
 
-        if warmup_steps <= 0:
-            return main_scheduler
+        remaining_steps = max(total_train_steps - warmup_steps, 1)
 
-        warmup_scheduler = LinearLR(
-            self.optimizer,
-            start_factor=1.0 / warmup_steps,
-            end_factor=1.0,
-            total_iters=warmup_steps,
-        )
-        return SequentialLR(
-            self.optimizer,
-            schedulers=[warmup_scheduler, main_scheduler],
-            milestones=[warmup_steps],
-        )
+        def lr_multiplier(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return max((step + 1) / float(warmup_steps), 1.0 / warmup_steps)
+            if scheduler_type == "constant":
+                return 1.0
+            progress = min(max((step - warmup_steps) / float(remaining_steps), 0.0), 1.0)
+            return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        # One multiplicative schedule preserves every configured group-LR ratio.
+        return LambdaLR(self.optimizer, lr_lambda=lr_multiplier)
     
     def _estimate_eta(self):
         elapsed = max(time.perf_counter() - self.run_start_time, 1e-6)
@@ -282,24 +458,54 @@ class Wan22Trainer:
         if not resume:
             return
         resume_path = Path(str(resume))
-        if resume_path.is_dir():
+        resume_kind = classify_training_resume_source(
+            resume_path, is_dual_regime=self.is_dual_regime
+        )
+        if resume_kind == "full_state":
             logger.info("Resuming full training state from directory: %s", resume)
             self.load_training_state(str(resume_path))
             return
-        if not resume_path.exists():
-            raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
         logger.info("Loading weight checkpoint only: %s", resume)
         self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
 
+    def _validate_loaded_training_contract(self, model) -> None:
+        if not self.is_dual_regime:
+            return
+        loaded = getattr(model, "dual_regime_training_contract", None)
+        if self.resume and loaded is not None and loaded != self.dual_regime_training_contract:
+            raise ValueError(
+                "Resumed dual-regime training contract differs from the current config: "
+                f"checkpoint={loaded}, current={self.dual_regime_training_contract}."
+            )
+        model.dual_regime_training_contract = self.dual_regime_training_contract
+        model.dual_regime_optimizer_steps = self.dual_regime_optimizer_steps
+        model.warm_start_provenance = self.warm_start_provenance
+
     def _set_dit_only_train_mode(self):
-        # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
-        logger.info("Setting DiT to train mode and freezing other model components.")
+        logger.info("Restoring configured train mode for groups=%s.", self.trainable_group_names)
         model = self.accelerator.unwrap_model(self.model)
-        self._apply_dit_only_train_mode(model)
+        model.eval()
+        model.mot.train()
+        for name in self.trainable_group_names:
+            module = {
+                "action": getattr(model, "action_expert", None),
+                "proprio": getattr(model, "proprio_encoder", None),
+                "video": getattr(model, "video_expert", None),
+            }[name]
+            if module is not None:
+                module.train()
+        for name, module in (
+            ("action", getattr(model, "action_expert", None)),
+            ("proprio", getattr(model, "proprio_encoder", None)),
+            ("video", getattr(model, "video_expert", None)),
+        ):
+            if module is not None and name not in self.trainable_group_names:
+                module.eval()
 
     @staticmethod
     def _apply_dit_only_train_mode(model):
+        """Legacy helper retained for callers outside the staged trainer path."""
         model.eval()
         model.requires_grad_(False)
         model.dit.train()
@@ -590,6 +796,15 @@ class Wan22Trainer:
 
     def _save_weights_checkpoint(self, step_tag: str):
         model = self.accelerator.unwrap_model(self.model)
+        if self.is_dual_regime:
+            model.dual_regime_optimizer_steps = int(self.dual_regime_optimizer_steps)
+            model.dual_regime_training_contract = self.dual_regime_training_contract
+            model.warm_start_provenance = self.warm_start_provenance
+            model.action_regime_weight_uncond = uncond_weight_at_step(
+                self.uncond_weight_schedule,
+                optimizer_step=self.dual_regime_optimizer_steps,
+                total_optimizer_steps=self.max_steps,
+            )
         stats_path = os.path.join(self.output_dir, "dataset_stats.json")
         if os.path.isfile(stats_path):
             model.dataset_stats_fingerprint = _sha256_file(stats_path)
@@ -604,10 +819,21 @@ class Wan22Trainer:
 
     def _save_trainer_state(self, state_path: str):
         state_file = os.path.join(state_path, "trainer_state.json")
+        stats_path = os.path.join(self.output_dir, "dataset_stats.json")
+        if self.is_dual_regime and not os.path.isfile(stats_path):
+            raise FileNotFoundError(
+                "Adaptive trainer state requires the exact dataset_stats.json."
+            )
         payload = {
             "global_step": int(self.global_step),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
+            "dual_regime_optimizer_steps": int(self.dual_regime_optimizer_steps),
+            "dual_regime_training_contract": self.dual_regime_training_contract,
+            "warm_start_provenance": self.warm_start_provenance,
+            "dataset_stats_fingerprint": (
+                _sha256_file(stats_path) if os.path.isfile(stats_path) else None
+            ),
         }
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
@@ -631,12 +857,35 @@ class Wan22Trainer:
         return {"weights_path": ckpt_path, "state_path": state_path}
 
     def load_training_state(self, state_dir: str):
-        self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
+        payload = None
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+        if self.is_dual_regime:
+            stats_path = os.path.join(self.output_dir, "dataset_stats.json")
+            if not os.path.isfile(stats_path):
+                raise FileNotFoundError(
+                    "Adaptive resume requires the current run dataset_stats.json."
+                )
+            current_stats = _sha256_file(stats_path)
+            validate_dual_regime_trainer_state(
+                payload,
+                expected_contract=self.dual_regime_training_contract,
+                expected_dataset_stats_fingerprint=current_stats,
+            )
+        self.accelerator.load_state(input_dir=state_dir)
+        if payload is not None:
             self.global_step = int(payload["global_step"])
+            if self.is_dual_regime:
+                self.dual_regime_optimizer_steps = int(
+                    payload["dual_regime_optimizer_steps"]
+                )
+                self.warm_start_provenance = payload.get("warm_start_provenance")
+                model = self.accelerator.unwrap_model(self.model)
+                model.dual_regime_optimizer_steps = self.dual_regime_optimizer_steps
+                model.dual_regime_training_contract = self.dual_regime_training_contract
+                model.warm_start_provenance = self.warm_start_provenance
 
             if "epoch" in payload and "batch_in_epoch" in payload:
                 self.epoch = int(payload["epoch"])
@@ -675,6 +924,98 @@ class Wan22Trainer:
             state_file,
         )
 
+    def _set_dual_regime_weight(self) -> float | None:
+        if not self.is_dual_regime:
+            return None
+        weight = uncond_weight_at_step(
+            self.uncond_weight_schedule,
+            optimizer_step=self.dual_regime_optimizer_steps,
+            total_optimizer_steps=self.max_steps,
+        )
+        model = self.accelerator.unwrap_model(self.model)
+        model.action_regime_weight_uncond = weight
+        return weight
+
+    def _capture_gradient_diagnostics_this_microbatch(self) -> bool:
+        return (
+            self.is_dual_regime
+            and self.gradient_diagnostics_every > 0
+            and self.accelerator.sync_gradients
+            and (self.dual_regime_optimizer_steps + 1)
+            % self.gradient_diagnostics_every
+            == 0
+        )
+
+    def _consume_gradient_diagnostics(self, model) -> dict[str, float]:
+        raw_losses = getattr(model, "_raw_dual_regime_losses", None)
+        if raw_losses is None or "idm" not in raw_losses or "uncond" not in raw_losses:
+            raise RuntimeError(
+                "Fused dual-regime model did not expose raw IDM/UNCOND losses for diagnostics."
+            )
+        try:
+            local_stats = raw_loss_gradient_statistics(
+                raw_losses["idm"],
+                raw_losses["uncond"],
+                dual_regime_gradient_parameter_groups(
+                    model,
+                    video_final_blocks=self.gradient_diagnostic_video_final_blocks,
+                ),
+            )
+        finally:
+            delattr(model, "_raw_dual_regime_losses")
+
+        metrics: dict[str, float] = {}
+        for group_name, values in local_stats.items():
+            gathered = self.accelerator.gather(values.reshape(1, -1))
+            totals = gathered.reshape(-1, values.numel()).sum(dim=0)
+            dot, idm_sq, uncond_sq, used_by_both, parameter_count = totals
+            denom = torch.sqrt(idm_sq * uncond_sq)
+            cosine = torch.where(
+                denom > 0,
+                dot / denom,
+                torch.full_like(denom, float("nan")),
+            )
+            prefix = f"gradient_alignment/{group_name}"
+            metrics[f"{prefix}/cosine"] = float(cosine.item())
+            metrics[f"{prefix}/idm_norm"] = float(torch.sqrt(idm_sq).item())
+            metrics[f"{prefix}/uncond_norm"] = float(torch.sqrt(uncond_sq).item())
+            metrics[f"{prefix}/used_fraction"] = float(
+                (used_by_both / parameter_count.clamp_min(1)).item()
+            )
+            metrics[f"{prefix}/unused_fraction"] = float(
+                (1.0 - used_by_both / parameter_count.clamp_min(1)).item()
+            )
+        return metrics
+
+    def _enable_frozen_video_diagnostic_parameters(
+        self, model
+    ) -> list[torch.nn.Parameter]:
+        """Temporarily expose frozen video suffixes only to ``autograd.grad``.
+
+        These leaves are switched off again before the main backward pass, so
+        they never enter optimizer state or DDP gradient reduction.
+        """
+        toggled = []
+        for param in _final_video_block_parameters(
+            model, self.gradient_diagnostic_video_final_blocks
+        ):
+            if not param.requires_grad:
+                param.requires_grad_(True)
+                toggled.append(param)
+        return toggled
+
+    def _apply_staged_gradient_freezing(self) -> None:
+        if "video" not in self.trainable_group_names:
+            return
+        fraction = self.dual_regime_optimizer_steps / float(max(self.max_steps, 1))
+        if fraction >= self.video_train_start_fraction:
+            return
+        for group in self.optimizer.param_groups:
+            if group.get("name") == "video":
+                group["lr"] = 0.0
+                for param in group["params"]:
+                    param.grad = None
+
     def train(self):
         self._set_dit_only_train_mode()
 
@@ -698,19 +1039,66 @@ class Wan22Trainer:
                 continue
 
             with self.accelerator.accumulate(self.model):
-                with self.accelerator.autocast():
-                    # Always enter through the prepared wrapper's forward so
-                    # DDP/DeepSpeed hooks and reducers observe every iteration.
-                    loss, loss_dict = _forward_prepared_model(self.model, sample)
+                self._set_dual_regime_weight()
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                capture_gradient_diagnostics = (
+                    self._capture_gradient_diagnostics_this_microbatch()
+                )
+                diagnostic_video_params = (
+                    self._enable_frozen_video_diagnostic_parameters(unwrapped_model)
+                    if capture_gradient_diagnostics
+                    else []
+                )
+                if hasattr(unwrapped_model, "_raw_dual_regime_losses"):
+                    delattr(unwrapped_model, "_raw_dual_regime_losses")
+                unwrapped_model._capture_raw_dual_regime_losses = (
+                    capture_gradient_diagnostics
+                )
+                try:
+                    with self.accelerator.autocast():
+                        # Always enter through the prepared wrapper's forward so
+                        # DDP/DeepSpeed hooks and reducers observe every iteration.
+                        loss, loss_dict = _forward_prepared_model(self.model, sample)
+                    diagnostic_metrics = (
+                        self._consume_gradient_diagnostics(unwrapped_model)
+                        if capture_gradient_diagnostics
+                        else {}
+                    )
+                finally:
+                    unwrapped_model._capture_raw_dual_regime_losses = False
+                    for param in diagnostic_video_params:
+                        param.requires_grad_(False)
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
+                    self._apply_staged_gradient_freezing()
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
-                    if not self.accelerator.optimizer_step_was_skipped:
+                    optimizer_step_was_skipped = bool(
+                        self.accelerator.optimizer_step_was_skipped
+                    )
+                    if not optimizer_step_was_skipped:
                         self.scheduler.step()
+                    self.global_step, self.dual_regime_optimizer_steps = (
+                        advance_successful_optimizer_steps(
+                            global_step=self.global_step,
+                            dual_regime_optimizer_steps=self.dual_regime_optimizer_steps,
+                            is_dual_regime=self.is_dual_regime,
+                            optimizer_step_was_skipped=optimizer_step_was_skipped,
+                        )
+                    )
+                    if self.is_dual_regime:
+                        unwrapped_model.dual_regime_optimizer_steps = (
+                            self.dual_regime_optimizer_steps
+                        )
                     self.optimizer.zero_grad(set_to_none=True)
-                    self.global_step += 1
+                    if optimizer_step_was_skipped:
+                        logger.warning(
+                            "Optimizer step was skipped; successful-step counters and "
+                            "dual-regime schedules remain at global_step=%d.",
+                            self.global_step,
+                        )
+                        continue
                     global_loss = float(
                         self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
                     )
@@ -720,12 +1108,21 @@ class Wan22Trainer:
                         global_loss_metrics[key] = float(
                             self.accelerator.gather(metric_tensor).mean().item()
                         )
+                    if self.is_dual_regime:
+                        global_loss_metrics["dual_regime_optimizer_steps"] = float(
+                            self.dual_regime_optimizer_steps
+                        )
+                        global_loss_metrics["dual_regime_schedule_fraction"] = float(
+                            self.dual_regime_optimizer_steps / max(self.max_steps, 1)
+                        )
+                    global_loss_metrics.update(diagnostic_metrics)
                     grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
 
-                    if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
+                    periodic_log = self.log_every > 0 and self.global_step % self.log_every == 0
+                    if (periodic_log or diagnostic_metrics) and self.accelerator.is_main_process:
                         eta_str, steps_per_sec = self._estimate_eta()
                         description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
                             self.epoch,
@@ -753,6 +1150,10 @@ class Wan22Trainer:
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
+                        for group in self.optimizer.param_groups:
+                            wandb_payload[f"train/lr_{group.get('name', 'unnamed')}"] = float(
+                                group["lr"]
+                            )
                         self._wandb_log(wandb_payload)
 
                     if (

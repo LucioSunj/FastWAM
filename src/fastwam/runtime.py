@@ -260,6 +260,7 @@ def create_fastwam_idm(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    checkpoint_task: str | None = None,
 ):
     from .models.wan22.fastwam_idm import (
         FastWAMIDM,
@@ -305,7 +306,7 @@ def create_fastwam_idm(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
-    return FastWAMIDM.from_wan22_pretrained(
+    model = FastWAMIDM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
         model_id=model_id,
@@ -328,6 +329,8 @@ def create_fastwam_idm(
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
     )
+    model.checkpoint_task = checkpoint_task
+    return model
 
 
 def build_datasets(data_cfg: DictConfig):

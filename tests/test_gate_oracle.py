@@ -164,6 +164,7 @@ def _meta(**overrides):
         "dataset_stats_fingerprint": "stats-sha",
         "num_video_frames": 9,
         "inference_steps": 20,
+        "solver_fingerprint": "solver-sha",
         "context_len": 128,
         "model_dtype": "torch.bfloat16",
         "cost_table": {"uncond": 0.2, "idm": 1.0},

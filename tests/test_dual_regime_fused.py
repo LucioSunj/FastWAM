@@ -698,6 +698,11 @@ class TestFusedDualRegimeTraining:
     def test_checkpoint_records_provenance(self, fused_model, tmp_path):
         m = fused_model
         m.dataset_stats_fingerprint = "test-stats-sha256"
+        m.dual_regime_optimizer_steps = 1
+        m.dual_regime_training_contract = {
+            "uncond_weight_schedule": [[0.0, 0.05], [1.0, 1.0]],
+            "total_optimizer_steps": 100,
+        }
         path = tmp_path / "step_test.pt"
         m.save_checkpoint(str(path))
         payload = torch.load(str(path), map_location="cpu")

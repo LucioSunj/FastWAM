@@ -31,7 +31,7 @@ EVALUATION:
   # Action inference
   action_horizon: null
   num_inference_steps: ${eval_num_inference_steps}
-  sigma_shift: null
+  sigma_shift: ${eval_sigma_shift}
   text_cfg_scale: 1.0
   negative_prompt: ""
   rand_device: cpu

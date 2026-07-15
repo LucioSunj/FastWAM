@@ -103,6 +103,7 @@ def main():
         help="must match the online gate WAM dtype",
     )
     ap.add_argument("--inference-steps", type=int, default=20)
+    ap.add_argument("--sigma-shift", type=float, default=None)
     ap.add_argument("--num-video-frames", type=int, default=None,
                     help="defaults to the dataset's derived sampled-video length")
     ap.add_argument("--cost-table", default=None, help="cost YAML from profile_wam_modes.py")
@@ -177,6 +178,7 @@ def main():
         num_video_frames=args.num_video_frames,
         generation_horizon=int(dataset.num_frames) - 1,
         inference_steps=args.inference_steps,
+        sigma_shift=args.sigma_shift,
         cost_table_path=args.cost_table,
         allow_legacy_checkpoint=args.allow_legacy_checkpoint,
         context_len=int(dataset.context_len),
@@ -272,6 +274,8 @@ def main():
         "ckpt": os.path.abspath(args.ckpt),
         "dataset_stats": resolved_stats,
         "inference_steps": args.inference_steps,
+        "solver_contract": adapter.solver_contract,
+        "solver_fingerprint": adapter.solver_fingerprint,
         "context_len": int(dataset.context_len),
         "model_dtype": str(model.torch_dtype),
         "num_video_frames": args.num_video_frames,

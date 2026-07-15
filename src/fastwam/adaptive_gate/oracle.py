@@ -39,6 +39,7 @@ SHARD_COMPAT_META_KEYS = (
     "dataset_stats_fingerprint",
     "num_video_frames",
     "inference_steps",
+    "solver_fingerprint",
     "context_len",
     "model_dtype",
     "cost_table",

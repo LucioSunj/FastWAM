@@ -15,7 +15,8 @@ model:
 
 # scheduler
 lr_scheduler_type: "cosine"
-learning_rate: 1e-4
+# Warm-start pilot: deliberately below the from-backbone 1e-4 recipe.
+learning_rate: 1e-5
 num_epochs: 10
 max_steps: null
 log_every: 10
@@ -26,3 +27,20 @@ eval_every: 200
 gradient_accumulation_steps: 1
 weight_decay: 1e-2
 resume: null
+
+dual_regime_training:
+  uncond_weight_schedule:
+    - {fraction: 0.0, weight: 0.05}
+    - {fraction: 0.1, weight: 0.05}
+    - {fraction: 0.4, weight: 0.5}
+    - {fraction: 1.0, weight: 1.0}
+  gradient_diagnostics_every: 200
+  gradient_diagnostic_video_final_blocks: 2
+  optimizer:
+    action_lr_scale: 1.0
+    proprio_lr_scale: 1.0
+    # Primary S-DR freezes the video expert. A conditional follow-up may set
+    # this to 0.05-0.1 and retain the 40% delayed-update boundary.
+    video_lr_scale: 0.0
+    video_final_blocks: 4
+    video_train_start_fraction: 0.4

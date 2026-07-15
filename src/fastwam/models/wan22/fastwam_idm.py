@@ -1,9 +1,16 @@
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 import torch.nn.functional as F
 
 from fastwam.utils.logging_config import get_logger
+from fastwam.adaptive_gate.controls import (
+    IDMControl,
+    ShuffledFutureDonor,
+    block_action_future_reads,
+    coerce_idm_control,
+    intervene_video_latents,
+)
 
 from .fastwam_joint import FastWAMJoint
 
@@ -246,6 +253,10 @@ class FastWAMIDM(FastWAMJoint):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        return_video_latents: bool = False,
+        idm_control: IDMControl | str = IDMControl.VALID_IDM,
+        shuffled_future_donor: Optional[ShuffledFutureDonor] = None,
+        expected_donor_metadata: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         # Reuse infer_joint pipeline and keep infer_action output contract.
         # Explicit class dispatch is required for MetricAdaptiveFastWAM: dynamic
@@ -272,8 +283,17 @@ class FastWAMIDM(FastWAMJoint):
             tiled=tiled,
             test_action_with_infer_action=False,
             decode_video=False,
+            return_video_latents=return_video_latents,
+            idm_control=idm_control,
+            shuffled_future_donor=shuffled_future_donor,
+            expected_donor_metadata=expected_donor_metadata,
         )
-        return {"action": out["action"]}
+        result = {"action": out["action"]}
+        if "video_latents" in out:
+            result["video_latents"] = out["video_latents"]
+        if "idm_control" in out:
+            result["idm_control"] = out["idm_control"]
+        return result
 
     @torch.no_grad()
     def infer_joint(
@@ -298,9 +318,19 @@ class FastWAMIDM(FastWAMJoint):
         tiled: bool = False,
         test_action_with_infer_action: bool = True,
         decode_video: bool = True,
+        return_video_latents: bool = False,
+        idm_control: IDMControl | str = IDMControl.VALID_IDM,
+        shuffled_future_donor: Optional[ShuffledFutureDonor] = None,
+        expected_donor_metadata: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         del negative_prompt, text_cfg_scale, test_action_with_infer_action
         self.eval()
+        selected_control = coerce_idm_control(idm_control)
+        if selected_control is IDMControl.EXTRA_COMPUTE:
+            raise ValueError(
+                "extra_compute must run the UNCOND/base branch with additional "
+                "action steps; it is not valid inside FastWAMIDM.infer_joint()."
+            )
         video_steps = int(video_inference_steps if video_inference_steps is not None else num_inference_steps)
         action_steps = int(action_inference_steps if action_inference_steps is not None else num_inference_steps)
 
@@ -418,6 +448,16 @@ class FastWAMIDM(FastWAMJoint):
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
+        # Intervention happens only after the recipient has paid the complete
+        # video-generation cost. Frame zero always remains the recipient state.
+        latents_video = intervene_video_latents(
+            latents_video,
+            control=selected_control,
+            first_frame_latents=first_frame_latents,
+            donor=shuffled_future_donor,
+            expected_donor_metadata=expected_donor_metadata,
+        )
+
         # Stage 2: freeze denoised video as cond and denoise action via video K/V cache.
         timestep_video_cond = torch.zeros(
             (latents_video.shape[0],), dtype=latents_video.dtype, device=self.device
@@ -437,6 +477,12 @@ class FastWAMIDM(FastWAMJoint):
             video_tokens_per_frame=int(video_pre_cond["meta"]["tokens_per_frame"]),
             device=video_pre_cond["tokens"].device,
         )
+        if selected_control is IDMControl.NO_READ:
+            attention_mask = block_action_future_reads(
+                attention_mask,
+                video_seq_len=video_seq_len,
+                video_tokens_per_frame=int(video_pre_cond["meta"]["tokens_per_frame"]),
+            )
         video_kv_cache = self.mot.prefill_video_cache(
             video_tokens=video_pre_cond["tokens"],
             video_freqs=video_pre_cond["freqs"],
@@ -472,4 +518,9 @@ class FastWAMIDM(FastWAMJoint):
         }
         if decode_video:
             result["video"] = self._decode_latents(latents_video, tiled=tiled)
+        if return_video_latents:
+            result["video_latents"] = latents_video.detach().to(
+                device="cpu", dtype=torch.float32
+            )
+        result["idm_control"] = selected_control.value
         return result

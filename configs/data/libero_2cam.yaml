@@ -1,5 +1,8 @@
 train:
   _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+  # Keep null for from-scratch normalization; strict warm-start launchers bind
+  # this to the parent IDM dataset_stats.json.
+  pretrained_norm_stats: null
   dataset_dirs:
     - ./data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
     - ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot

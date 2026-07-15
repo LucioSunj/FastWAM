@@ -18,6 +18,9 @@ from fastwam.adaptive_gate import (  # noqa: E402
     coerce_mode,
     default_cost_table,
     explicit_eval_branch,
+    dual_regime_schedule_fingerprint,
+    inference_solver_contract,
+    inference_solver_fingerprint,
     load_cost_table,
     mode_from_index,
     mode_to_branch_steps,
@@ -30,6 +33,31 @@ from fastwam.adaptive_gate import (  # noqa: E402
     validate_action_only_attention_mode,
     validate_dataset_stats_fingerprint,
 )
+
+
+def _schedule_contract():
+    return {
+        "uncond_weight_schedule": [[0.0, 0.05], [1.0, 1.0]],
+        "total_optimizer_steps": 100,
+    }
+
+
+STATS_SHA = "c" * 64
+
+
+def _with_schedule(provenance):
+    provenance = dict(provenance)
+    contract = _schedule_contract()
+    provenance["dual_regime_training_contract"] = contract
+    provenance["schedule_fingerprint"] = dual_regime_schedule_fingerprint(contract)
+    provenance["initialization_type"] = "standalone_idm"
+    provenance["parent_checkpoint_id"] = "parent-id"
+    provenance["parent_checkpoint_sha256"] = "a" * 64
+    provenance["parent_config_sha256"] = "b" * 64
+    provenance["parent_dataset_stats_sha256"] = provenance.get(
+        "dataset_stats_fingerprint", "c" * 64
+    )
+    return provenance
 
 
 def test_binary_mode_contract():
@@ -53,6 +81,28 @@ def test_binary_mode_contract():
     assert validate_action_only_attention_mode("per_frame_causal") == "per_frame_causal"
     with pytest.raises(ValueError):
         validate_action_only_attention_mode("bidirectional")
+
+
+def test_solver_fingerprint_binds_video_action_steps_and_shift():
+    model = _StubModel()
+    base = inference_solver_contract(
+        model, video_inference_steps=20, action_inference_steps=20
+    )
+    shifted = inference_solver_contract(
+        model,
+        video_inference_steps=20,
+        action_inference_steps=20,
+        sigma_shift=7.0,
+    )
+    more_action = inference_solver_contract(
+        model, video_inference_steps=20, action_inference_steps=21
+    )
+    fingerprints = {
+        inference_solver_fingerprint(base),
+        inference_solver_fingerprint(shifted),
+        inference_solver_fingerprint(more_action),
+    }
+    assert len(fingerprints) == 3
 
 
 def test_explicit_eval_branch_for_adaptive_and_vanilla_models():
@@ -140,6 +190,11 @@ class _StubVAE:
     model = _StubVAEModel()
 
 
+class _StubScheduler:
+    shift = 5.0
+    num_train_timesteps = 1000
+
+
 class _StubModel:
     adaptive_regimes = ("uncond", "idm")
     adaptive_backbone_kind = "idm"
@@ -152,6 +207,8 @@ class _StubModel:
         self.proprio_dim = None
         self.encode_calls = 0
         self.calls = []
+        self.infer_video_scheduler = _StubScheduler()
+        self.infer_action_scheduler = _StubScheduler()
 
     def _encode_input_image_latents_tensor(self, image):
         assert image.dtype == torch.bfloat16
@@ -171,6 +228,7 @@ class _StubModel:
         context=None,
         context_mask=None,
         num_inference_steps=20,
+        sigma_shift=None,
         seed=None,
         force_branch=None,
         return_routing_info=False,
@@ -226,13 +284,21 @@ def test_adapter_rejects_joint_and_unverified_legacy_checkpoint():
 
 def test_adapter_validates_cost_profile_metadata_and_resolution(tmp_path):
     model = _StubModel()
-    model._loaded_checkpoint_provenance = {
+    model._loaded_checkpoint_provenance = _with_schedule({
         "schema_version": 2,
         "adaptive_regimes": ["uncond", "idm"], "checkpoint_id": "abc", "task": "libero",
         "action_regime_weight_uncond": 1.0,
-        "dataset_stats_fingerprint": "stats-abc",
-    }
+        "dual_regime_optimizer_steps": 12,
+        "dataset_stats_fingerprint": STATS_SHA,
+    })
     model._loaded_checkpoint_fingerprint = "abc"
+    solver_fingerprint = inference_solver_fingerprint(
+        inference_solver_contract(
+            model,
+            video_inference_steps=20,
+            action_inference_steps=20,
+        )
+    )
     path = str(tmp_path / "profile.yaml")
     save_cost_table(
         path,
@@ -242,6 +308,7 @@ def test_adapter_validates_cost_profile_metadata_and_resolution(tmp_path):
             "backbone_kind": "idm",
             "ckpt_fingerprint": "abc",
             "inference_steps": 20,
+            "solver_fingerprint": solver_fingerprint,
             "num_video_frames": 9,
             "action_horizon": 32,
             "height": 64,
@@ -254,7 +321,7 @@ def test_adapter_validates_cost_profile_metadata_and_resolution(tmp_path):
     )
     adapter = _adapter(
         model, task="libero", cost_table_path=path,
-        dataset_stats_fingerprint="stats-abc",
+        dataset_stats_fingerprint=STATS_SHA,
     )
     adapter.act(
         input_image=torch.rand(1, 3, 64, 64),
@@ -264,7 +331,7 @@ def test_adapter_validates_cost_profile_metadata_and_resolution(tmp_path):
     )
     bad_resolution_adapter = _adapter(
         model, task="libero", cost_table_path=path,
-        dataset_stats_fingerprint="stats-abc",
+        dataset_stats_fingerprint=STATS_SHA,
     )
     with pytest.raises(ValueError, match="resolution"):
         bad_resolution_adapter.act(
@@ -277,7 +344,7 @@ def test_adapter_validates_cost_profile_metadata_and_resolution(tmp_path):
     with pytest.raises(ValueError, match="task"):
         _adapter(
             model, task="robotwin", cost_table_path=path,
-            dataset_stats_fingerprint="stats-abc",
+            dataset_stats_fingerprint=STATS_SHA,
         )
 
     with pytest.raises(ValueError, match="generation_horizon override"):
@@ -290,14 +357,28 @@ def test_adapter_validates_cost_profile_metadata_and_resolution(tmp_path):
         )
 
     untrained = _StubModel()
-    untrained._loaded_checkpoint_provenance = {
+    untrained._loaded_checkpoint_provenance = _with_schedule({
         "schema_version": 2, "checkpoint_id": "untrained",
         "adaptive_regimes": ["uncond", "idm"], "task": "libero",
         "action_regime_weight_uncond": 0.0,
-        "dataset_stats_fingerprint": "stats-abc",
-    }
+        "dual_regime_optimizer_steps": 1,
+        "dataset_stats_fingerprint": STATS_SHA,
+    })
     with pytest.raises(ValueError, match="positive"):
         _adapter(untrained, task="libero")
+
+    s0 = _StubModel()
+    s0._loaded_checkpoint_provenance = _with_schedule({
+        "schema_version": 2,
+        "checkpoint_id": "s0",
+        "adaptive_regimes": ["uncond", "idm"],
+        "task": "libero",
+        "action_regime_weight_uncond": 0.05,
+        "dual_regime_optimizer_steps": 0,
+        "dataset_stats_fingerprint": STATS_SHA,
+    })
+    with pytest.raises(ValueError, match="untrained S0"):
+        _adapter(s0, task="libero")
 
     with pytest.raises(ValueError, match="Dataset-stats fingerprint"):
         _adapter(
@@ -306,12 +387,28 @@ def test_adapter_validates_cost_profile_metadata_and_resolution(tmp_path):
             dataset_stats_fingerprint="different-stats",
         )
 
+    scratch = _StubModel()
+    scratch._loaded_checkpoint_provenance = _with_schedule(
+        {
+            "schema_version": 2,
+            "checkpoint_id": "scratch",
+            "adaptive_regimes": ["uncond", "idm"],
+            "task": "libero",
+            "action_regime_weight_uncond": 1.0,
+            "dual_regime_optimizer_steps": 12,
+            "dataset_stats_fingerprint": STATS_SHA,
+        }
+    )
+    scratch._loaded_checkpoint_provenance["initialization_type"] = "scratch"
+    with pytest.raises(ValueError, match="standalone IDM"):
+        _adapter(scratch, task="libero", dataset_stats_fingerprint=STATS_SHA)
+
     malformed = _StubModel()
     malformed._loaded_checkpoint_provenance = {
         "adaptive_regimes": ["uncond", "idm"],
         "task": "libero",
         "action_regime_weight_uncond": 1.0,
-        "dataset_stats_fingerprint": "stats-abc",
+        "dataset_stats_fingerprint": STATS_SHA,
     }
     with pytest.raises(ValueError, match="schema_version"):
         _adapter(malformed, task="libero")
@@ -364,6 +461,8 @@ def test_checkpoint_provenance_roundtrip_sets_stable_fingerprint(tmp_path):
         FastWAM.save_checkpoint(source, str(path), step=3)
     source.dataset_stats_fingerprint = "stats-sha256"
     source.action_regime_weight_uncond = 1.0
+    source.dual_regime_optimizer_steps = 3
+    source.dual_regime_training_contract = _schedule_contract()
     FastWAM.save_checkpoint(source, str(path), step=3)
     target = Tiny()
     payload = FastWAM.load_checkpoint(target, str(path))
@@ -371,6 +470,7 @@ def test_checkpoint_provenance_roundtrip_sets_stable_fingerprint(tmp_path):
     assert target._loaded_checkpoint_fingerprint == checkpoint_id
     assert target._loaded_checkpoint_provenance["adaptive_regimes"] == ["uncond", "idm"]
     assert target._loaded_checkpoint_provenance["dataset_stats_fingerprint"] == "stats-sha256"
+    assert target.dual_regime_optimizer_steps == 3
 
     malformed_payload = torch.load(path, weights_only=False)
     malformed_payload["fastwam_provenance"].pop("checkpoint_id")

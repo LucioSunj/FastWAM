@@ -103,6 +103,12 @@ def main():
         help="must match actor.model.wam.dtype",
     )
     ap.add_argument("--inference-steps", type=int, default=20)
+    ap.add_argument(
+        "--sigma-shift",
+        type=float,
+        default=None,
+        help="optional inference-schedule shift override; part of solver provenance",
+    )
     ap.add_argument("--height", type=int, default=224)
     ap.add_argument("--width", type=int, default=448)
     ap.add_argument("--num-video-frames", type=int, default=9)
@@ -124,6 +130,7 @@ def main():
         num_video_frames=args.num_video_frames,
         generation_horizon=args.action_horizon,
         inference_steps=args.inference_steps,
+        sigma_shift=args.sigma_shift,
         context_len=args.context_len,
         default_seed=0,
         allow_legacy_checkpoint=args.allow_legacy_checkpoint,
@@ -170,6 +177,8 @@ def main():
             "backbone_kind": args.backbone_kind,
             "ckpt_fingerprint": model._loaded_checkpoint_fingerprint,
             "inference_steps": args.inference_steps,
+            "solver_contract": adapter.solver_contract,
+            "solver_fingerprint": adapter.solver_fingerprint,
             "height": args.height,
             "width": args.width,
             "num_video_frames": args.num_video_frames,

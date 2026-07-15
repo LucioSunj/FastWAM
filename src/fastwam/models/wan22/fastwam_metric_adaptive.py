@@ -152,6 +152,10 @@ class MetricAdaptiveFastWAM(FastWAMIDM):
         routing_metric_value: float | None = None,
         force_branch: str | None = None,
         return_routing_info: bool = False,
+        return_video_latents: bool = False,
+        idm_control: Any = "valid_idm",
+        shuffled_future_donor: Any = None,
+        expected_donor_metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         kwargs = locals()
         kwargs.pop("self")
@@ -181,6 +185,10 @@ class MetricAdaptiveFastWAM(FastWAMIDM):
         routing_metric_value: float | None = None,
         force_branch: str | None = None,
         return_routing_info: bool = False,
+        return_video_latents: bool = False,
+        idm_control: Any = "valid_idm",
+        shuffled_future_donor: Any = None,
+        expected_donor_metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         kwargs = locals()
         kwargs.pop("self")
@@ -210,6 +218,9 @@ class MetricAdaptiveFastWAM(FastWAMIDM):
         routing_metric_value: float | None = None,
         force_branch: str | None = None,
         return_routing_info: bool = False,
+        idm_control: Any = "valid_idm",
+        shuffled_future_donor: Any = None,
+        expected_donor_metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         kwargs = locals()
         kwargs.pop("self")

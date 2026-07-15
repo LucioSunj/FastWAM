@@ -12,9 +12,34 @@ from .cost import (
     validate_cost_table,
 )
 from .contracts import ACTION_ONLY_ATTENTION_MODES, validate_action_only_attention_mode
+from .controls import (
+    IDM_CONTROL_ORDER,
+    DONOR_BANK_VERSION,
+    DONOR_CELL_FIELDS,
+    IDMControl,
+    ShuffledFutureBank,
+    ShuffledFutureDonor,
+    block_action_future_reads,
+    coerce_idm_control,
+    donor_cell,
+    intervene_video_latents,
+    validate_donor_metadata,
+)
+from .plus_manifest import (
+    PLUS_MANIFEST_SCHEMA,
+    PlusEpisode,
+    PlusManifest,
+    load_plus_manifest,
+)
 from .features import DEFAULT_TEXT_FEAT_DIM, TEXT_FEAT_LAYOUT, pool_text_context
 from .eval_routing import explicit_eval_branch
-from .provenance import sha256_file, validate_dataset_stats_fingerprint
+from .provenance import (
+    dual_regime_schedule_fingerprint,
+    inference_solver_contract,
+    inference_solver_fingerprint,
+    sha256_file,
+    validate_dataset_stats_fingerprint,
+)
 from .modes import (
     MODE_ORDER,
     NUM_MODES,
@@ -24,7 +49,14 @@ from .modes import (
     mode_to_branch_steps,
     mode_to_index,
 )
-from .training import normalized_dual_regime_action_loss
+from .training import (
+    build_optimizer_parameter_groups,
+    canonicalize_uncond_weight_schedule,
+    normalized_dual_regime_action_loss,
+    raw_loss_gradient_statistics,
+    uncond_weight_at_step,
+)
+from .warm_start import strict_standalone_idm_warm_start, warm_start_is_enabled
 from .oracle import (
     LABEL_SHARD_VERSION,
     SHARD_DATA_KEYS,
@@ -54,6 +86,12 @@ __all__ = [
     "mode_to_index",
     "mode_to_branch_steps",
     "normalized_dual_regime_action_loss",
+    "canonicalize_uncond_weight_schedule",
+    "uncond_weight_at_step",
+    "raw_loss_gradient_statistics",
+    "build_optimizer_parameter_groups",
+    "strict_standalone_idm_warm_start",
+    "warm_start_is_enabled",
     "WAMModeAdapter",
     "EncodedWorldState",
     "WORLD_FEAT_LAYOUT",
@@ -62,6 +100,9 @@ __all__ = [
     "TEXT_FEAT_LAYOUT",
     "explicit_eval_branch",
     "sha256_file",
+    "dual_regime_schedule_fingerprint",
+    "inference_solver_contract",
+    "inference_solver_fingerprint",
     "validate_dataset_stats_fingerprint",
     "default_cost_table",
     "normalize_cost_table",
@@ -70,6 +111,21 @@ __all__ = [
     "validate_cost_table",
     "ACTION_ONLY_ATTENTION_MODES",
     "validate_action_only_attention_mode",
+    "IDMControl",
+    "IDM_CONTROL_ORDER",
+    "DONOR_BANK_VERSION",
+    "DONOR_CELL_FIELDS",
+    "ShuffledFutureDonor",
+    "ShuffledFutureBank",
+    "PLUS_MANIFEST_SCHEMA",
+    "PlusEpisode",
+    "PlusManifest",
+    "load_plus_manifest",
+    "coerce_idm_control",
+    "donor_cell",
+    "intervene_video_latents",
+    "block_action_future_reads",
+    "validate_donor_metadata",
     # oracle labels (M3: self-supervised SFT targets from raw VLA data)
     "IDM_INDEX",
     "LABEL_SHARD_VERSION",

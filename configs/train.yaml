@@ -22,6 +22,7 @@ log_every: 10
 save_every: 100
 eval_every: 50
 eval_num_inference_steps: 10
+eval_sigma_shift: null
 
 # training
 gradient_accumulation_steps: 1
@@ -30,6 +31,30 @@ seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
 resume: null
+
+# A new dual-regime lineage may be initialized from a verified standalone IDM
+# checkpoint. All fields must remain null together when the operation is off.
+warm_start:
+  kind: null
+  checkpoint: null
+  expected_checkpoint_sha256: null
+  source_task: null
+  source_config: null
+  source_dataset_stats: null
+
+dual_regime_training:
+  uncond_weight_schedule: null
+  gradient_diagnostics_every: 0
+  optimizer:
+    action_lr_scale: 1.0
+    proprio_lr_scale: 1.0
+    # null resolves to 0 for adaptive dual-regime models and 1 for legacy
+    # standalone training.
+    video_lr_scale: null
+    # null preserves the original non-adaptive recipe. Dual-regime tasks set a
+    # finite suffix and keep video_lr_scale=0 unless the fallback is triggered.
+    video_final_blocks: null
+    video_train_start_fraction: 0.0
 
 # wandb
 wandb:

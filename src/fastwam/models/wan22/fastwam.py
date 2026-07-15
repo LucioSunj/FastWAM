@@ -8,6 +8,10 @@ from PIL import Image
 
 from fastwam.utils.logging_config import get_logger
 from fastwam.adaptive_gate.contracts import validate_action_only_attention_mode
+from fastwam.adaptive_gate.provenance import (
+    checkpoint_model_contract,
+    dual_regime_schedule_fingerprint,
+)
 
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
@@ -1162,7 +1166,48 @@ class FastWAM(torch.nn.Module):
             "action_dim": int(self.action_expert.action_dim),
             "proprio_dim": self.proprio_dim,
             "video_latent_dim": int(self.vae.model.z_dim),
+            "model_contract": checkpoint_model_contract(self),
         }
+        if adaptive_regimes:
+            dual_steps = getattr(self, "dual_regime_optimizer_steps", 0)
+            if (
+                not isinstance(dual_steps, int)
+                or isinstance(dual_steps, bool)
+                or dual_steps < 0
+            ):
+                raise ValueError(
+                    "dual_regime_optimizer_steps must be a non-negative integer, got "
+                    f"{dual_steps}."
+                )
+            warm_start = getattr(self, "warm_start_provenance", None)
+            contract = getattr(self, "dual_regime_training_contract", None)
+            schedule_fingerprint = dual_regime_schedule_fingerprint(contract)
+            if dual_steps > int(contract["total_optimizer_steps"]):
+                raise ValueError(
+                    "dual_regime_optimizer_steps cannot exceed the contracted "
+                    f"total: {dual_steps} > {contract['total_optimizer_steps']}."
+                )
+            provenance["dual_regime_optimizer_steps"] = dual_steps
+            provenance["warm_start_provenance"] = warm_start
+            provenance["dual_regime_training_contract"] = contract
+            provenance["schedule_fingerprint"] = schedule_fingerprint
+            provenance["initialization_type"] = (
+                "scratch" if warm_start is None else warm_start.get("initialization_type")
+            )
+            provenance["parent_checkpoint_id"] = (
+                None if warm_start is None else warm_start.get("parent_checkpoint_id")
+            )
+            provenance["parent_checkpoint_sha256"] = (
+                None if warm_start is None else warm_start.get("parent_checkpoint_sha256")
+            )
+            provenance["parent_config_sha256"] = (
+                None if warm_start is None else warm_start.get("parent_config_sha256")
+            )
+            provenance["parent_dataset_stats_sha256"] = (
+                None
+                if warm_start is None
+                else warm_start.get("parent_dataset_stats_sha256")
+            )
         payload = {
             "mot": self.mot.state_dict(),
             "step": step,
@@ -1222,13 +1267,41 @@ class FastWAM(torch.nn.Module):
                     "Checkpoint adaptive backbone does not match the model: "
                     f"checkpoint={actual_kind!r}, model={expected_kind!r}."
                 )
+            if expected_regimes:
+                contract = provenance.get("dual_regime_training_contract")
+                expected_schedule_fingerprint = dual_regime_schedule_fingerprint(
+                    contract
+                )
+                if provenance.get("schedule_fingerprint") != expected_schedule_fingerprint:
+                    raise ValueError(
+                        "Adaptive checkpoint schedule_fingerprint does not match its "
+                        "dual-regime training contract."
+                    )
+                dual_steps = provenance.get("dual_regime_optimizer_steps")
+                total_steps = int(contract["total_optimizer_steps"])
+                if (
+                    isinstance(dual_steps, bool)
+                    or not isinstance(dual_steps, int)
+                    or not 0 <= dual_steps <= total_steps
+                ):
+                    raise ValueError(
+                        "Adaptive checkpoint dual_regime_optimizer_steps is outside "
+                        f"its schedule contract: {dual_steps!r} vs [0,{total_steps}]."
+                    )
             expected_task = getattr(self, "checkpoint_task", None)
             actual_task = provenance.get("task")
             if actual_task != expected_task:
-                raise ValueError(
-                    "Checkpoint task does not match the configured model: "
-                    f"checkpoint={actual_task!r}, model={expected_task!r}."
-                )
+                if not expected_regimes and actual_task is None:
+                    logger.warning(
+                        "Standalone checkpoint predates task binding; configured task=%r. "
+                        "Use the strict warm-start contract to hash and record its source config.",
+                        expected_task,
+                    )
+                else:
+                    raise ValueError(
+                        "Checkpoint task does not match the configured model: "
+                        f"checkpoint={actual_task!r}, model={expected_task!r}."
+                    )
             expected_dims = {
                 "action_dim": int(self.action_expert.action_dim),
                 "proprio_dim": self.proprio_dim,
@@ -1244,6 +1317,19 @@ class FastWAM(torch.nn.Module):
                     "Checkpoint dimensions do not match the configured model "
                     f"(checkpoint, model): {dim_mismatches}."
                 )
+            actual_contract = provenance.get("model_contract")
+            if actual_contract is not None:
+                expected_contract = checkpoint_model_contract(self)
+                if actual_contract != expected_contract:
+                    mismatches = {
+                        key: (actual_contract.get(key), expected_contract.get(key))
+                        for key in sorted(set(actual_contract) | set(expected_contract))
+                        if actual_contract.get(key) != expected_contract.get(key)
+                    }
+                    raise ValueError(
+                        "Checkpoint model contract does not match the configured model "
+                        f"(checkpoint, model): {mismatches}."
+                    )
         if "mot" in payload:
             # New checkpoints are self-describing and therefore load strictly.
             # Legacy payloads retain permissive loading for compatibility.
@@ -1269,6 +1355,19 @@ class FastWAM(torch.nn.Module):
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
+        if provenance is not None:
+            if "dual_regime_optimizer_steps" in provenance:
+                dual_steps = provenance["dual_regime_optimizer_steps"]
+                if not isinstance(dual_steps, int) or isinstance(dual_steps, bool) or dual_steps < 0:
+                    raise ValueError(
+                        "Malformed dual_regime_optimizer_steps in checkpoint provenance: "
+                        f"{dual_steps!r}."
+                    )
+                self.dual_regime_optimizer_steps = dual_steps
+            self.warm_start_provenance = provenance.get("warm_start_provenance")
+            self.dual_regime_training_contract = provenance.get(
+                "dual_regime_training_contract"
+            )
         return payload
 
     def forward(self, *args, **kwargs):

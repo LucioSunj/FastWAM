@@ -11,7 +11,13 @@ import torch
 import torch.nn.functional as F
 
 from .cost import default_cost_table, load_cost_table, validate_cost_table
+from .controls import IDMControl, ShuffledFutureDonor, coerce_idm_control
 from .modes import WAMMode, coerce_mode, mode_to_branch_steps
+from .provenance import (
+    dual_regime_schedule_fingerprint,
+    inference_solver_contract,
+    inference_solver_fingerprint,
+)
 
 
 WORLD_FEAT_LAYOUT = "spatial_2x2_plus_channel_std_v1"
@@ -39,6 +45,7 @@ class WAMModeAdapter:
         num_video_frames: int,
         generation_horizon: int,
         inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
         context_len: int = 128,
         dataset_stats_fingerprint: Optional[str] = None,
         cost_table: Optional[dict[str, float]] = None,
@@ -70,6 +77,7 @@ class WAMModeAdapter:
         self.num_video_frames = int(num_video_frames)
         self.generation_horizon = int(generation_horizon)
         self.inference_steps = int(inference_steps)
+        self.sigma_shift = None if sigma_shift is None else float(sigma_shift)
         self.context_len = int(context_len)
         self.dataset_stats_fingerprint = dataset_stats_fingerprint
         self.cost_source = None if cost_source is None else str(cost_source)
@@ -79,11 +87,20 @@ class WAMModeAdapter:
             or self.generation_horizon <= 0
             or self.inference_steps <= 0
             or self.context_len <= 0
+            or (self.sigma_shift is not None and self.sigma_shift <= 0)
         ):
             raise ValueError(
                 "num_video_frames, generation_horizon and inference_steps must be positive; "
                 f"got {self.num_video_frames}, {self.generation_horizon}, {self.inference_steps}."
             )
+
+        self.solver_contract = inference_solver_contract(
+            self.model,
+            video_inference_steps=self.inference_steps,
+            action_inference_steps=self.inference_steps,
+            sigma_shift=self.sigma_shift,
+        )
+        self.solver_fingerprint = inference_solver_fingerprint(self.solver_contract)
 
         self._validate_checkpoint_provenance(
             allow_legacy_checkpoint=allow_legacy_checkpoint,
@@ -116,6 +133,7 @@ class WAMModeAdapter:
             "backbone_kind": "idm",
             "ckpt_fingerprint": getattr(self.model, "_loaded_checkpoint_fingerprint", None),
             "inference_steps": self.inference_steps,
+            "solver_fingerprint": self.solver_fingerprint,
             "num_video_frames": self.num_video_frames,
             "action_horizon": self.generation_horizon,
             "context_len": self.context_len,
@@ -213,6 +231,58 @@ class WAMModeAdapter:
             raise ValueError(
                 "Checkpoint is not a dual-regime UNCOND+IDM checkpoint: "
                 f"adaptive_regimes={regimes!r}."
+            )
+        dual_steps = provenance.get("dual_regime_optimizer_steps")
+        if (
+            not isinstance(dual_steps, int)
+            or isinstance(dual_steps, bool)
+            or dual_steps <= 0
+        ):
+            raise ValueError(
+                "Checkpoint is an untrained S0 artifact or does not prove any "
+                "dual-regime optimizer update: "
+                f"dual_regime_optimizer_steps={dual_steps!r}."
+            )
+        contract = provenance.get("dual_regime_training_contract")
+        try:
+            expected_schedule_fingerprint = dual_regime_schedule_fingerprint(contract)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Checkpoint has no valid deterministic dual-regime schedule contract."
+            ) from exc
+        if provenance.get("schedule_fingerprint") != expected_schedule_fingerprint:
+            raise ValueError(
+                "Checkpoint schedule_fingerprint does not match its training contract."
+            )
+        if dual_steps > int(contract["total_optimizer_steps"]):
+            raise ValueError(
+                "Checkpoint dual_regime_optimizer_steps exceeds its training contract."
+            )
+        if provenance.get("initialization_type") != "standalone_idm":
+            raise ValueError(
+                "Production adaptive Gate checkpoints must be initialized from the "
+                "verified standalone IDM endpoint."
+            )
+        parent_id = provenance.get("parent_checkpoint_id")
+        if not isinstance(parent_id, str) or not parent_id:
+            raise ValueError("Checkpoint is missing parent_checkpoint_id lineage.")
+        for key in (
+            "parent_checkpoint_sha256",
+            "parent_config_sha256",
+            "parent_dataset_stats_sha256",
+        ):
+            value = provenance.get(key)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+            ):
+                raise ValueError(f"Checkpoint has invalid {key} lineage.")
+        if provenance["parent_dataset_stats_sha256"] != provenance.get(
+            "dataset_stats_fingerprint"
+        ):
+            raise ValueError(
+                "Parent and shared checkpoint dataset-stats lineage must match."
             )
         regime_weight = provenance.get("action_regime_weight_uncond")
         regime_weight_value = None if regime_weight is None else float(regime_weight)
@@ -368,6 +438,7 @@ class WAMModeAdapter:
             context=context,
             context_mask=context_mask,
             num_inference_steps=steps,
+            sigma_shift=self.sigma_shift,
             seed=seed if seed is not None else self.default_seed,
             force_branch=branch,
             return_routing_info=True,
@@ -385,3 +456,136 @@ class WAMModeAdapter:
                 "routing": out.get("_routing"),
             },
         }
+
+    @torch.no_grad()
+    def act_control(
+        self,
+        *,
+        input_image: torch.Tensor,
+        control: IDMControl | str,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        prompt: Optional[str] = None,
+        generation_horizon: Optional[int] = None,
+        num_video_frames: Optional[int] = None,
+        encoded_state: Optional[EncodedWorldState] = None,
+        seed: Optional[int] = None,
+        shuffled_future_donor: Optional[ShuffledFutureDonor] = None,
+        expected_donor_metadata: Optional[dict[str, Any]] = None,
+        extra_action_steps: Optional[int] = None,
+        return_video_latents: bool = False,
+    ) -> dict[str, Any]:
+        """Run a mechanism control without extending the production mode space."""
+        selected = coerce_idm_control(control)
+        if selected is IDMControl.VALID_IDM and not return_video_latents:
+            if shuffled_future_donor is not None or extra_action_steps is not None:
+                raise ValueError("valid_idm does not accept donor or extra-action-step overrides.")
+            return self.act(
+                input_image=input_image,
+                mode=WAMMode.IDM,
+                proprio=proprio,
+                context=context,
+                context_mask=context_mask,
+                prompt=prompt,
+                generation_horizon=generation_horizon,
+                num_video_frames=num_video_frames,
+                encoded_state=encoded_state,
+                seed=seed,
+            )
+
+        self._validate_cost_resolution(input_image)
+        requested_horizon = (
+            self.generation_horizon if generation_horizon is None else int(generation_horizon)
+        )
+        requested_frames = (
+            self.num_video_frames if num_video_frames is None else int(num_video_frames)
+        )
+        if requested_horizon <= 0 or requested_frames <= 0:
+            raise ValueError("generation_horizon and num_video_frames must be positive.")
+        if self._cost_meta is not None and (
+            requested_horizon != self.generation_horizon
+            or requested_frames != self.num_video_frames
+        ):
+            raise ValueError("control shape overrides are incompatible with the profiled WAM shape.")
+        expected_proprio_dim = getattr(self.model, "proprio_dim", None)
+        if expected_proprio_dim is not None:
+            if proprio is None or int(proprio.shape[-1]) != int(expected_proprio_dim):
+                actual = None if proprio is None else int(proprio.shape[-1])
+                raise ValueError(
+                    f"proprio dim must be {expected_proprio_dim} for controls, got {actual}."
+                )
+        if context is not None:
+            if context_mask is None or int(context.shape[-2]) != self.context_len or (
+                int(context_mask.shape[-1]) != self.context_len
+            ):
+                raise ValueError(f"control context/context_mask must use length {self.context_len}.")
+        if encoded_state is None:
+            encoded_state = self.encode_world_state(input_image)
+        if encoded_state.layout != WORLD_FEAT_LAYOUT:
+            raise ValueError(
+                f"encoded state layout {encoded_state.layout!r} does not match {WORLD_FEAT_LAYOUT!r}."
+            )
+
+        branch = "base" if selected is IDMControl.EXTRA_COMPUTE else "idm"
+        action_steps = self.inference_steps
+        if selected is IDMControl.EXTRA_COMPUTE:
+            if extra_action_steps is None or int(extra_action_steps) <= 0:
+                raise ValueError("extra_compute requires positive extra_action_steps.")
+            if shuffled_future_donor is not None:
+                raise ValueError("extra_compute does not accept a future donor.")
+            action_steps = int(extra_action_steps)
+        elif extra_action_steps is not None:
+            raise ValueError(f"{selected.value} does not accept extra_action_steps.")
+
+        signature = inspect.signature(self.model.infer_action)
+        if selected is not IDMControl.EXTRA_COMPUTE and "idm_control" not in signature.parameters:
+            raise TypeError("Loaded WAM does not expose the experimental IDM-control API.")
+        out = self.model.infer_action(
+            prompt=prompt,
+            input_image=input_image,
+            first_frame_latents=encoded_state.first_frame_latents,
+            action_horizon=requested_horizon,
+            num_video_frames=requested_frames,
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+            # The base FastWAM branch exposes a single action-solver step
+            # count.  IDM splits video/action schedules, so preserve the
+            # production video count there while overriding only action steps.
+            num_inference_steps=(
+                action_steps
+                if selected is IDMControl.EXTRA_COMPUTE
+                else self.inference_steps
+            ),
+            action_inference_steps=action_steps,
+            sigma_shift=self.sigma_shift,
+            seed=seed if seed is not None else self.default_seed,
+            force_branch=branch,
+            return_routing_info=True,
+            idm_control=selected,
+            shuffled_future_donor=shuffled_future_donor,
+            expected_donor_metadata=expected_donor_metadata,
+            return_video_latents=return_video_latents,
+        )
+        reference_mode = WAMMode.UNCOND if selected is IDMControl.EXTRA_COMPUTE else WAMMode.IDM
+        result = {
+            "action_chunk": out["action"],
+            "world_feat": encoded_state.world_feat,
+            # Controls are calibrated in a separate profile. This value is only
+            # the production-mode reference and must not enter Gate rewards.
+            "cost": float(self.cost_table[reference_mode.value]),
+            "aux": {
+                "control": selected.value,
+                "branch": branch,
+                "action_inference_steps": action_steps,
+                "video_inference_steps": (
+                    None if selected is IDMControl.EXTRA_COMPUTE else self.inference_steps
+                ),
+                "cost_is_reference": True,
+                "routing": out.get("_routing"),
+            },
+        }
+        if "video_latents" in out:
+            result["video_latents"] = out["video_latents"]
+        return result

@@ -265,6 +265,13 @@ class _FusedDualRegimeTrainingMixin:
         )
         loss_action_main = regime_losses[self.main_regime_name]
         loss_action_base = regime_losses["base"]
+        if bool(getattr(self, "_capture_raw_dual_regime_losses", False)):
+            # Kept on the live graph only for the sparse trainer diagnostic.
+            # The trainer consumes and deletes this attribute before backward.
+            self._raw_dual_regime_losses = {
+                self.main_regime_name: loss_action_main,
+                "uncond": loss_action_base,
+            }
 
         combined_action, main_raw_contribution, base_raw_contribution = (
             normalized_dual_regime_action_loss(loss_action_main, loss_action_base, w_base)
