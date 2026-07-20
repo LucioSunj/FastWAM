@@ -1,0 +1,132 @@
+__ADAPTIVE_WM_COMMAND__ python /root/When-will-inference-time-prediction-beneficial-/scripts/adaptive_gate/resolve_config.py --config-dir /root/When-will-inference-time-prediction-beneficial-/FastWAM/configs --config-name train --out /root/autodl-fs/fastwam/experiments/adaptive_wm_reasoning/P0_fused_parity/p0_real_20260720T025557Z/resolved_config.yaml --override task=libero_dual_regime_fused_2cam224_1e-4 
+__ADAPTIVE_WM_COMMAND__ env RUN_FASTWAM_MODEL_TESTS=1 FASTWAM_TEST_TASK=libero_dual_regime_fused_2cam224_1e-4 PYTHONPATH=/root/When-will-inference-time-prediction-beneficial-/FastWAM/src:/root/autodl-fs/fastwam/third_party/LIBERO:/root/When-will-inference-time-prediction-beneficial-/FastWAM/src: pytest -v tests/test_dual_regime_fused.py 
+============================= test session starts ==============================
+platform linux -- Python 3.10.20, pytest-9.1.1, pluggy-1.6.0 -- /root/autodl-fs/fastwam/venv/bin/python
+cachedir: .pytest_cache
+rootdir: /root/When-will-inference-time-prediction-beneficial-/FastWAM
+configfile: pyproject.toml
+plugins: hydra-core-1.3.2
+collecting ... collected 25 items
+
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_joint_style_layout PASSED [  4%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_joint_draft_submask_matches_fastwam_joint_mask PASSED [  8%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_base_draft_submask_matches_fastwam_base_mask PASSED [ 12%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_idm_style_two_block_layout PASSED [ 16%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_idm_submask_matches_teacher_forcing_mask PASSED [ 20%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_span_out_of_range_raises PASSED [ 24%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_mismatched_draft_args_raise PASSED [ 28%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_non_square_block_mask_raises PASSED [ 32%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_shapes_slices_and_t_mod_expansion PASSED [ 36%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_token_wise_t_mod_passthrough PASSED [ 40%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_bad_freqs_length_raises PASSED [ 44%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_bad_t_mod_ndim_raises PASSED [ 48%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_empty_raises PASSED [ 52%]
+tests/test_dual_regime_fused.py::test_only_training_loss_is_overridden PASSED [ 56%]
+tests/test_dual_regime_fused.py::test_first_frame_isolation_guard PASSED [ 60%]
+tests/test_dual_regime_fused.py::test_token_wise_t_mod_guard PASSED      [ 64%]
+tests/test_dual_regime_fused.py::test_temporal_patch_size_guard PASSED   [ 68%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_training_loss_runs_backward_and_keys PASSED [ 72%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_gradient_covers_all_trained_params PASSED [ 76%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_single_mot_forward_and_video_loss_once PASSED [ 80%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_w_base_zero_drops_base_action_term PASSED [ 84%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference FAILED [ 88%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_force_branch_inference_inherited[low] PASSED [ 92%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_force_branch_inference_inherited[high] PASSED [ 96%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_checkpoint_records_provenance PASSED [100%]
+
+=================================== FAILURES ===================================
+_____ TestFusedDualRegimeTraining.test_fused_matches_two_forward_reference _____
+
+self = <test_dual_regime_fused.TestFusedDualRegimeTraining object at 0x7fb67289e050>
+fused_model = FusedDualRegimeFastWAM(
+  (video_expert): WanVideoDiT(
+    (patch_embedding): Conv3d(48, 3072, kernel_size=(1, 2, 2), ...tride=(1, 1, 1))
+        )
+      )
+    )
+  )
+  (proprio_encoder): Linear(in_features=8, out_features=4096, bias=True)
+)
+
+    def test_fused_matches_two_forward_reference(self, fused_model):
+        """Replay identical draws through the fused forward and through
+        parent-style separate forwards; per-regime predictions must match.
+    
+        Tolerances are loose-ish because bf16 attention kernels tile
+        differently for different sequence lengths; tighten after a first GPU
+        run if headroom allows.
+        """
+        from fastwam.models.wan22.fastwam import FastWAM
+    
+        m = fused_model
+        assert m.main_regime_name == "idm", (
+            "same-draw parity must run against the fused IDM task; set "
+            "FASTWAM_TEST_TASK=libero_dual_regime_fused_2cam224_1e-4"
+        )
+        was_training = m.dit.training
+        m.dit.eval()  # disable grad checkpointing for the comparison
+        try:
+            with torch.no_grad():
+                inputs = m.build_inputs(_synthetic_sample(m))
+                draws = m._sample_dual_regime_draws(inputs)
+                out = m._fused_dual_regime_forward(inputs, draws)
+    
+                context, context_mask = inputs["context"], inputs["context_mask"]
+                action = inputs["action"]
+                fuse_flag = inputs["fuse_vae_embedding_in_latents"]
+    
+                # ---- reference for the BASE draft: standalone ff forward ----
+                base_regime = draws["action_regimes"][1]
+                assert base_regime["name"] == "base"
+                noisy_action = m.train_action_scheduler.add_noise(
+                    action, base_regime["noise"], base_regime["timestep"]
+                )
+                ff = inputs["first_frame_latents"]
+                timestep_video0 = torch.zeros(
+                    (ff.shape[0],), dtype=ff.dtype, device=m.device
+                )
+                video_pre_ff = m.video_expert.pre_dit(
+                    x=ff, timestep=timestep_video0, context=context,
+                    context_mask=context_mask, action=None,
+                    fuse_vae_embedding_in_latents=fuse_flag,
+                )
+                action_pre_b = m.action_expert.pre_dit(
+                    action_tokens=noisy_action, timestep=base_regime["timestep"],
+                    context=context, context_mask=context_mask,
+                )
+                mask_b = FastWAM._build_mot_attention_mask(
+                    m,
+                    video_seq_len=int(video_pre_ff["tokens"].shape[1]),
+                    action_seq_len=int(action_pre_b["tokens"].shape[1]),
+                    video_tokens_per_frame=int(video_pre_ff["meta"]["tokens_per_frame"]),
+                    device=video_pre_ff["tokens"].device,
+                )
+                ref_b = m.mot(
+                    embeds_all={"video": video_pre_ff["tokens"], "action": action_pre_b["tokens"]},
+                    attention_mask=mask_b,
+                    freqs_all={"video": video_pre_ff["freqs"], "action": action_pre_b["freqs"]},
+                    context_all={
+                        "video": {"context": video_pre_ff["context"], "mask": video_pre_ff["context_mask"]},
+                        "action": {"context": action_pre_b["context"], "mask": action_pre_b["context_mask"]},
+                    },
+                    t_mod_all={"video": video_pre_ff["t_mod"], "action": action_pre_b["t_mod"]},
+                )
+                ref_pred_base = m.action_expert.post_dit(ref_b["action"], action_pre_b)
+    
+                fused_pred_base = out["action_drafts"][1]["pred"]
+>               assert torch.allclose(
+                    fused_pred_base.float(), ref_pred_base.float(), atol=5e-2, rtol=5e-2
+                ), f"base-draft mismatch: max abs diff {(fused_pred_base - ref_pred_base).abs().max()}"
+E               AssertionError: base-draft mismatch: max abs diff 0.09375
+E               assert False
+E                +  where False = <built-in method allclose of type object at 0x7fb78d4d8f40>(tensor([[[-2.2031,  0.0288, -1.1016, -2.0312, -1.0000,  2.9844,  0.3691],\n         [-2.8125,  0.2773, -1.0312, -1.4922, -0.4785,  3.0938,  0.5273],\n         [-2.8125,  0.9375, -1.6406, -1.9453,  0.1348,  3.2812,  0.0854],\n         [-1.5469,  0.5664, -2.4219, -2.8125, -0.1973,  3.4219, -0.0284],\n         [-2.7344,  1.0469, -2.4688, -2.7031,  0.8789,  3.5625, -0.0471],\n         [-2.5469,  0.2852, -2.4062, -2.0312, -1.0156,  4.2812,  0.5469],\n         [-2.2812,  0.7344, -1.7969, -2.4062,  0.7305,  3.7500, -0.6953],\n         [-3.4531,  0.8047, -1.1016, -2.3281,  1.0234,  2.6562, -0.1216]]],\n       device='cuda:0'), tensor([[[-2.2031,  0.0491, -1.0859, -2.0156, -0.9961,  3.0469,  0.3887],\n         [-2.8125,  0.2891, -1.0625, -1.4766, -0.4746,  3.1406,  0.5117],\n         [-2.8281,  0.8828, -1.6250, -2.0000,  0.1670,  3.3281,  0.1196],\n         [-1.5781,  0.5742, -2.4531, -2.8125, -0.2041,  3.3906,  0.0352],\n         [-2.7031,  1.0469, -2.4219, -2.6719,  0.8945,  3.5312, -0.0327],\n         [-2.5156,  0.3027, -2.4375, -2.0625, -1.0156,  4.2812,  0.5469],\n         [-2.3125,  0.7617, -1.7969, -2.4531,  0.7578,  3.6562, -0.7383],\n         [-3.4375,  0.7930, -1.1250, -2.3750,  1.0234,  2.6719, -0.1099]]],\n       device='cuda:0'), atol=0.05, rtol=0.05)
+E                +    where <built-in method allclose of type object at 0x7fb78d4d8f40> = torch.allclose
+E                +    and   tensor([[[-2.2031,  0.0288, -1.1016, -2.0312, -1.0000,  2.9844,  0.3691],\n         [-2.8125,  0.2773, -1.0312, -1.4922, -0.4785,  3.0938,  0.5273],\n         [-2.8125,  0.9375, -1.6406, -1.9453,  0.1348,  3.2812,  0.0854],\n         [-1.5469,  0.5664, -2.4219, -2.8125, -0.1973,  3.4219, -0.0284],\n         [-2.7344,  1.0469, -2.4688, -2.7031,  0.8789,  3.5625, -0.0471],\n         [-2.5469,  0.2852, -2.4062, -2.0312, -1.0156,  4.2812,  0.5469],\n         [-2.2812,  0.7344, -1.7969, -2.4062,  0.7305,  3.7500, -0.6953],\n         [-3.4531,  0.8047, -1.1016, -2.3281,  1.0234,  2.6562, -0.1216]]],\n       device='cuda:0') = <built-in method float of Tensor object at 0x7fb659dc7b00>()
+E                +      where <built-in method float of Tensor object at 0x7fb659dc7b00> = tensor([[[-2.2031,  0.0288, -1.1016, -2.0312, -1.0000,  2.9844,  0.3691],\n         [-2.8125,  0.2773, -1.0312, -1.4922, -0.4785,  3.0938,  0.5273],\n         [-2.8125,  0.9375, -1.6406, -1.9453,  0.1348,  3.2812,  0.0854],\n         [-1.5469,  0.5664, -2.4219, -2.8125, -0.1973,  3.4219, -0.0284],\n         [-2.7344,  1.0469, -2.4688, -2.7031,  0.8789,  3.5625, -0.0471],\n         [-2.5469,  0.2852, -2.4062, -2.0312, -1.0156,  4.2812,  0.5469],\n         [-2.2812,  0.7344, -1.7969, -2.4062,  0.7305,  3.7500, -0.6953],\n         [-3.4531,  0.8047, -1.1016, -2.3281,  1.0234,  2.6562, -0.1216]]],\n       device='cuda:0', dtype=torch.bfloat16).float
+E                +    and   tensor([[[-2.2031,  0.0491, -1.0859, -2.0156, -0.9961,  3.0469,  0.3887],\n         [-2.8125,  0.2891, -1.0625, -1.4766, -0.4746,  3.1406,  0.5117],\n         [-2.8281,  0.8828, -1.6250, -2.0000,  0.1670,  3.3281,  0.1196],\n         [-1.5781,  0.5742, -2.4531, -2.8125, -0.2041,  3.3906,  0.0352],\n         [-2.7031,  1.0469, -2.4219, -2.6719,  0.8945,  3.5312, -0.0327],\n         [-2.5156,  0.3027, -2.4375, -2.0625, -1.0156,  4.2812,  0.5469],\n         [-2.3125,  0.7617, -1.7969, -2.4531,  0.7578,  3.6562, -0.7383],\n         [-3.4375,  0.7930, -1.1250, -2.3750,  1.0234,  2.6719, -0.1099]]],\n       device='cuda:0') = <built-in method float of Tensor object at 0x7fb659dc6bb0>()
+E                +      where <built-in method float of Tensor object at 0x7fb659dc6bb0> = tensor([[[-2.2031,  0.0491, -1.0859, -2.0156, -0.9961,  3.0469,  0.3887],\n         [-2.8125,  0.2891, -1.0625, -1.4766, -0.4746,  3.1406,  0.5117],\n         [-2.8281,  0.8828, -1.6250, -2.0000,  0.1670,  3.3281,  0.1196],\n         [-1.5781,  0.5742, -2.4531, -2.8125, -0.2041,  3.3906,  0.0352],\n         [-2.7031,  1.0469, -2.4219, -2.6719,  0.8945,  3.5312, -0.0327],\n         [-2.5156,  0.3027, -2.4375, -2.0625, -1.0156,  4.2812,  0.5469],\n         [-2.3125,  0.7617, -1.7969, -2.4531,  0.7578,  3.6562, -0.7383],\n         [-3.4375,  0.7930, -1.1250, -2.3750,  1.0234,  2.6719, -0.1099]]],\n       device='cuda:0', dtype=torch.bfloat16).float
+
+tests/test_dual_regime_fused.py:506: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference
+=================== 1 failed, 24 passed in 342.86s (0:05:42) ===================

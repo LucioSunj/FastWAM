@@ -1,0 +1,3 @@
+fastwam: /root/When-will-inference-time-prediction-beneficial-/FastWAM/src/fastwam/__init__.py
+deepspeed_import: 0.18.5
+core_imports: PASS

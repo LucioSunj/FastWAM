@@ -1,0 +1,27 @@
+## metric-adaptive...origin/metric-adaptive
+ M configs/sim_libero.yaml
+ M configs/sim_robotwin.yaml
+ M configs/train.yaml
+ M experiments/libero/eval_libero_single.py
+ M experiments/libero/libero_utils.py
+ M experiments/libero/run_libero_parallel_test.sh
+ M experiments/robotwin/eval_robotwin_single.py
+ M experiments/robotwin/fastwam_policy/deploy_policy.py
+ M experiments/robotwin/fastwam_policy/deploy_policy.yml
+ M experiments/robotwin/run_robotwin_manager.py
+ M scripts/precompute_text_embeds.py
+ M scripts/preprocess_action_dit_backbone.py
+ M src/fastwam/models/wan22/fastwam.py
+ M src/fastwam/models/wan22/helpers/loader.py
+ M src/fastwam/trainer.py
+ M third_party/RoboTwin/script/eval_policy.py
+?? configs/sim_libero_plus.yaml
+?? data
+?? experiments/libero/eval_libero_persistent_worker.py
+?? experiments/libero/run_libero_persistent_workers.sh
+?? experiments/libero/text_embedding_cache.py
+?? experiments/robotwin/pack_text_embedding_cache.py
+?? experiments/robotwin/precompute_robotwin_text_embeds.py
+?? scripts/activate_fastwam.sh
+?? scripts/train_single_gpu.sh
+?? scripts/verify_fastwam_libero_setup.py

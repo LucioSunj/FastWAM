@@ -1,0 +1,14 @@
+Filesystem      Type         Size  Used Avail Use% Mounted on
+overlay         overlay       30G   23G  7.3G  76% /
+tmpfs           tmpfs         64M     0   64M   0% /dev
+/dev/md0        xfs          150M  4.0K  150M   1% /init
+AutoFS:fs1      fuse.autofs   10T  4.4T  5.7T  44% /autodl-pub/data
+AutoFS:fs435907 fuse.autofs  200G  182G   19G  91% /autodl-fs/data
+shm             tmpfs         60G     0   60G   0% /dev/shm
+tmpfs           tmpfs        101G  5.8M  101G   1% /run/nvidia-fabricmanager/socket
+/dev/sda2       ext4         438G   19G  398G   5% /usr/bin/nvidia-smi
+tmpfs           tmpfs        4.0K  4.0K     0 100% /run/nvidia-ctk-hook
+tmpfs           tmpfs        504G     0  504G   0% /proc/acpi
+tmpfs           tmpfs        504G     0  504G   0% /proc/scsi
+tmpfs           tmpfs        504G     0  504G   0% /sys/firmware
+tmpfs           tmpfs        504G     0  504G   0% /sys/devices/virtual/powercap

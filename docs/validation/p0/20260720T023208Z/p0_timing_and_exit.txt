@@ -1,0 +1,5 @@
+launcher_log_birth=2026-07-20T10:58:23.735587992+08:00
+launcher_log_modify=2026-07-20T11:04:08.201512942+08:00
+launcher_wall_clock_seconds=344.466
+pytest_reported_seconds=342.86
+launcher_exit_code=1

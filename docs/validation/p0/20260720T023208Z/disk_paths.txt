@@ -1,0 +1,4 @@
+Filesystem      Type         Size  Used Avail Use% Mounted on
+overlay         overlay       30G   23G  7.3G  76% /
+AutoFS:fs435907 fuse.autofs  200G  182G   19G  91% /autodl-fs/data
+overlay         overlay       30G   23G  7.3G  76% /

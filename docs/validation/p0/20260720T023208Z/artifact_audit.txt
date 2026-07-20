@@ -1,0 +1,20 @@
+READABLE size=72865 path=/root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model.safetensors.index.json
+DIT_INDEX tensors=825 shards=3
+READABLE size=9825014472 path=/root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model-00001-of-00003.safetensors
+SAFETENSORS_HEADER tensors=413 path=/root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model-00001-of-00003.safetensors
+READABLE size=9995661736 path=/root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model-00002-of-00003.safetensors
+SAFETENSORS_HEADER tensors=407 path=/root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model-00002-of-00003.safetensors
+READABLE size=178558176 path=/root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model-00003-of-00003.safetensors
+SAFETENSORS_HEADER tensors=5 path=/root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model-00003-of-00003.safetensors
+READABLE size=1409401152 path=/root/autodl-fs/fastwam/models/wan22_components/Wan2.2_VAE.safetensors
+SAFETENSORS_HEADER tensors=196 path=/root/autodl-fs/fastwam/models/wan22_components/Wan2.2_VAE.safetensors
+READABLE size=11361845432 path=/root/autodl-fs/fastwam/models/wan22_components/models_t5_umt5-xxl-enc-bf16.safetensors
+SAFETENSORS_HEADER tensors=242 path=/root/autodl-fs/fastwam/models/wan22_components/models_t5_umt5-xxl-enc-bf16.safetensors
+READABLE size=6623 path=/root/autodl-fs/fastwam/models/wan22_components/google/umt5-xxl/special_tokens_map.json
+READABLE size=4548313 path=/root/autodl-fs/fastwam/models/wan22_components/google/umt5-xxl/spiece.model
+READABLE size=16837417 path=/root/autodl-fs/fastwam/models/wan22_components/google/umt5-xxl/tokenizer.json
+READABLE size=61728 path=/root/autodl-fs/fastwam/models/wan22_components/google/umt5-xxl/tokenizer_config.json
+TOKENIZER_LOAD class=T5TokenizerFast vocab_size=256300
+READABLE size=2042025883 path=/autodl-fs/data/fastwam/checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+ACTION_DIT_MAGIC 504b030400000808
+ARTIFACT_AUDIT PASS

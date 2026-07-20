@@ -1,0 +1,4 @@
+ 55510a15bfdc052ad53d26a3d2bf7cbb5368a093 FastWAM (heads/metric-adaptive)
+ aabebda3cd7200870d677f159165ebf564d92d89 RLinf (heads/adaptive-gate)
+ f6c771fc3be0a9bc271ea4f1531d8ea35efb0ec7 StarWAM (heads/When-will-wm-reasoning-beneficial)
+ 235f39929759164f1087204e610ce6c1252b22aa starVLA (heads/adaptive-gate)

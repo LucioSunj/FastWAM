@@ -1,0 +1,13 @@
+191 /root/autodl-fs/fastwam/models/wan22_components/.cache/huggingface/CACHEDIR.TAG
+1 /root/autodl-fs/fastwam/models/wan22_components/.cache/huggingface/.gitignore
+0 /root/autodl-fs/fastwam/models/wan22_components/.cache/huggingface/download/diffusion_pytorch_model-00001-of-00003.safetensors.lock
+6623 /root/autodl-fs/fastwam/models/wan22_components/google/umt5-xxl/special_tokens_map.json
+4548313 /root/autodl-fs/fastwam/models/wan22_components/google/umt5-xxl/spiece.model
+16837417 /root/autodl-fs/fastwam/models/wan22_components/google/umt5-xxl/tokenizer.json
+61728 /root/autodl-fs/fastwam/models/wan22_components/google/umt5-xxl/tokenizer_config.json
+1409401152 /root/autodl-fs/fastwam/models/wan22_components/Wan2.2_VAE.safetensors
+11361845432 /root/autodl-fs/fastwam/models/wan22_components/models_t5_umt5-xxl-enc-bf16.safetensors
+9825014472 /root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model-00001-of-00003.safetensors
+9995661736 /root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model-00002-of-00003.safetensors
+178558176 /root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model-00003-of-00003.safetensors
+72865 /root/autodl-fs/fastwam/models/wan22_components/diffusion_pytorch_model.safetensors.index.json
