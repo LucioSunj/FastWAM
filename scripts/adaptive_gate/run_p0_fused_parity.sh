@@ -137,6 +137,7 @@ CMD=(
     "PYTHONPATH=${PROJECT_REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
     pytest -v tests/test_dual_regime_fused.py
     "--junitxml=${PYTEST_XML}"
+    "--basetemp=${RUN_DIR}/pytest_tmp"
     "${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"}"
 )
 
