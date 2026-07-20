@@ -1,0 +1,122 @@
+__ADAPTIVE_WM_COMMAND__ python /root/adaptive-wm-p0-repair/scripts/adaptive_gate/resolve_config.py --config-dir /root/adaptive-wm-p0-repair/FastWAM/configs --config-name train --out /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/resolved_config.yaml --override task=libero_dual_regime_fused_2cam224_1e-4 
+__ADAPTIVE_WM_COMMAND__ env RUN_FASTWAM_MODEL_TESTS=1 FASTWAM_TEST_TASK=libero_dual_regime_fused_2cam224_1e-4 PYTHONPATH=/root/adaptive-wm-p0-repair/FastWAM/src pytest -v tests/test_dual_regime_fused.py --junitxml=/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml --basetemp=/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest_tmp 
+============================= test session starts ==============================
+platform linux -- Python 3.10.20, pytest-9.1.1, pluggy-1.6.0 -- /root/autodl-fs/fastwam/venv/bin/python
+cachedir: .pytest_cache
+rootdir: /root/adaptive-wm-p0-repair/FastWAM
+configfile: pyproject.toml
+plugins: hydra-core-1.3.2
+collecting ... collected 28 items
+
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_joint_style_layout PASSED [  3%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_joint_draft_submask_matches_fastwam_joint_mask PASSED [  7%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_base_draft_submask_matches_fastwam_base_mask PASSED [ 10%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_idm_style_two_block_layout PASSED [ 14%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_idm_submask_matches_teacher_forcing_mask PASSED [ 17%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_span_out_of_range_raises PASSED [ 21%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_mismatched_draft_args_raise PASSED [ 25%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_non_square_block_mask_raises PASSED [ 28%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_shapes_slices_and_t_mod_expansion PASSED [ 32%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_token_wise_t_mod_passthrough PASSED [ 35%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_bad_freqs_length_raises PASSED [ 39%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_bad_t_mod_ndim_raises PASSED [ 42%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_empty_raises PASSED [ 46%]
+tests/test_dual_regime_fused.py::test_only_training_loss_is_overridden PASSED [ 50%]
+tests/test_dual_regime_fused.py::test_first_frame_isolation_guard PASSED [ 53%]
+tests/test_dual_regime_fused.py::test_token_wise_t_mod_guard PASSED      [ 57%]
+tests/test_dual_regime_fused.py::test_temporal_patch_size_guard PASSED   [ 60%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_training_loss_runs_backward_and_keys PASSED [ 64%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_gradient_covers_all_trained_params PASSED [ 67%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_single_mot_forward_and_video_loss_once PASSED [ 71%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_w_base_zero_drops_base_action_term PASSED [ 75%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference PASSED [ 78%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[0] PASSED [ 82%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[1] PASSED [ 85%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[2] PASSED [ 89%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_force_branch_inference_inherited[low] PASSED [ 92%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_force_branch_inference_inherited[high] PASSED [ 96%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_checkpoint_records_provenance PASSED [100%]
+
+- generated xml file: /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml -
+======================== 28 passed in 72.58s (0:01:12) =========================
+__ADAPTIVE_WM_COMMAND__ python /root/adaptive-wm-p0-repair/scripts/adaptive_gate/decision.py p0 --check fused_real_wan_parity --pytest-junit /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml --pytest-log /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.log --pytest-exit-code 0 --evidence tests/test_dual_regime_fused.py --out /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/decision.json 
+{
+  "metrics": {
+    "blocked_reasons": [],
+    "completed_check": "fused_real_wan_parity",
+    "evidence": [
+      {
+        "exists": true,
+        "path": "/root/adaptive-wm-p0-repair/FastWAM/tests/test_dual_regime_fused.py",
+        "sha256": "caf8a2e4180153e60f45488d97d75769c47df54540caf5bead2bb0e06a5e2b51",
+        "size_bytes": 34633
+      }
+    ],
+    "failure_reasons": [],
+    "junit": {
+      "errors": 0,
+      "exists": true,
+      "failures": 0,
+      "parse_error": null,
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml",
+      "sha256": "0d96201a7691a9bdbc84dcee7f193cd82091b01573cad3133d82517d492d1269",
+      "size_bytes": 4105,
+      "skipped": 0,
+      "skips": [],
+      "test_cases": [
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_joint_style_layout",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_joint_draft_submask_matches_fastwam_joint_mask",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_base_draft_submask_matches_fastwam_base_mask",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_idm_style_two_block_layout",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_idm_submask_matches_teacher_forcing_mask",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_span_out_of_range_raises",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_mismatched_draft_args_raise",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_non_square_block_mask_raises",
+        "tests.test_dual_regime_fused.TestMergeActionDraftPayloads::test_shapes_slices_and_t_mod_expansion",
+        "tests.test_dual_regime_fused.TestMergeActionDraftPayloads::test_token_wise_t_mod_passthrough",
+        "tests.test_dual_regime_fused.TestMergeActionDraftPayloads::test_bad_freqs_length_raises",
+        "tests.test_dual_regime_fused.TestMergeActionDraftPayloads::test_bad_t_mod_ndim_raises",
+        "tests.test_dual_regime_fused.TestMergeActionDraftPayloads::test_empty_raises",
+        "tests.test_dual_regime_fused::test_only_training_loss_is_overridden",
+        "tests.test_dual_regime_fused::test_first_frame_isolation_guard",
+        "tests.test_dual_regime_fused::test_token_wise_t_mod_guard",
+        "tests.test_dual_regime_fused::test_temporal_patch_size_guard",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_training_loss_runs_backward_and_keys",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_gradient_covers_all_trained_params",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_single_mot_forward_and_video_loss_once",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_w_base_zero_drops_base_action_term",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[0]",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[1]",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[2]",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_force_branch_inference_inherited[low]",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_force_branch_inference_inherited[high]",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_checkpoint_records_provenance"
+      ],
+      "tests": 28
+    },
+    "missing_required_tests": [],
+    "pytest_exit_code": 0,
+    "pytest_log": {
+      "exists": true,
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.log",
+      "sha256": "398b88cb9aac4c8f2a3340508c2398cf389bff7942fe24a5383f80b001e8330a",
+      "size_bytes": 3699
+    },
+    "required_tests": [
+      "test_training_loss_runs_backward_and_keys",
+      "test_gradient_covers_all_trained_params",
+      "test_single_mot_forward_and_video_loss_once",
+      "test_fused_matches_two_forward_reference",
+      "test_fused_matches_two_forward_reference_seeded[0]",
+      "test_fused_matches_two_forward_reference_seeded[1]",
+      "test_fused_matches_two_forward_reference_seeded[2]",
+      "test_base_draft_submask_matches_fastwam_base_mask",
+      "test_idm_submask_matches_teacher_forcing_mask"
+    ]
+  },
+  "stage": "P0",
+  "status": "PASS"
+}
+__ADAPTIVE_WM_MANIFEST_COMMAND_COUNT__ /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/run_manifest.json 3
+__ADAPTIVE_WM_MANIFEST_WRITE__ python /root/adaptive-wm-p0-repair/scripts/adaptive_gate/experiment_manifest.py write-run --workspace-root /root/adaptive-wm-p0-repair --cwd /root/adaptive-wm-p0-repair/FastWAM --out /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/run_manifest.json --resolved-config /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/resolved_config.yaml --command-arg python --command-arg /root/adaptive-wm-p0-repair/scripts/adaptive_gate/resolve_config.py --command-arg --config-dir --command-arg /root/adaptive-wm-p0-repair/FastWAM/configs --command-arg --config-name --command-arg train --command-arg --out --command-arg /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/resolved_config.yaml --command-arg --override --command-arg task=libero_dual_regime_fused_2cam224_1e-4 --command-arg __ADAPTIVE_WM_COMMAND_BREAK__ --command-arg env --command-arg RUN_FASTWAM_MODEL_TESTS=1 --command-arg FASTWAM_TEST_TASK=libero_dual_regime_fused_2cam224_1e-4 --command-arg PYTHONPATH=/root/adaptive-wm-p0-repair/FastWAM/src --command-arg pytest --command-arg -v --command-arg tests/test_dual_regime_fused.py --command-arg --junitxml=/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml --command-arg --basetemp=/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest_tmp --command-arg __ADAPTIVE_WM_COMMAND_BREAK__ --command-arg python --command-arg /root/adaptive-wm-p0-repair/scripts/adaptive_gate/decision.py --command-arg p0 --command-arg --check --command-arg fused_real_wan_parity --command-arg --pytest-junit --command-arg /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml --command-arg --pytest-log --command-arg /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.log --command-arg --pytest-exit-code --command-arg 0 --command-arg --evidence --command-arg tests/test_dual_regime_fused.py --command-arg --out --command-arg /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/decision.json --artifact /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml --artifact /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.log --artifact /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/decision.json --artifact /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/gpu_monitor.csv --artifact /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/nvidia_smi_before.txt --artifact /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/nvidia_smi_after.txt --artifact /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/timing.json 

@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
+import json
 import os
 import tempfile
+from pathlib import Path
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-config", required=True, help="resolved config.yaml from E-I")
     parser.add_argument("--source-task", required=True)
@@ -30,6 +33,103 @@ def main() -> None:
     )
     parser.add_argument("--atol", type=float, default=5e-4)
     parser.add_argument("--rtol", type=float, default=5e-3)
+    parser.add_argument("--out", required=True, help="atomic parity_result.json output")
+    return parser
+
+
+def _tensor_sha256(tensor) -> str:
+    value = tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {"shape": list(value.shape), "dtype": str(value.dtype)},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    )
+    digest.update(value.numpy().tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _atomic_write_json(path: str | os.PathLike, payload: dict) -> None:
+    destination = Path(path).expanduser().resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def assert_parity_and_write_result(
+    *,
+    target_action,
+    source_action,
+    output_path: str | os.PathLike,
+    metadata: dict,
+    atol: float,
+    rtol: float,
+) -> dict:
+    import torch
+
+    torch.testing.assert_close(
+        target_action,
+        source_action,
+        atol=atol,
+        rtol=rtol,
+        msg=(
+            "S0 forced-IDM output differs from its standalone IDM parent under "
+            "the paired seed/solver acceptance setting."
+        ),
+    )
+    if source_action.numel() == 0:
+        raise ValueError("parity action tensors must be non-empty")
+    absolute_error = (target_action - source_action).abs()
+    tolerance = atol + rtol * source_action.abs()
+    normalized_error = torch.where(
+        tolerance > 0,
+        absolute_error / tolerance,
+        torch.zeros_like(absolute_error),
+    )
+    worst_normalized_error = float(normalized_error.max().item())
+    payload = {
+        **metadata,
+        "schema": "fastwam-warmstart-parity-v1",
+        "kind": "standalone_idm_to_s0_fixed_seed_parity",
+        "status": "PASS",
+        "comparison": {
+            "atol": float(atol),
+            "rtol": float(rtol),
+            "max_abs": float(absolute_error.max().item()),
+            "worst_normalized_error": worst_normalized_error,
+            "allclose_margin": 1.0 - worst_normalized_error,
+        },
+        "actions": {
+            "source_sha256": _tensor_sha256(source_action),
+            "target_sha256": _tensor_sha256(target_action),
+            "shape": list(source_action.shape),
+            "dtype": str(source_action.dtype),
+        },
+    }
+    _atomic_write_json(output_path, payload)
+    return payload
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     import torch
@@ -37,17 +137,34 @@ def main() -> None:
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
 
+    from fastwam.adaptive_gate.provenance import (
+        inference_solver_contract,
+        inference_solver_fingerprint,
+        sha256_file,
+    )
     from fastwam.adaptive_gate.warm_start import strict_standalone_idm_warm_start
     from fastwam.utils import misc
 
     if args.sample_index < 0 or args.inference_steps <= 0:
         parser.error("--sample-index must be non-negative and --inference-steps positive")
+    if args.atol < 0 or args.rtol < 0:
+        parser.error("--atol and --rtol must be non-negative")
     stats_path = os.path.abspath(os.path.expanduser(args.dataset_stats))
     source_config_path = os.path.abspath(os.path.expanduser(args.source_config))
     checkpoint_path = os.path.abspath(os.path.expanduser(args.ckpt))
     for path in (stats_path, source_config_path, checkpoint_path):
         if not os.path.isfile(path):
             raise FileNotFoundError(path)
+    artifact_sha256 = {
+        "checkpoint": sha256_file(checkpoint_path),
+        "config": sha256_file(source_config_path),
+        "stats": sha256_file(stats_path),
+    }
+    if artifact_sha256["checkpoint"].lower() != args.checkpoint_sha256.lower():
+        raise ValueError(
+            "E-I checkpoint SHA256 mismatch: "
+            f"expected={args.checkpoint_sha256}, actual={artifact_sha256['checkpoint']}"
+        )
 
     dtype = {
         "float32": torch.float32,
@@ -96,6 +213,12 @@ def main() -> None:
     source = instantiate(source_model_cfg, model_dtype=dtype, device=args.device)
     source.load_checkpoint(checkpoint_path)
     source.eval().requires_grad_(False)
+    source_solver_contract = inference_solver_contract(
+        source,
+        video_inference_steps=args.inference_steps,
+        action_inference_steps=args.inference_steps,
+        sigma_shift=args.sigma_shift,
+    )
     with torch.inference_mode():
         source_action = source.infer_action(**common)["action"].float().cpu()
     del source
@@ -118,25 +241,72 @@ def main() -> None:
         target_dataset_stats=stats_path,
     )
     target.eval().requires_grad_(False)
+    target_solver_contract = inference_solver_contract(
+        target,
+        video_inference_steps=args.inference_steps,
+        action_inference_steps=args.inference_steps,
+        sigma_shift=args.sigma_shift,
+    )
+    if target_solver_contract != source_solver_contract:
+        raise AssertionError(
+            "S0 target and standalone E-I source inference solver contracts differ"
+        )
     with torch.inference_mode():
         target_action = target.infer_action(
             **common, force_branch="idm", return_routing_info=True
         )["action"].float().cpu()
 
-    torch.testing.assert_close(
-        target_action,
-        source_action,
+    device_metadata = {"requested": str(args.device)}
+    if str(args.device).startswith("cuda"):
+        index = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(index)
+        device_metadata.update(
+            {
+                "cuda_index": index,
+                "name": properties.name,
+                "compute_capability": list(torch.cuda.get_device_capability(index)),
+                "total_memory_bytes": properties.total_memory,
+            }
+        )
+    result = assert_parity_and_write_result(
+        target_action=target_action,
+        source_action=source_action,
+        output_path=args.out,
         atol=args.atol,
         rtol=args.rtol,
-        msg=(
-            "S0 forced-IDM output differs from its standalone IDM parent under "
-            "the paired seed/solver acceptance setting."
-        ),
+        metadata={
+            "source_task": args.source_task,
+            "target_task": args.target_task,
+            "artifacts": {
+                "e_i_checkpoint": {
+                    "path": checkpoint_path,
+                    "sha256": artifact_sha256["checkpoint"],
+                },
+                "e_i_config": {
+                    "path": source_config_path,
+                    "sha256": artifact_sha256["config"],
+                },
+                "e_i_stats": {
+                    "path": stats_path,
+                    "sha256": artifact_sha256["stats"],
+                },
+            },
+            "sample_index": args.sample_index,
+            "seed": args.seed,
+            "model_dtype": args.dtype,
+            "inference_steps": args.inference_steps,
+            "sigma_shift": args.sigma_shift,
+            "device": device_metadata,
+            "solver_contract": target_solver_contract,
+            "solver_contract_sha256": inference_solver_fingerprint(
+                target_solver_contract
+            ),
+        },
     )
-    max_abs = float((target_action - source_action).abs().max().item())
     print(
         "PASS standalone->S0 forced-IDM parity: "
-        f"sample={args.sample_index} seed={args.seed} max_abs={max_abs:.6g} "
+        f"sample={args.sample_index} seed={args.seed} "
+        f"max_abs={result['comparison']['max_abs']:.6g} "
         f"atol={args.atol} rtol={args.rtol}"
     )
 

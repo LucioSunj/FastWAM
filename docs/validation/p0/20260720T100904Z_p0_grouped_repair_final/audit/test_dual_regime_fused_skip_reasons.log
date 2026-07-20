@@ -1,0 +1,11 @@
+.................sssssssssss                                             [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_dual_regime_fused.py:382: set RUN_FASTWAM_MODEL_TESTS=1 (requires Wan2.2 weights + GPU)
+SKIPPED [1] tests/test_dual_regime_fused.py:398: set RUN_FASTWAM_MODEL_TESTS=1 (requires Wan2.2 weights + GPU)
+SKIPPED [1] tests/test_dual_regime_fused.py:406: set RUN_FASTWAM_MODEL_TESTS=1 (requires Wan2.2 weights + GPU)
+SKIPPED [1] tests/test_dual_regime_fused.py:430: set RUN_FASTWAM_MODEL_TESTS=1 (requires Wan2.2 weights + GPU)
+SKIPPED [1] tests/test_dual_regime_fused.py:440: set RUN_FASTWAM_MODEL_TESTS=1 (requires Wan2.2 weights + GPU)
+SKIPPED [3] tests/test_dual_regime_fused.py:675: set RUN_FASTWAM_MODEL_TESTS=1 (requires Wan2.2 weights + GPU)
+SKIPPED [2] tests/test_dual_regime_fused.py:690: set RUN_FASTWAM_MODEL_TESTS=1 (requires Wan2.2 weights + GPU)
+SKIPPED [1] tests/test_dual_regime_fused.py:713: set RUN_FASTWAM_MODEL_TESTS=1 (requires Wan2.2 weights + GPU)
+17 passed, 11 skipped in 12.31s

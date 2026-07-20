@@ -1,0 +1,425 @@
+{
+  "artifacts": {
+    "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/decision.json": {
+      "bytes": 4686,
+      "sha256": "37595f03dc8b3fb4e54621915d9dc5c1cdb8a0e2f954d63d5f23dfa54cb1bd28"
+    },
+    "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/gpu_monitor.csv": {
+      "bytes": 5385,
+      "sha256": "5de397f9692014428f705d32384710426ebd01617cbb10d569d4d1e9e49dcfa3"
+    },
+    "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/nvidia_smi_after.txt": {
+      "bytes": 1689,
+      "sha256": "95154e30140ffc5d51a778bc9e1b040b770cc3457c7adfaef201609de2659dae"
+    },
+    "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/nvidia_smi_before.txt": {
+      "bytes": 1689,
+      "sha256": "3303c451c39b9521950b70796fabf8bfdfa576cc1a98f3b6793cdd09fe150a08"
+    },
+    "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.log": {
+      "bytes": 3699,
+      "sha256": "398b88cb9aac4c8f2a3340508c2398cf389bff7942fe24a5383f80b001e8330a"
+    },
+    "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml": {
+      "bytes": 4105,
+      "sha256": "0d96201a7691a9bdbc84dcee7f193cd82091b01573cad3133d82517d492d1269"
+    },
+    "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/resolved_config.yaml": {
+      "bytes": 5358,
+      "sha256": "634e4c71c4c213bc37220f7e7143c106f87d8843d894c63cea7622ac7f76a08c"
+    },
+    "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/timing.json": {
+      "bytes": 162,
+      "sha256": "8e41f0b2d1d2201c9d470af031d9a5ba9f2ef4253c9d03dcb1bcd4c1e124406d"
+    }
+  },
+  "command": null,
+  "commands": [
+    [
+      "python",
+      "/root/adaptive-wm-p0-repair/scripts/adaptive_gate/resolve_config.py",
+      "--config-dir",
+      "/root/adaptive-wm-p0-repair/FastWAM/configs",
+      "--config-name",
+      "train",
+      "--out",
+      "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/resolved_config.yaml",
+      "--override",
+      "task=libero_dual_regime_fused_2cam224_1e-4"
+    ],
+    [
+      "env",
+      "RUN_FASTWAM_MODEL_TESTS=1",
+      "FASTWAM_TEST_TASK=libero_dual_regime_fused_2cam224_1e-4",
+      "PYTHONPATH=/root/adaptive-wm-p0-repair/FastWAM/src",
+      "pytest",
+      "-v",
+      "tests/test_dual_regime_fused.py",
+      "--junitxml=/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml",
+      "--basetemp=/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest_tmp"
+    ],
+    [
+      "python",
+      "/root/adaptive-wm-p0-repair/scripts/adaptive_gate/decision.py",
+      "p0",
+      "--check",
+      "fused_real_wan_parity",
+      "--pytest-junit",
+      "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml",
+      "--pytest-log",
+      "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.log",
+      "--pytest-exit-code",
+      "0",
+      "--evidence",
+      "tests/test_dual_regime_fused.py",
+      "--out",
+      "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/decision.json"
+    ]
+  ],
+  "created_at": "2026-07-20T10:11:45.787585+00:00",
+  "cwd": "/root/adaptive-wm-p0-repair/FastWAM",
+  "environment": {
+    "cuda_visible_devices": "0",
+    "hostname": "autodl-container-0zv0wuxn4h-27f6a439",
+    "libero_plus_commit": null,
+    "libero_plus_root": null,
+    "nvidia_smi": "NVIDIA A800-SXM4-80GB, 580.126.09",
+    "platform": "Linux-5.15.0-78-generic-x86_64-with-glibc2.35",
+    "python": "3.10.20 (main, Apr 14 2026, 14:28:08) [Clang 22.1.3 ]"
+  },
+  "kind": "adaptive_wm_run_manifest",
+  "repositories": {
+    ".": {
+      "branch": "p0-fused-parity-fix",
+      "dirty": false,
+      "sha": "aef7bc153bcffecdabd8f8b5e2ab4ab106898032"
+    },
+    "FastWAM": {
+      "branch": "p0-fused-parity-fix",
+      "dirty": false,
+      "sha": "4cfc6acd6ddfef2cb18b2a829d77306351203448"
+    },
+    "RLinf": {
+      "branch": "HEAD",
+      "dirty": false,
+      "sha": "aabebda3cd7200870d677f159165ebf564d92d89"
+    },
+    "StarWAM": {
+      "branch": "HEAD",
+      "dirty": false,
+      "sha": "f6c771fc3be0a9bc271ea4f1531d8ea35efb0ec7"
+    },
+    "starVLA": {
+      "branch": "HEAD",
+      "dirty": false,
+      "sha": "235f39929759164f1087204e610ce6c1252b22aa"
+    }
+  },
+  "resolved_config": {
+    "batch_size": 16,
+    "data": {
+      "train": {
+        "_target_": "fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset",
+        "action_video_freq_ratio": 4,
+        "camera_key": null,
+        "concat_multi_camera": "horizontal",
+        "context_len": 128,
+        "dataset_dirs": [
+          "./data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot",
+          "./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot",
+          "./data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot",
+          "./data/libero_mujoco3.3.2/libero_10_no_noops_lerobot"
+        ],
+        "global_sample_stride": 1,
+        "is_training_set": true,
+        "num_frames": 33,
+        "pretrained_norm_stats": null,
+        "processor": {
+          "_target_": "fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor",
+          "action_output_dim": 7,
+          "action_state_merger": {
+            "_target_": "fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign"
+          },
+          "action_state_transforms": null,
+          "delta_action_dim_mask": {
+            "default": [
+              true,
+              true,
+              true,
+              true,
+              true,
+              true,
+              false
+            ]
+          },
+          "norm_default_mode": "min/max",
+          "norm_exception_mode": null,
+          "num_obs_steps": 33,
+          "num_output_cameras": 2,
+          "proprio_output_dim": 8,
+          "shape_meta": {
+            "action": [
+              {
+                "key": "default",
+                "raw_shape": 7,
+                "shape": 7
+              }
+            ],
+            "images": [
+              {
+                "key": "image",
+                "raw_shape": [
+                  3,
+                  512,
+                  512
+                ],
+                "shape": [
+                  3,
+                  224,
+                  224
+                ]
+              },
+              {
+                "key": "wrist_image",
+                "raw_shape": [
+                  3,
+                  512,
+                  512
+                ],
+                "shape": [
+                  3,
+                  224,
+                  224
+                ]
+              }
+            ],
+            "state": [
+              {
+                "key": "default",
+                "raw_shape": 8,
+                "shape": 8
+              }
+            ]
+          },
+          "train_transforms": [
+            {
+              "_target_": "fastwam.datasets.lerobot.transforms.image.ToTensor"
+            },
+            {
+              "_target_": "torchvision.transforms.Resize",
+              "size": [
+                224,
+                224
+              ]
+            }
+          ],
+          "use_stepwise_action_norm": false,
+          "val_transforms": [
+            {
+              "_target_": "fastwam.datasets.lerobot.transforms.image.ToTensor"
+            },
+            {
+              "_target_": "torchvision.transforms.Resize",
+              "size": [
+                224,
+                224
+              ]
+            }
+          ]
+        },
+        "shape_meta": {
+          "action": [
+            {
+              "key": "default",
+              "raw_shape": 7,
+              "shape": 7
+            }
+          ],
+          "images": [
+            {
+              "key": "image",
+              "raw_shape": [
+                3,
+                512,
+                512
+              ],
+              "shape": [
+                3,
+                224,
+                224
+              ]
+            },
+            {
+              "key": "wrist_image",
+              "raw_shape": [
+                3,
+                512,
+                512
+              ],
+              "shape": [
+                3,
+                224,
+                224
+              ]
+            }
+          ],
+          "state": [
+            {
+              "key": "default",
+              "raw_shape": 8,
+              "shape": 8
+            }
+          ]
+        },
+        "skip_padding_as_possible": false,
+        "text_embedding_cache_dir": "./data/text_embeds_cache/libero",
+        "val_set_proportion": 0.0,
+        "video_size": [
+          224,
+          448
+        ]
+      }
+    },
+    "dual_regime_training": {
+      "gradient_diagnostic_video_final_blocks": 2,
+      "gradient_diagnostics_every": 200,
+      "optimizer": {
+        "action_lr_scale": 1.0,
+        "proprio_lr_scale": 1.0,
+        "video_final_blocks": 4,
+        "video_lr_scale": 0.0,
+        "video_train_start_fraction": 0.4
+      },
+      "uncond_weight_schedule": [
+        {
+          "fraction": 0.0,
+          "weight": 0.05
+        },
+        {
+          "fraction": 0.1,
+          "weight": 0.05
+        },
+        {
+          "fraction": 0.4,
+          "weight": 0.5
+        },
+        {
+          "fraction": 1.0,
+          "weight": 1.0
+        }
+      ]
+    },
+    "eval_every": 200,
+    "eval_num_inference_steps": 10,
+    "eval_sigma_shift": null,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 1e-05,
+    "log_every": 10,
+    "lr_scheduler_type": "cosine",
+    "max_grad_norm": 1.0,
+    "max_steps": null,
+    "mixed_precision": "bf16",
+    "model": {
+      "_target_": "fastwam.models.wan22.fastwam_dual_regime_fused.create_fused_dual_regime_fastwam",
+      "action_dit_config": {
+        "action_dim": 7,
+        "attn_head_dim": 128,
+        "eps": 1e-06,
+        "ffn_dim": 4096,
+        "freq_dim": 256,
+        "hidden_dim": 1024,
+        "num_heads": 24,
+        "num_layers": 30,
+        "text_dim": 4096,
+        "use_gradient_checkpointing": false
+      },
+      "action_dit_pretrained_path": "checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt",
+      "action_scheduler": {
+        "infer_shift": 5.0,
+        "num_train_timesteps": 1000,
+        "train_shift": 5.0
+      },
+      "adaptive": {
+        "allow_internal_routing": false,
+        "annotate_outputs": true
+      },
+      "checkpoint_task": "libero_dual_regime_fused_2cam224_1e-4",
+      "load_text_encoder": false,
+      "loss": {
+        "lambda_action": 1.0
+      },
+      "model_id": "Wan-AI/Wan2.2-TI2V-5B",
+      "mot_checkpoint_mixed_attn": false,
+      "proprio_dim": 8,
+      "redirect_common_files": true,
+      "skip_dit_load_from_pretrain": false,
+      "tokenizer_max_len": 128,
+      "tokenizer_model_id": "Wan-AI/Wan2.1-T2V-1.3B",
+      "train": {
+        "action_regime_weight_uncond": 1.0
+      },
+      "video_dit_config": {
+        "action_conditioned": false,
+        "action_dim": 7,
+        "action_group_causal_mask_mode": "group_diagonal",
+        "attn_head_dim": 128,
+        "eps": 1e-06,
+        "ffn_dim": 14336,
+        "freq_dim": 256,
+        "fuse_vae_embedding_in_latents": true,
+        "has_image_input": false,
+        "hidden_dim": 3072,
+        "in_dim": 48,
+        "num_heads": 24,
+        "num_layers": 30,
+        "out_dim": 48,
+        "patch_size": [
+          1,
+          2,
+          2
+        ],
+        "require_clip_embedding": false,
+        "require_vae_embedding": false,
+        "seperated_timestep": true,
+        "text_dim": 4096,
+        "use_gradient_checkpointing": false,
+        "video_attention_mask_mode": "first_frame_causal"
+      },
+      "video_scheduler": {
+        "infer_shift": 5.0,
+        "num_train_timesteps": 1000,
+        "train_shift": 5.0
+      }
+    },
+    "num_epochs": 10,
+    "num_workers": 8,
+    "output_dir": "./runs/train/2026-07-20_18-10-30",
+    "resume": null,
+    "save_every": 2000,
+    "seed": 42,
+    "wandb": {
+      "enabled": false,
+      "group": null,
+      "mode": "online",
+      "name": "train",
+      "project": "fast-wam",
+      "workspace": null
+    },
+    "warm_start": {
+      "checkpoint": null,
+      "expected_checkpoint_sha256": null,
+      "kind": null,
+      "source_config": null,
+      "source_dataset_stats": null,
+      "source_task": null
+    },
+    "weight_decay": 0.01
+  },
+  "runtime_settings": {
+    "batch_size": 16,
+    "eval_num_inference_steps": 10,
+    "eval_sigma_shift": null,
+    "mixed_precision": "bf16"
+  },
+  "schema_version": 1
+}

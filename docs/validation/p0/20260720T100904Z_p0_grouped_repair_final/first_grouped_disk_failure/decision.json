@@ -1,0 +1,81 @@
+{
+  "metrics": {
+    "blocked_reasons": [],
+    "completed_check": "fused_real_wan_parity",
+    "evidence": [
+      {
+        "exists": true,
+        "path": "/root/adaptive-wm-p0-repair/FastWAM/tests/test_dual_regime_fused.py",
+        "sha256": "caf8a2e4180153e60f45488d97d75769c47df54540caf5bead2bb0e06a5e2b51",
+        "size_bytes": 34633
+      }
+    ],
+    "failure_reasons": [
+      "pytest_exit_code=1",
+      "junit_failures=1"
+    ],
+    "junit": {
+      "errors": 0,
+      "exists": true,
+      "failures": 1,
+      "parse_error": null,
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T094723Z_p0_grouped_repair/pytest.xml",
+      "sha256": "cdad2582c6ce98229621f4567d284dde68a7059766de46c9c50e782750401c45",
+      "size_bytes": 16475,
+      "skipped": 0,
+      "skips": [],
+      "test_cases": [
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_joint_style_layout",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_joint_draft_submask_matches_fastwam_joint_mask",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_base_draft_submask_matches_fastwam_base_mask",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_idm_style_two_block_layout",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_idm_submask_matches_teacher_forcing_mask",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_span_out_of_range_raises",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_mismatched_draft_args_raise",
+        "tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask::test_non_square_block_mask_raises",
+        "tests.test_dual_regime_fused.TestMergeActionDraftPayloads::test_shapes_slices_and_t_mod_expansion",
+        "tests.test_dual_regime_fused.TestMergeActionDraftPayloads::test_token_wise_t_mod_passthrough",
+        "tests.test_dual_regime_fused.TestMergeActionDraftPayloads::test_bad_freqs_length_raises",
+        "tests.test_dual_regime_fused.TestMergeActionDraftPayloads::test_bad_t_mod_ndim_raises",
+        "tests.test_dual_regime_fused.TestMergeActionDraftPayloads::test_empty_raises",
+        "tests.test_dual_regime_fused::test_only_training_loss_is_overridden",
+        "tests.test_dual_regime_fused::test_first_frame_isolation_guard",
+        "tests.test_dual_regime_fused::test_token_wise_t_mod_guard",
+        "tests.test_dual_regime_fused::test_temporal_patch_size_guard",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_training_loss_runs_backward_and_keys",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_gradient_covers_all_trained_params",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_single_mot_forward_and_video_loss_once",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_w_base_zero_drops_base_action_term",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[0]",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[1]",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[2]",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_force_branch_inference_inherited[low]",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_force_branch_inference_inherited[high]",
+        "tests.test_dual_regime_fused.TestFusedDualRegimeTraining::test_checkpoint_records_provenance"
+      ],
+      "tests": 28
+    },
+    "missing_required_tests": [],
+    "pytest_exit_code": 1,
+    "pytest_log": {
+      "exists": true,
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T094723Z_p0_grouped_repair/pytest.log",
+      "sha256": "e6a3f164b86f64132ee489dd926257a682130c412673d021649b1ad7ab8946c7",
+      "size_bytes": 16148
+    },
+    "required_tests": [
+      "test_training_loss_runs_backward_and_keys",
+      "test_gradient_covers_all_trained_params",
+      "test_single_mot_forward_and_video_loss_once",
+      "test_fused_matches_two_forward_reference",
+      "test_fused_matches_two_forward_reference_seeded[0]",
+      "test_fused_matches_two_forward_reference_seeded[1]",
+      "test_fused_matches_two_forward_reference_seeded[2]",
+      "test_base_draft_submask_matches_fastwam_base_mask",
+      "test_idm_submask_matches_teacher_forcing_mask"
+    ]
+  },
+  "stage": "P0",
+  "status": "FAIL"
+}

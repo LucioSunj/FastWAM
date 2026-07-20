@@ -1,0 +1,5 @@
+# Preserve byte-identical archived validation evidence across checkouts.
+docs/validation/p0/20260720T100904Z_p0_grouped_repair_final/** -text
+docs/validation/p0/20260720T100904Z_p0_grouped_repair_final/**/*.log -diff
+docs/validation/p0/20260720T100904Z_p0_grouped_repair_final/**/*.txt -diff
+docs/validation/p0/20260720T100904Z_p0_grouped_repair_final/**/*.xml -diff

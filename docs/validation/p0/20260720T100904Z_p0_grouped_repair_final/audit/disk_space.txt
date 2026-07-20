@@ -1,0 +1,4 @@
+Filesystem       Size  Used Avail Use% Mounted on
+overlay           30G   23G  7.1G  77% /
+AutoFS:fs435907  200G  183G   18G  92% /autodl-fs/data
+/dev/md0          50G  956K   50G   1% /root/autodl-tmp

@@ -2,21 +2,18 @@
 # SETTING: Two independent S-DR pilot trainings with the preregistered 1e-5 and 3e-5 base learning rates.
 # MODEL/CHECKPOINT LINEAGE: The same standalone E-I parent initializes both pilots; neither pilot resumes from the other.
 # SCIENTIFIC GOAL: Compare optimization stability before committing endpoint/control/Gate artifacts to one shared checkpoint.
-# ACCEPTANCE: Both pilots finish the full optimizer-step schedule with finite weights; selection binds one exact checkpoint SHA.
-# REQUIRED INPUTS: All run_e1_train_shared.sh inputs plus SELECTED_LR (1e-5 or 3e-5) and a non-empty SELECTION_BASIS.
-# OUTPUTS: Two independent S-DR runs and pilot_selection.json consumed by E1 endpoint/profile launchers.
+# ACCEPTANCE: Both pilots finish the full optimizer-step schedule with finite weights; selection is a later explicit step.
+# REQUIRED INPUTS: All run_e1_train_shared.sh inputs; no pilot may be selected before both candidates finish.
+# OUTPUTS: Two independent S-DR runs, completion evidence, and a contract decision; no pilot_selection.json.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 parse_launcher_args "$@"
-for name in E_I_CKPT E_I_CONFIG DATASET_STATS WARMSTART_DECISION SELECTED_LR SELECTION_BASIS; do
+for name in E_I_CKPT E_I_CONFIG DATASET_STATS WARMSTART_DECISION; do
     require_env "${name}"
 done
-[[ "${SELECTED_LR}" == "1e-5" || "${SELECTED_LR}" == "3e-5" ]] || \
-    die "SELECTED_LR must be 1e-5 or 3e-5"
-[[ -n "${SELECTION_BASIS}" ]] || die "SELECTION_BASIS must explain the pilot choice"
 
 RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}
-RUN_DIR="${EXPERIMENT_ROOT}/E1_shared_pilot_selection/${RUN_ID}"
+RUN_DIR="${EXPERIMENT_ROOT}/E1_shared_pilot_candidates/${RUN_ID}"
 prepare_run_dir "${RUN_DIR}"
 CANDIDATE_1E5_ID="${RUN_ID}_lr1e-5"
 CANDIDATE_3E5_ID="${RUN_ID}_lr3e-5"
@@ -53,21 +50,17 @@ if [[ "${DRY_RUN}" -eq 0 ]]; then
     require_file "${VALIDATION_1E5}"
     require_file "${VALIDATION_3E5}"
 fi
-SELECT_CMD=(
-    python scripts/validate_sdr_checkpoint.py select
-    --candidate-validation "${VALIDATION_1E5}"
-    --candidate-validation "${VALIDATION_3E5}"
-    --selected-lr "${SELECTED_LR}"
-    --selection-basis "${SELECTION_BASIS}"
-    --out "${RUN_DIR}/pilot_selection.json"
-)
-run_command "${SELECT_CMD[@]}"
+run_command python "${DECISION_TOOL}" contract \
+    --check sdr_two_lr_pilots_complete \
+    --evidence "${VALIDATION_1E5}" \
+    --evidence "${VALIDATION_3E5}" \
+    --out "${RUN_DIR}/decision.json"
 if [[ "${DRY_RUN}" -eq 0 ]]; then
     RUN_ARTIFACTS=(
         "${VALIDATION_1E5}" "${VALIDATION_3E5}"
         "${CANDIDATE_1E5_DIR}/run_manifest.json"
         "${CANDIDATE_3E5_DIR}/run_manifest.json"
-        "${RUN_DIR}/pilot_selection.json"
+        "${RUN_DIR}/decision.json"
     )
 fi
 write_full_run_manifest "${RUN_DIR}/run_manifest.json"

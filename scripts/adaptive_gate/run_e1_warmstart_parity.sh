@@ -28,6 +28,7 @@ RTOL=${RTOL:-5e-3}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}
 RUN_DIR="${EXPERIMENT_ROOT}/E1_warmstart_parity/${RUN_ID}"
 prepare_run_dir "${RUN_DIR}"
+PARITY_RESULT="${RUN_DIR}/parity_result.json"
 E_I_SHA256=${E_I_SHA256:-$(python -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "${E_I_CKPT}")}
 RUN_ARTIFACTS=(
     "${E_I_CKPT}" "${E_I_CONFIG}" "${DATASET_STATS}" "${P0_FUSED_DECISION}"
@@ -49,14 +50,16 @@ CMD=(
     --dtype "${DTYPE}"
     --atol "${ATOL}"
     --rtol "${RTOL}"
+    --out "${PARITY_RESULT}"
 )
 if [[ -n "${SIGMA_SHIFT:-}" && "${SIGMA_SHIFT}" != "null" ]]; then
     CMD+=(--sigma-shift "${SIGMA_SHIFT}")
 fi
 CMD+=("${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"}")
 run_command "${CMD[@]}"
-run_command python "${DECISION_TOOL}" p0 \
+RUN_ARTIFACTS+=("${PARITY_RESULT}")
+run_command python "${DECISION_TOOL}" contract \
     --check standalone_idm_to_s0_fixed_seed_parity \
-    --evidence "${E_I_CKPT}" \
+    --evidence "${PARITY_RESULT}" \
     --out "${RUN_DIR}/decision.json"
 write_full_run_manifest "${RUN_DIR}/run_manifest.json"

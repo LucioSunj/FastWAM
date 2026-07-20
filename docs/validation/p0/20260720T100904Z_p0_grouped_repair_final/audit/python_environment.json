@@ -1,0 +1,13 @@
+{
+  "accelerate": "1.12.0",
+  "bf16_supported": true,
+  "cuda_available": true,
+  "deepspeed": "0.18.5",
+  "executable": "/root/autodl-fs/fastwam/venv/bin/python",
+  "gpu_name": "NVIDIA A800-SXM4-80GB",
+  "gpu_total_bytes": 85093777408,
+  "python": "3.10.20",
+  "torch": "2.7.1+cu128",
+  "torch_cuda": "12.8",
+  "torchvision": "0.22.1+cu128"
+}

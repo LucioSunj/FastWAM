@@ -1,0 +1,39 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.20, pytest-9.1.1, pluggy-1.6.0 -- /root/autodl-fs/fastwam/venv/bin/python
+cachedir: .pytest_cache
+rootdir: /root/adaptive-wm-p0-repair/FastWAM
+configfile: pyproject.toml
+plugins: hydra-core-1.3.2
+collecting ... collected 28 items
+
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_joint_style_layout PASSED [  3%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_joint_draft_submask_matches_fastwam_joint_mask PASSED [  7%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_base_draft_submask_matches_fastwam_base_mask PASSED [ 10%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_idm_style_two_block_layout PASSED [ 14%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_idm_submask_matches_teacher_forcing_mask PASSED [ 17%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_span_out_of_range_raises PASSED [ 21%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_mismatched_draft_args_raise PASSED [ 25%]
+tests/test_dual_regime_fused.py::TestBuildMultiRegimeAttentionMask::test_non_square_block_mask_raises PASSED [ 28%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_shapes_slices_and_t_mod_expansion PASSED [ 32%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_token_wise_t_mod_passthrough PASSED [ 35%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_bad_freqs_length_raises PASSED [ 39%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_bad_t_mod_ndim_raises PASSED [ 42%]
+tests/test_dual_regime_fused.py::TestMergeActionDraftPayloads::test_empty_raises PASSED [ 46%]
+tests/test_dual_regime_fused.py::test_only_training_loss_is_overridden PASSED [ 50%]
+tests/test_dual_regime_fused.py::test_first_frame_isolation_guard PASSED [ 53%]
+tests/test_dual_regime_fused.py::test_token_wise_t_mod_guard PASSED      [ 57%]
+tests/test_dual_regime_fused.py::test_temporal_patch_size_guard PASSED   [ 60%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_training_loss_runs_backward_and_keys PASSED [ 64%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_gradient_covers_all_trained_params PASSED [ 67%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_single_mot_forward_and_video_loss_once PASSED [ 71%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_w_base_zero_drops_base_action_term PASSED [ 75%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference PASSED [ 78%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[0] PASSED [ 82%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[1] PASSED [ 85%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_fused_matches_two_forward_reference_seeded[2] PASSED [ 89%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_force_branch_inference_inherited[low] PASSED [ 92%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_force_branch_inference_inherited[high] PASSED [ 96%]
+tests/test_dual_regime_fused.py::TestFusedDualRegimeTraining::test_checkpoint_records_provenance PASSED [100%]
+
+- generated xml file: /root/autodl-tmp/experiments/adaptive_wm_reasoning/P0_fused_parity/20260720T100904Z_p0_grouped_repair_final/pytest.xml -
+======================== 28 passed in 72.58s (0:01:12) =========================

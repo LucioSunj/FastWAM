@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="28" time="175.098" timestamp="2026-07-20T17:50:32.378550+08:00" hostname="autodl-container-0zv0wuxn4h-27f6a439"><testcase classname="tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask" name="test_joint_style_layout" time="0.024" /><testcase classname="tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask" name="test_joint_draft_submask_matches_fastwam_joint_mask" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask" name="test_base_draft_submask_matches_fastwam_base_mask" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask" name="test_idm_style_two_block_layout" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask" name="test_idm_submask_matches_teacher_forcing_mask" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask" name="test_span_out_of_range_raises" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask" name="test_mismatched_draft_args_raise" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestBuildMultiRegimeAttentionMask" name="test_non_square_block_mask_raises" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestMergeActionDraftPayloads" name="test_shapes_slices_and_t_mod_expansion" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestMergeActionDraftPayloads" name="test_token_wise_t_mod_passthrough" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestMergeActionDraftPayloads" name="test_bad_freqs_length_raises" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestMergeActionDraftPayloads" name="test_bad_t_mod_ndim_raises" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestMergeActionDraftPayloads" name="test_empty_raises" time="0.001" /><testcase classname="tests.test_dual_regime_fused" name="test_only_training_loss_is_overridden" time="4.392" /><testcase classname="tests.test_dual_regime_fused" name="test_first_frame_isolation_guard" time="0.001" /><testcase classname="tests.test_dual_regime_fused" name="test_token_wise_t_mod_guard" time="0.001" /><testcase classname="tests.test_dual_regime_fused" name="test_temporal_patch_size_guard" time="0.001" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_training_loss_runs_backward_and_keys" time="142.708" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_gradient_covers_all_trained_params" time="0.509" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_single_mot_forward_and_video_loss_once" time="0.214" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_w_base_zero_drops_base_action_term" time="0.213" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_fused_matches_two_forward_reference" time="0.355" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_fused_matches_two_forward_reference_seeded[0]" time="0.355" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_fused_matches_two_forward_reference_seeded[1]" time="0.346" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_fused_matches_two_forward_reference_seeded[2]" time="0.345" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_force_branch_inference_inherited[low]" time="0.153" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_force_branch_inference_inherited[high]" time="0.227" /><testcase classname="tests.test_dual_regime_fused.TestFusedDualRegimeTraining" name="test_checkpoint_records_provenance" time="18.649"><failure message="RuntimeError: [enforce fail at inline_container.cc:659] . unexpected pos 7531394880 vs 7531394776">obj = {'mot': OrderedDict([('mixtures.video.patch_embedding.weight', tensor([[[[[ 1.9653e-02,  3.9368e-03],
+           [-1.5...eda574491f8acf3740fb8b322c', 'model_class': 'FusedDualRegimeFastWAM', 'adaptive_regimes': ['uncond', 'idm'], ...}, ...}
+f = '/tmp/pytest-of-root/pytest-23/test_checkpoint_records_proven0/step_test.pt'
+pickle_module = &lt;module 'pickle' from '/root/autodl-fs/fastwam/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/pickle.py'&gt;
+pickle_protocol = 2, _use_new_zipfile_serialization = True
+_disable_byteorder_record = False
+
+    def save(
+        obj: object,
+        f: FileLike,
+        pickle_module: Any = pickle,
+        pickle_protocol: int = DEFAULT_PROTOCOL,
+        _use_new_zipfile_serialization: bool = True,
+        _disable_byteorder_record: bool = False,
+    ) -&gt; None:
+        # Reference: https://github.com/pytorch/pytorch/issues/54354
+        # The first line of this docstring overrides the one Sphinx generates for the
+        # documentation. We need it so that Sphinx doesn't leak `pickle`s path from
+        # the build environment (e.g. `&lt;module 'pickle' from '/leaked/path').
+    
+        """save(obj, f, pickle_module=pickle, pickle_protocol=2, _use_new_zipfile_serialization=True)
+    
+        Saves an object to a disk file.
+    
+        See also: :ref:`saving-loading-tensors`
+    
+        Args:
+            obj: saved object
+            f: a file-like object (has to implement write and flush) or a string or
+               os.PathLike object containing a file name
+            pickle_module: module used for pickling metadata and objects
+            pickle_protocol: can be specified to override the default protocol
+    
+        .. note::
+            A common PyTorch convention is to save tensors using .pt file extension.
+    
+        .. note::
+            PyTorch preserves storage sharing across serialization. See
+            :ref:`preserve-storage-sharing` for more details.
+    
+        .. note::
+            The 1.6 release of PyTorch switched ``torch.save`` to use a new
+            zipfile-based file format. ``torch.load`` still retains the ability to
+            load files in the old format. If for any reason you want ``torch.save``
+            to use the old format, pass the kwarg ``_use_new_zipfile_serialization=False``.
+    
+        Example:
+            &gt;&gt;&gt; # xdoctest: +SKIP("makes cwd dirty")
+            &gt;&gt;&gt; # Save to file
+            &gt;&gt;&gt; x = torch.tensor([0, 1, 2, 3, 4])
+            &gt;&gt;&gt; torch.save(x, "tensor.pt")
+            &gt;&gt;&gt; # Save to io.BytesIO buffer
+            &gt;&gt;&gt; buffer = io.BytesIO()
+            &gt;&gt;&gt; torch.save(x, buffer)
+        """
+        torch._C._log_api_usage_once("torch.save")
+        _check_dill_version(pickle_module)
+        _check_save_filelike(f)
+    
+        if isinstance(f, (str, os.PathLike)):
+            f = os.fspath(f)
+    
+        if _use_new_zipfile_serialization:
+            with _open_zipfile_writer(f) as opened_zipfile:
+&gt;               _save(
+                    obj,
+                    opened_zipfile,
+                    pickle_module,
+                    pickle_protocol,
+                    _disable_byteorder_record,
+                )
+
+/root/autodl-fs/fastwam/venv/lib/python3.10/site-packages/torch/serialization.py:965: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+obj = {'mot': OrderedDict([('mixtures.video.patch_embedding.weight', tensor([[[[[ 1.9653e-02,  3.9368e-03],
+           [-1.5...eda574491f8acf3740fb8b322c', 'model_class': 'FusedDualRegimeFastWAM', 'adaptive_regimes': ['uncond', 'idm'], ...}, ...}
+zip_file = &lt;torch.PyTorchFileWriter object at 0x7f7e322cacb0&gt;
+pickle_module = &lt;module 'pickle' from '/root/autodl-fs/fastwam/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/pickle.py'&gt;
+pickle_protocol = 2, _disable_byteorder_record = False
+
+    def _save(
+        obj,
+        zip_file,
+        pickle_module,
+        pickle_protocol,
+        _disable_byteorder_record,
+    ):
+        serialized_storages = {}
+        id_map: dict[int, str] = {}
+    
+        # Since loading storages that view the same data with different dtypes is
+        # not supported, we need to keep track of the dtype associated with each
+        # storage data_ptr and throw an error if the dtype is ever different.
+        # TODO: This feature could be added in the future
+        storage_dtypes: dict[int, torch.dtype] = {}
+    
+        def persistent_id(obj):
+            # FIXME: the docs say that persistent_id should only return a string
+            # but torch store returns tuples. This works only in the binary protocol
+            # see
+            # https://docs.python.org/2/library/pickle.html#pickling-and-unpickling-external-objects
+            # https://github.com/python/cpython/blob/master/Lib/pickle.py#L527-L537
+            if isinstance(obj, torch.storage.TypedStorage) or torch.is_storage(obj):
+                if isinstance(obj, torch.storage.TypedStorage):
+                    # TODO: Once we decide to break serialization FC, this case
+                    # can be deleted
+                    storage = obj._untyped_storage
+                    storage_dtype = obj.dtype
+                    storage_type_str = obj._pickle_storage_type()
+                    storage_type = getattr(torch, storage_type_str)
+                    storage_numel = obj._size()
+    
+                else:
+                    storage = obj
+                    storage_dtype = torch.uint8
+                    storage_type = normalize_storage_type(type(obj))
+                    storage_numel = storage.nbytes()
+    
+                # If storage is allocated, ensure that any other saved storages
+                # pointing to the same data all have the same dtype. If storage is
+                # not allocated, don't perform this check
+                if str(storage.device) != "meta" and storage.data_ptr() != 0:
+                    if storage.data_ptr() in storage_dtypes:
+                        if storage_dtype != storage_dtypes[storage.data_ptr()]:
+                            raise RuntimeError(
+                                "Cannot save multiple tensors or storages that "
+                                "view the same data as different types"
+                            )
+                    else:
+                        storage_dtypes[storage.data_ptr()] = storage_dtype
+    
+                storage_key = id_map.setdefault(storage._cdata, str(len(id_map)))
+                if hasattr(obj, "_fake_device") and obj._fake_device is not None:
+                    location = str(obj._fake_device)
+                else:
+                    location = location_tag(storage)
+                serialized_storages[storage_key] = storage
+    
+                return ("storage", storage_type, storage_key, location, storage_numel)
+    
+            return None
+    
+        # Write the pickle data for `obj`
+        data_buf = io.BytesIO()
+    
+        class PyTorchPickler(pickle_module.Pickler):  # type: ignore[name-defined]
+            def persistent_id(self, obj):
+                return persistent_id(obj)
+    
+        pickler = PyTorchPickler(data_buf, protocol=pickle_protocol)
+        pickler.dump(obj)
+        data_value = data_buf.getvalue()
+        zip_file.write_record("data.pkl", data_value, len(data_value))
+        # .format_version is used to track
+        #     1. version 1 represents the order of storages being changed from
+        #        lexicographical based on keys to numerically ordered based on keys
+        #     2. version 2 represents including storage_alignment as a record
+        #        within the zipfile
+        zip_file.write_record(".format_version", "1", len("1"))
+        storage_alignment = str(_get_storage_alignment())
+        zip_file.write_record(
+            ".storage_alignment", storage_alignment, len(storage_alignment)
+        )
+    
+        # Write byte order marker
+        if not _disable_byteorder_record:
+            if sys.byteorder not in ["little", "big"]:
+                raise ValueError("Unknown endianness type: " + sys.byteorder)
+    
+            zip_file.write_record("byteorder", sys.byteorder, len(sys.byteorder))
+    
+        # Write each tensor to a file named tensor/the_tensor_key in the zip archive
+        for key in serialized_storages.keys():
+            name = f"data/{key}"
+            storage = serialized_storages[key]
+            num_bytes = storage.nbytes()
+            global _serialization_tls
+            if _serialization_tls.skip_data:
+                zip_file.write_record_metadata(name, num_bytes)
+            else:
+                # given that we copy things around anyway, we might use storage.cpu()
+                # this means to that to get tensors serialized, you need to implement
+                # .cpu() on the underlying Storage
+                if storage.device.type != "cpu":
+                    from torch.utils.serialization import config
+    
+                    if (
+                        config.save.use_pinned_memory_for_d2h
+                        and (
+                            acc := torch.accelerator.current_accelerator(
+                                check_available=True
+                            )
+                        )
+                        is not None
+                        and acc.type == storage.device.type
+                    ):
+                        new_storage = torch.empty(
+                            num_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
+                        ).untyped_storage()
+                        new_storage.copy_(storage)
+                        torch.accelerator.current_stream(storage.device.index).synchronize()
+                        storage = new_storage
+                    else:
+                        storage = storage.cpu()
+                # Now that it is on the CPU we can directly copy it into the zip file
+&gt;               zip_file.write_record(name, storage, num_bytes)
+E               RuntimeError: [enforce fail at inline_container.cc:857] . PytorchStreamWriter failed writing file data/629: file write failed
+
+/root/autodl-fs/fastwam/venv/lib/python3.10/site-packages/torch/serialization.py:1266: RuntimeError
+
+During handling of the above exception, another exception occurred:
+
+self = &lt;test_dual_regime_fused.TestFusedDualRegimeTraining object at 0x7f7e35ca43d0&gt;
+fused_model = FusedDualRegimeFastWAM(
+  (video_expert): WanVideoDiT(
+    (patch_embedding): Conv3d(48, 3072, kernel_size=(1, 2, 2), ...tride=(1, 1, 1))
+        )
+      )
+    )
+  )
+  (proprio_encoder): Linear(in_features=8, out_features=4096, bias=True)
+)
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-23/test_checkpoint_records_proven0')
+
+    def test_checkpoint_records_provenance(self, fused_model, tmp_path):
+        m = fused_model
+        m.dataset_stats_fingerprint = "test-stats-sha256"
+        m.dual_regime_optimizer_steps = 1
+        m.dual_regime_training_contract = {
+            "uncond_weight_schedule": [[0.0, 0.05], [1.0, 1.0]],
+            "total_optimizer_steps": 100,
+        }
+        path = tmp_path / "step_test.pt"
+&gt;       m.save_checkpoint(str(path))
+
+tests/test_dual_regime_fused.py:722: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+src/fastwam/models/wan22/fastwam.py:1221: in save_checkpoint
+    torch.save(payload, path)
+/root/autodl-fs/fastwam/venv/lib/python3.10/site-packages/torch/serialization.py:964: in save
+    with _open_zipfile_writer(f) as opened_zipfile:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = &lt;torch.serialization._open_zipfile_writer_file object at 0x7f7e28337580&gt;
+args = (&lt;class 'RuntimeError'&gt;, RuntimeError('[enforce fail at inline_container.cc:857] . PytorchStreamWriter failed writing file data/629: file write failed'), &lt;traceback object at 0x7f7e1c53c040&gt;)
+
+    def __exit__(self, *args) -&gt; None:
+&gt;       self.file_like.write_end_of_file()
+E       RuntimeError: [enforce fail at inline_container.cc:659] . unexpected pos 7531394880 vs 7531394776
+
+/root/autodl-fs/fastwam/venv/lib/python3.10/site-packages/torch/serialization.py:798: RuntimeError</failure></testcase></testsuite></testsuites>

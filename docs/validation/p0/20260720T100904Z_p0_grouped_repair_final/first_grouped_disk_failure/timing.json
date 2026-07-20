@@ -1,0 +1,7 @@
+{
+  "dtype": "bfloat16",
+  "end_utc": "2026-07-20T09:53:29Z",
+  "peak_gpu_memory_mib": 26083,
+  "start_utc": "2026-07-20T09:50:30Z",
+  "wall_clock_seconds": 179
+}

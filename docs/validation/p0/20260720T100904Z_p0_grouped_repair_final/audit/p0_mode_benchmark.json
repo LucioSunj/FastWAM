@@ -1,0 +1,30 @@
+{
+  "acceptance_role": "report_only_not_p0_acceptance",
+  "device": "NVIDIA A800-SXM4-80GB",
+  "dtype": "bfloat16",
+  "input": {
+    "batch": 1,
+    "frames": 5,
+    "height": 64,
+    "horizon": 8,
+    "width": 64
+  },
+  "results": {
+    "grouped_single_mot": {
+      "peak_allocated_mib": 12881.01220703125,
+      "peak_reserved_mib": 13096.0,
+      "wall_clock_seconds": 0.16731894202530384
+    },
+    "old_dense_single_mot": {
+      "peak_allocated_mib": 12881.01220703125,
+      "peak_reserved_mib": 13096.0,
+      "wall_clock_seconds": 0.10186591558158398
+    },
+    "two_forward_reference": {
+      "peak_allocated_mib": 12881.01220703125,
+      "peak_reserved_mib": 13096.0,
+      "wall_clock_seconds": 0.1803741343319416
+    }
+  },
+  "seed": 0
+}

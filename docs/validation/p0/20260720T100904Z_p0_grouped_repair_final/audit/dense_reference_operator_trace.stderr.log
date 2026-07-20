@@ -1,0 +1,2 @@
+/root/adaptive_wm_reasoning_validation/20260720T023208Z/diagnose_p0_layer_drift.py:17: UserWarning: Casting complex values to real discards the imaginary part (Triggered internally at /pytorch/aten/src/ATen/native/Copy.cpp:307.)
+  return float((left.float() - right.float()).abs().max().item())

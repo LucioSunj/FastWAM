@@ -1,0 +1,15 @@
+
+==================================== ERRORS ====================================
+_____________ ERROR collecting tests/test_mot_attention_groups.py ______________
+ImportError while importing test module '/root/adaptive-wm-p0-repair/FastWAM/tests/test_mot_attention_groups.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/root/autodl-fs/fastwam/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+tests/test_mot_attention_groups.py:9: in <module>
+    from fastwam.models.wan22.mot import MoT, MoTAttentionGroup, MoTExpertSpan
+E   ImportError: cannot import name 'MoTAttentionGroup' from 'fastwam.models.wan22.mot' (/root/When-will-inference-time-prediction-beneficial-/FastWAM/src/fastwam/models/wan22/mot.py)
+=========================== short test summary info ============================
+ERROR tests/test_mot_attention_groups.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 2.99s

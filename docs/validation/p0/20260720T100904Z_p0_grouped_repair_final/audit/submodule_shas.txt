@@ -1,0 +1,4 @@
+ 4cfc6acd6ddfef2cb18b2a829d77306351203448 FastWAM (heads/p0-fused-parity-fix)
+ aabebda3cd7200870d677f159165ebf564d92d89 RLinf (remotes/origin/adaptive-gate)
+ f6c771fc3be0a9bc271ea4f1531d8ea35efb0ec7 StarWAM (remotes/origin/Lucio's)
+ 235f39929759164f1087204e610ce6c1252b22aa starVLA (remotes/origin/adaptive-gate)

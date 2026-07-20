@@ -55,7 +55,7 @@ CMD=(
 )
 run_command "${CMD[@]}"
 RUN_ARTIFACTS+=("${BANK_PATH}")
-run_command python "${DECISION_TOOL}" p0 \
+run_command python "${DECISION_TOOL}" contract \
     --check e2_valid_idm_shuffled_future_bank \
     --evidence "${BANK_PATH}" \
     --evidence "${CONTROL_PROFILE}" \
