@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -9,6 +10,24 @@ from .wan_video_dit import flash_attention, modulate, rope_apply
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class MoTExpertSpan:
+    """Contiguous tokens contributed by one expert to an attention group."""
+
+    expert: str
+    start: int
+    end: int
+    write: bool = True
+
+
+@dataclass(frozen=True)
+class MoTAttentionGroup:
+    """Reference-shaped attention call executed inside one MoT forward."""
+
+    name: str
+    spans: tuple[MoTExpertSpan, ...]
 
 
 class MoT(nn.Module):
@@ -444,6 +463,284 @@ class MoT(nn.Module):
             )
         return x
 
+    @staticmethod
+    def _slice_sequence_tensor(
+        value: torch.Tensor,
+        start: int,
+        end: int,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        """Slice a token-wise tensor while preserving sequence-shared values."""
+        if value.ndim == 3:
+            return value
+        if value.ndim != 4:
+            raise ValueError(
+                f"{name} must be sequence-shared [B,6,D] or token-wise "
+                f"[B,S,6,D], got shape {tuple(value.shape)}"
+            )
+        if value.shape[1] < end:
+            raise ValueError(
+                f"{name} sequence length {value.shape[1]} does not cover span "
+                f"[{start}, {end})"
+            )
+        return value[:, start:end]
+
+    @staticmethod
+    def _slice_context_payload(
+        payload: Optional[dict],
+        start: int,
+        end: int,
+        *,
+        expert_name: str,
+    ) -> Optional[dict]:
+        if payload is None:
+            return None
+        result = dict(payload)
+        mask = result.get("mask")
+        if mask is None or mask.ndim == 2:
+            return result
+        if mask.ndim == 3:
+            query_len = int(mask.shape[1])
+            if query_len == 1:
+                return result
+            if query_len < end:
+                raise ValueError(
+                    f"context mask for expert {expert_name!r} has query length "
+                    f"{query_len}, which does not cover span [{start}, {end})"
+                )
+            result["mask"] = mask[:, start:end, :]
+            return result
+        if mask.ndim == 4:
+            query_len = int(mask.shape[-2])
+            if query_len == 1:
+                return result
+            if query_len < end:
+                raise ValueError(
+                    f"context mask for expert {expert_name!r} has query length "
+                    f"{query_len}, which does not cover span [{start}, {end})"
+                )
+            result["mask"] = mask[:, :, start:end, :]
+            return result
+        raise ValueError(
+            f"context mask for expert {expert_name!r} must have 2, 3, or 4 "
+            f"dimensions, got shape {tuple(mask.shape)}"
+        )
+
+    def _validate_attention_groups(
+        self,
+        attention_groups: Sequence[MoTAttentionGroup],
+        tokens_all: Dict[str, torch.Tensor],
+    ) -> tuple[tuple[MoTAttentionGroup, ...], dict[str, int]]:
+        groups = tuple(attention_groups)
+        if not groups:
+            raise ValueError("attention_groups cannot be empty")
+
+        offsets: dict[str, int] = {}
+        total = 0
+        writer_counts: dict[str, list[int]] = {}
+        for expert_name in self.expert_order:
+            seq_len = int(tokens_all[expert_name].shape[1])
+            offsets[expert_name] = total
+            total += seq_len
+            writer_counts[expert_name] = [0] * seq_len
+
+        group_names: set[str] = set()
+        expert_positions = {name: index for index, name in enumerate(self.expert_order)}
+        for group in groups:
+            if not isinstance(group, MoTAttentionGroup):
+                raise TypeError(
+                    "each attention group must be a MoTAttentionGroup, got "
+                    f"{type(group).__name__}"
+                )
+            if not group.name:
+                raise ValueError("attention group names cannot be empty")
+            if group.name in group_names:
+                raise ValueError(f"duplicate attention group name {group.name!r}")
+            group_names.add(group.name)
+            if not group.spans:
+                raise ValueError(f"attention group {group.name!r} has no spans")
+
+            seen_experts: set[str] = set()
+            previous_position = -1
+            group_writer_tokens = 0
+            for span in group.spans:
+                if not isinstance(span, MoTExpertSpan):
+                    raise TypeError(
+                        f"attention group {group.name!r} contains a non-MoTExpertSpan"
+                    )
+                if span.expert not in expert_positions:
+                    raise ValueError(
+                        f"attention group {group.name!r} references unknown expert "
+                        f"{span.expert!r}"
+                    )
+                if span.expert in seen_experts:
+                    raise ValueError(
+                        f"attention group {group.name!r} contains more than one span "
+                        f"for expert {span.expert!r}"
+                    )
+                seen_experts.add(span.expert)
+                position = expert_positions[span.expert]
+                if position <= previous_position:
+                    raise ValueError(
+                        f"attention group {group.name!r} spans must follow expert order "
+                        f"{self.expert_order}"
+                    )
+                previous_position = position
+
+                seq_len = int(tokens_all[span.expert].shape[1])
+                if span.start < 0 or span.end <= span.start or span.end > seq_len:
+                    raise ValueError(
+                        f"attention group {group.name!r} span {span.expert}"
+                        f"[{span.start}, {span.end}) is out of range for length {seq_len}"
+                    )
+                if span.write:
+                    group_writer_tokens += span.end - span.start
+                    counts = writer_counts[span.expert]
+                    for token_index in range(span.start, span.end):
+                        counts[token_index] += 1
+            if group_writer_tokens == 0:
+                raise ValueError(
+                    f"attention group {group.name!r} must own at least one output token"
+                )
+
+        for expert_name, counts in writer_counts.items():
+            missing = [index for index, count in enumerate(counts) if count == 0]
+            duplicates = [index for index, count in enumerate(counts) if count > 1]
+            if missing or duplicates:
+                raise ValueError(
+                    f"attention group writers must cover every {expert_name!r} token "
+                    f"exactly once; missing={missing[:8]}, duplicate={duplicates[:8]}"
+                )
+
+        return groups, offsets
+
+    def _forward_attention_groups(
+        self,
+        tokens_all: Dict[str, torch.Tensor],
+        attention_mask: torch.Tensor,
+        freqs_all: Dict[str, torch.Tensor],
+        context_all: Dict[str, Optional[dict]],
+        t_mod_all: Dict[str, torch.Tensor],
+        attention_groups: Sequence[MoTAttentionGroup],
+    ) -> Dict[str, torch.Tensor]:
+        groups, offsets = self._validate_attention_groups(attention_groups, tokens_all)
+        total_seq = sum(int(tokens_all[name].shape[1]) for name in self.expert_order)
+        if attention_mask.shape[0] != total_seq:
+            raise ValueError(
+                "Attention mask seq length mismatch: "
+                f"mask={attention_mask.shape[0]} vs tokens={total_seq}"
+            )
+
+        group_indices: dict[str, torch.Tensor] = {}
+        for group in groups:
+            indices = [
+                offsets[span.expert] + token_index
+                for span in group.spans
+                for token_index in range(span.start, span.end)
+            ]
+            group_indices[group.name] = torch.tensor(
+                indices, dtype=torch.long, device=attention_mask.device
+            )
+
+        for layer_idx in range(self.num_layers):
+            writers: dict[str, list[tuple[int, int, torch.Tensor]]] = {
+                name: [] for name in self.expert_order
+            }
+            for group in groups:
+                q_chunks = []
+                k_chunks = []
+                v_chunks = []
+                cached_spans = []
+                for span in group.spans:
+                    expert = self.mixtures[span.expert]
+                    block = expert.blocks[layer_idx]
+                    x = tokens_all[span.expert][:, span.start:span.end]
+                    freqs = freqs_all[span.expert][span.start:span.end]
+                    t_mod = self._slice_sequence_tensor(
+                        t_mod_all[span.expert],
+                        span.start,
+                        span.end,
+                        name=f"t_mod_all[{span.expert!r}]",
+                    )
+                    (
+                        q,
+                        k,
+                        v,
+                        residual_x,
+                        gate_msa,
+                        shift_mlp,
+                        scale_mlp,
+                        gate_mlp,
+                        use_gradient_checkpointing,
+                    ) = self._build_expert_attention_io(
+                        expert=expert,
+                        block=block,
+                        x=x,
+                        freqs=freqs,
+                        t_mod=t_mod,
+                    )
+                    q_chunks.append(q)
+                    k_chunks.append(k)
+                    v_chunks.append(v)
+                    cached_spans.append(
+                        {
+                            "span": span,
+                            "block": block,
+                            "seq_len": int(x.shape[1]),
+                            "residual_x": residual_x,
+                            "gate_msa": gate_msa,
+                            "shift_mlp": shift_mlp,
+                            "scale_mlp": scale_mlp,
+                            "gate_mlp": gate_mlp,
+                            "use_gradient_checkpointing": use_gradient_checkpointing,
+                            "context_payload": self._slice_context_payload(
+                                context_all.get(span.expert),
+                                span.start,
+                                span.end,
+                                expert_name=span.expert,
+                            ),
+                        }
+                    )
+
+                indices = group_indices[group.name]
+                group_mask = attention_mask.index_select(0, indices).index_select(1, indices)
+                mixed = self._mixed_attention(
+                    q_cat=torch.cat(q_chunks, dim=1),
+                    k_cat=torch.cat(k_chunks, dim=1),
+                    v_cat=torch.cat(v_chunks, dim=1),
+                    attention_mask=group_mask,
+                )
+
+                mixed_start = 0
+                for cached in cached_spans:
+                    mixed_end = mixed_start + cached["seq_len"]
+                    span = cached["span"]
+                    if span.write:
+                        updated = self._apply_post_with_optional_checkpoint(
+                            block=cached["block"],
+                            residual_x=cached["residual_x"],
+                            gate_msa=cached["gate_msa"],
+                            shift_mlp=cached["shift_mlp"],
+                            scale_mlp=cached["scale_mlp"],
+                            gate_mlp=cached["gate_mlp"],
+                            use_gradient_checkpointing=cached["use_gradient_checkpointing"],
+                            mixed_slice=mixed[:, mixed_start:mixed_end],
+                            context_payload=cached["context_payload"],
+                        )
+                        writers[span.expert].append((span.start, span.end, updated))
+                    mixed_start = mixed_end
+
+            next_tokens: dict[str, torch.Tensor] = {}
+            for expert_name in self.expert_order:
+                ordered = sorted(writers[expert_name], key=lambda item: item[0])
+                next_tokens[expert_name] = torch.cat(
+                    [updated for _, _, updated in ordered], dim=1
+                )
+            tokens_all = next_tokens
+
+        return tokens_all
+
     def forward(
         self,
         embeds_all: Dict[str, torch.Tensor],
@@ -451,6 +748,7 @@ class MoT(nn.Module):
         freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
+        attention_groups: Optional[Sequence[MoTAttentionGroup]] = None,
     ):
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
@@ -468,6 +766,16 @@ class MoT(nn.Module):
             raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
 
         tokens_all = {k: v for k, v in embeds_all.items()}
+
+        if attention_groups is not None:
+            return self._forward_attention_groups(
+                tokens_all=tokens_all,
+                attention_mask=attention_mask,
+                freqs_all=freqs_all,
+                context_all=context_all,
+                t_mod_all=t_mod_all,
+                attention_groups=attention_groups,
+            )
 
         for layer_idx in range(self.num_layers):
             q_chunks = []

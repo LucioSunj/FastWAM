@@ -4,9 +4,11 @@ An alternative implementation of the dual-regime action training that lives in
 `MetricAdaptiveFastWAM` / `MetricAdaptiveFastWAMJoint`. It trains the same
 objective (shared action expert in-distribution for BOTH the base regime and
 the joint/idm regime, video loss exactly once) but in **one MoT forward per
-step instead of two**, with **no copied parent training code**. Nothing in the
-existing implementation is modified; this is an additive, opt-in variant
-selected purely by config.
+step instead of two**, with **no copied parent training code**. The one
+`MoT.forward` internally executes two reference-shaped attention groups per
+layer so BF16 kernels see the same component shapes as the two-forward
+reference. Grouped execution is opt-in; `attention_groups=None`, inference,
+and KV-cache paths retain the original behavior.
 
 ## Why (critique of the two-forward implementation)
 
@@ -47,10 +49,11 @@ inherited implementation recomputes something that is already present.
 
 ## Design
 
-Append a second, independently-noised action draft to the mixed sequence and
-give each draft its own visibility span in ONE block-structured attention mask
-(the same trick `FastWAMIDM` already uses to merge `[noisy_video, cond_video]`
-into one sequence — generalized to action drafts):
+Append a second, independently-noised action draft to the logical mixed
+sequence and give each draft its own visibility span in one block-structured
+global attention mask. The mask remains the source of truth, but each layer
+extracts two submatrices and runs exact reference component shapes instead of
+sending all tokens through one dense BF16 kernel:
 
 ```
 joint variant (FusedDualRegimeFastWAMJoint):
@@ -65,6 +68,26 @@ idm variant (FusedDualRegimeFastWAM):
     - action_idm:      itself + cond_video block
     - action_base:     itself + cond block's first-frame columns (clean, t=0)
 ```
+
+The per-layer execution plan is:
+
+1. Main group: `[full main video | main action]`. IDM therefore uses
+   `[noisy_video | cond_video | action_idm]`, exactly matching its reference
+   forward.
+2. Base group: `[clean cond first frame | action_base]`, exactly matching the
+   standalone base reference shape.
+3. The base video span is read-only. Its Q/K/V and SDPA rows are recomputed so
+   the kernel shape stays reference-aligned, but its attention output,
+   cross-attention, and FFN are discarded. The next layer reuses the main
+   group updated first-frame hidden state.
+4. Main and base action separately execute Q/K/V, output projection,
+   cross-attention, and FFN. They are never projected as one merged matrix.
+
+Every logical token has exactly one output writer. Validation rejects
+out-of-bounds spans, duplicate or missing writers, duplicate experts inside a
+group, and groups without an output. The read-only first-frame overlap still
+participates in autograd through base-action K/V dependencies.
+
 
 - Each draft carries its own noise draw and diffusion timestep: per-draft
   `t_mod [B,6,D]` is expanded to token-wise `[B,S,6,D]` and concatenated —
@@ -94,18 +117,21 @@ fastwam-internal imports, so its unit tests run anywhere torch is installed.
 
 ## Cost accounting (LIBERO joint 2cam224: S_v=294, S_f=98, S_a=32)
 
-| per training step | inherited (share_inputs=true) | fused |
+| per training step | inherited (share_inputs=true) | grouped fused |
 |---|---|---|
 | MoT forwards | 2 | 1 |
-| MoT tokens, joint variant | (294+32) + (98+32) = 456 | 294+64 = **358 (−21%)** |
-| MoT tokens, idm variant | (588+32) + (98+32) = 750 | 588+64 = **652 (−13%)** |
+| attention-group tokens, joint | (294+32) + (98+32) = 456 | same two shapes inside one forward |
+| attention-group tokens, idm | (588+32) + (98+32) = 750 | same two shapes inside one forward |
+| post/cross-attn/FFN writer tokens, joint | 456 | 294+64 = **358 (-21%)** |
+| post/cross-attn/FFN writer tokens, idm | 750 | 588+64 = **652 (-13%)** |
 | VAE encodes | 1 (2 if `share_inputs=false`) | 1, unconditionally |
 | video `pre_dit` calls | 2 (joint) / 3 (idm) | 1 (joint) / 2 (idm) |
 | copied parent training code | ~200 lines ("keep in sync") | none (parity is test-enforced instead) |
 
-Per-token FFN/projection work dominates at these lengths, so token count ≈
-compute. Dense-mask attention FLOPs grow slightly ((S_v+2S_a)² vs the sum of
-two smaller squares, ~+4%), which is negligible against the FFN savings.
+The grouped implementation deliberately recomputes base first-frame Q/K/V and
+SDPA. This trades some of the old dense implementation speed for numerical
+equivalence while still avoiding the base video 30-layer post/cross-attention
+and FFN shadow path.
 
 ## Configs & usage
 
@@ -150,10 +176,15 @@ pytest tests/test_dual_regime_fused.py -v
 # on the training server (Wan2.2 weights + GPU): real step + numerical parity
 RUN_FASTWAM_MODEL_TESTS=1 pytest tests/test_dual_regime_fused.py -v
 ```
+Run `pytest tests/test_mot_attention_groups.py -q` for tiny FP32 output and
+gradient parity, writer/read-only validation, checkpoint backward, and
+`attention_groups=None` compatibility.
+
 
 The heavy group includes `test_fused_matches_two_forward_reference`, which
 replays identical noise/timestep draws through the fused forward and through
-parent-style separate forwards and asserts per-regime predictions match
-(bf16 tolerances; tighten after the first GPU run if headroom allows). Run
-this before any real training run, exactly as with the inherited
-implementation's gated tests.
+parent-style separate forwards and asserts per-regime predictions match at the
+preregistered BF16 tolerances. The unchanged unseeded case is accompanied by
+fixed-seed 0/1/2 regressions. The P0 launcher requires every real-model case to
+appear in JUnit with zero failures, errors, and skips; source-file presence
+alone cannot produce PASS.

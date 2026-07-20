@@ -19,28 +19,29 @@ Under the adaptive configs, three facts already hold:
 3. Frame-0 RoPE coordinates are identical whether the video sequence holds one
    frame or many.
 
-Together these mean the training forward already CONTAINS a layer-exact replica
-of the base branch's inference-time video computation (``FastWAM.infer_action``
-runs the video expert on the clean first frame alone): same token values, same
-visible attention set, same modulation, same RoPE. So the base-regime action
-loss does not need its own forward — it suffices to append a SECOND
-independently-noised action draft to the mixed sequence and mask it to attend
-only the first-frame video columns. One MoT pass per step then trains:
+Together these mean the main training forward already contains a layer-exact
+replica of the base branch clean first-frame hidden state. The implementation
+therefore makes one `self.mot(...)` call per step, while each MoT layer runs two
+component-aligned attention groups:
+
+1. Main: `[full main video | main action]`, with the exact reference shape.
+2. Base: `[clean first frame | base action]`, also with the exact reference
+   shape. The first-frame span recomputes Q/K/V and participates in SDPA but is
+   read-only: its attention/post output is discarded, and the next layer reuses
+   the main group updated first-frame hidden state.
+
+Main and base action separately execute Q/K/V, output projection,
+cross-attention, and FFN. The existing global boolean mask supplies each group
+submatrix without changing visibility semantics. One MoT call then trains:
 
     video loss            <- noisy-video block (computed exactly once)
     main-regime action    <- draft 0 (joint: full video / idm: cond video)
     base-regime action    <- draft 1 (first-frame columns only)
 
-Because video tokens never attend action tokens, appending drafts provably
-leaves the video outputs (and hence the video loss) untouched.
-
-Compared to the inherited two-forward implementation this removes the second
-MoT forward and its re-processing of the first-frame block (~21% fewer MoT
-tokens/step for the LIBERO joint config, ~13% for idm), yields a single
-autograd graph, and drops the ``share_inputs`` copied-code/second-VAE-encode
-trade-off entirely. Every trained parameter still receives a gradient every
-step (video head via the video loss, everything else via all three losses), so
-the ZeRO/DDP safety argument is unchanged.
+This removes the complete base-video post/cross-attention/FFN shadow path,
+yields one autograd graph, and drops the `share_inputs` copied-code or
+second-VAE-encode trade-off. Base-action loss still backpropagates through the
+read-only first-frame K/V into the video expert.
 
 Randomness is isolated in ``_sample_dual_regime_draws`` so tests can replay the
 same draws through both this fused forward and a reference two-forward
@@ -57,6 +58,7 @@ from fastwam.utils.logging_config import get_logger
 from fastwam.adaptive_gate.training import normalized_dual_regime_action_loss
 
 from .dual_regime_masks import build_multi_regime_attention_mask, merge_action_draft_payloads
+from .mot import MoTAttentionGroup, MoTExpertSpan
 from .fastwam_metric_adaptive import (
     MetricAdaptiveFastWAM,
     _maybe_instantiate,
@@ -194,6 +196,31 @@ class _FusedDualRegimeTrainingMixin:
             draft_video_spans=[[span_by_name[d["name"]]] for d in drafts],
             device=video_side["tokens"].device,
         )
+        action_span_by_name = {
+            draft["name"]: span
+            for draft, span in zip(drafts, merged_action["draft_slices"])
+        }
+        main_action_start, main_action_end = action_span_by_name[self.main_regime_name]
+        base_action_start, base_action_end = action_span_by_name["base"]
+        base_video_start, base_video_end = video_side["base_span"]
+        attention_groups = (
+            MoTAttentionGroup(
+                name=self.main_regime_name,
+                spans=(
+                    MoTExpertSpan("video", 0, int(video_side["tokens"].shape[1])),
+                    MoTExpertSpan("action", main_action_start, main_action_end),
+                ),
+            ),
+            MoTAttentionGroup(
+                name="base",
+                spans=(
+                    MoTExpertSpan(
+                        "video", base_video_start, base_video_end, write=False
+                    ),
+                    MoTExpertSpan("action", base_action_start, base_action_end),
+                ),
+            ),
+        )
 
         tokens_out = self.mot(
             embeds_all={"video": video_side["tokens"], "action": merged_action["tokens"]},
@@ -204,6 +231,7 @@ class _FusedDualRegimeTrainingMixin:
                 "action": {"context": merged_action["context"], "mask": merged_action["context_mask"]},
             },
             t_mod_all={"video": video_side["t_mod"], "action": merged_action["t_mod"]},
+            attention_groups=attention_groups,
         )
 
         pred_start, pred_end = video_side["pred_slice"]

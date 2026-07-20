@@ -672,6 +672,21 @@ class TestFusedDualRegimeTraining:
             if was_training:
                 m.dit.train()
 
+    @pytest.mark.parametrize("seed", [0, 1, 2])
+    def test_fused_matches_two_forward_reference_seeded(self, fused_model, seed):
+        """Replay the unchanged parity case at three fixed RNG states."""
+        device = torch.device(fused_model.device)
+        cuda_devices = []
+        if device.type == "cuda":
+            cuda_devices = [
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            ]
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(seed)
+            self.test_fused_matches_two_forward_reference(fused_model)
+
     @pytest.mark.parametrize("branch_attr", ["low", "high"])
     def test_force_branch_inference_inherited(self, fused_model, branch_attr):
         m = fused_model
