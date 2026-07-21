@@ -126,6 +126,7 @@ class Wan22Trainer:
         self.max_steps = int(max_steps) if max_steps is not None else None
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
+        self.save_final_checkpoint = bool(cfg.get("save_final_checkpoint", True))
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
@@ -1201,22 +1202,27 @@ class Wan22Trainer:
                             )
 
                     if self.global_step >= self.max_steps:
-                        ckpt_info = self.save_checkpoint()
-                        if self.accelerator.is_main_process:
-                            logger.info(
-                                "[done] max_steps reached step=%d weights=%s state=%s",
-                                self.global_step,
-                                ckpt_info["weights_path"],
-                                ckpt_info["state_path"],
-                            )
+                        self._finish_training("max_steps reached")
                         return
 
+        self._finish_training("training finished")
+
+    def _finish_training(self, reason: str):
+        if not self.save_final_checkpoint:
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "[done] %s step=%d final checkpoint disabled",
+                    reason,
+                    self.global_step,
+                )
+            return None
         ckpt_info = self.save_checkpoint()
         if self.accelerator.is_main_process:
             logger.info(
-                "[done] training finished step=%d weights=%s state=%s",
+                "[done] %s step=%d weights=%s state=%s",
+                reason,
                 self.global_step,
                 ckpt_info["weights_path"],
                 ckpt_info["state_path"],
             )
-        
+        return ckpt_info

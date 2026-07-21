@@ -1,0 +1,122 @@
+diff --git a/configs/train.yaml b/configs/train.yaml
+index c61597e..068da12 100644
+--- a/configs/train.yaml
++++ b/configs/train.yaml
+@@ -20,6 +20,7 @@ num_epochs: 1
+ max_steps: null
+ log_every: 10
+ save_every: 100
++save_final_checkpoint: true
+ eval_every: 50
+ eval_num_inference_steps: 10
+ eval_sigma_shift: null
+diff --git a/src/fastwam/runtime.py b/src/fastwam/runtime.py
+index 73a4dc1..4e841e0 100644
+--- a/src/fastwam/runtime.py
++++ b/src/fastwam/runtime.py
+@@ -381,7 +381,10 @@ def run_training(cfg: DictConfig):
+         train_dataset=train_ds,
+         val_dataset=val_ds,
+     )
+-    trainer.train()
++    try:
++        trainer.train()
++    finally:
++        trainer.accelerator.end_training()
+
+ def run_inference(cfg: DictConfig):
+     setup_logging(log_level=logging.INFO)
+diff --git a/src/fastwam/trainer.py b/src/fastwam/trainer.py
+index 5d8105b..e114f4a 100644
+--- a/src/fastwam/trainer.py
++++ b/src/fastwam/trainer.py
+@@ -126,6 +126,7 @@ class Wan22Trainer:
+         self.max_steps = int(max_steps) if max_steps is not None else None
+         self.log_every = int(cfg.log_every)
+         self.save_every = int(cfg.save_every)
++        self.save_final_checkpoint = bool(cfg.get("save_final_checkpoint", True))
+         self.eval_every = int(cfg.eval_every)
+         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
+         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
+@@ -1201,22 +1202,27 @@ class Wan22Trainer:
+                             )
+
+                     if self.global_step >= self.max_steps:
+-                        ckpt_info = self.save_checkpoint()
+-                        if self.accelerator.is_main_process:
+-                            logger.info(
+-                                "[done] max_steps reached step=%d weights=%s state=%s",
+-                                self.global_step,
+-                                ckpt_info["weights_path"],
+-                                ckpt_info["state_path"],
+-                            )
++                        self._finish_training("max_steps reached")
+                         return
+
++        self._finish_training("training finished")
++
++    def _finish_training(self, reason: str):
++        if not self.save_final_checkpoint:
++            if self.accelerator.is_main_process:
++                logger.info(
++                    "[done] %s step=%d final checkpoint disabled",
++                    reason,
++                    self.global_step,
++                )
++            return None
+         ckpt_info = self.save_checkpoint()
+         if self.accelerator.is_main_process:
+             logger.info(
+-                "[done] training finished step=%d weights=%s state=%s",
++                "[done] %s step=%d weights=%s state=%s",
++                reason,
+                 self.global_step,
+                 ckpt_info["weights_path"],
+                 ckpt_info["state_path"],
+             )
+-
++        return ckpt_info
+diff --git a/tests/test_trainer_forward_contract.py b/tests/test_trainer_forward_contract.py
+index 81d743b..6aa4d2c 100644
+--- a/tests/test_trainer_forward_contract.py
++++ b/tests/test_trainer_forward_contract.py
+@@ -1,6 +1,8 @@
+ """Regression test for DDP/DeepSpeed forward-hook preservation."""
+ from __future__ import annotations
+
++from types import SimpleNamespace
++
+ import pytest
+
+ trainer = pytest.importorskip("fastwam.trainer")
+@@ -22,3 +24,30 @@ def test_training_forward_enters_prepared_wrapper():
+     loss, metrics = trainer._forward_prepared_model(wrapper, {"loss": 2.0})
+     assert wrapper.calls == 1
+     assert loss == 2.0 and metrics == {"loss": 2.0}
++
++
++def test_finish_training_can_skip_final_checkpoint():
++    instance = object.__new__(trainer.Wan22Trainer)
++    instance.global_step = 1
++    instance.save_final_checkpoint = False
++    instance.accelerator = SimpleNamespace(
++        is_main_process=True,
++    )
++    instance.save_checkpoint = lambda: pytest.fail("checkpoint must not be written")
++
++    assert instance._finish_training("smoke complete") is None
++
++
++def test_finish_training_preserves_default_checkpoint_behavior():
++    expected = {"weights_path": "weights.pt", "state_path": "state"}
++    calls = []
++    instance = object.__new__(trainer.Wan22Trainer)
++    instance.global_step = 3
++    instance.save_final_checkpoint = True
++    instance.accelerator = SimpleNamespace(
++        is_main_process=True,
++    )
++    instance.save_checkpoint = lambda: calls.append("save") or expected
++
++    assert instance._finish_training("training finished") == expected
++    assert calls == ["save"]

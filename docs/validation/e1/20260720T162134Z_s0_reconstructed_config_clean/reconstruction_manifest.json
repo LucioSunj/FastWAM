@@ -1,0 +1,59 @@
+{
+  "schema": "fastwam-e-i-config-reconstruction-v1",
+  "status": "USER_CONFIRMED_RECONSTRUCTION",
+  "created_at_utc": "2026-07-20T15:59:23Z",
+  "purpose": "E1-S0 standalone IDM to fused dual-regime forced-IDM parity only",
+  "historical_resolved_config_recovered": false,
+  "user_assertion": "The checkpoint used the default FastWAM-IDM LIBERO training configuration; only global batch size was halved, so optimizer steps doubled.",
+  "baseline": {
+    "fastwam_commit": "b4b65ca70be2468c24b106f53ec706807dc51e5b",
+    "hydra_config_name": "train",
+    "hydra_overrides": [
+      "task=libero_idm_2cam224_1e-4"
+    ],
+    "documented_processes": 8,
+    "per_process_batch_size": 16,
+    "global_batch_size": 128,
+    "epochs": 10
+  },
+  "reconstructed_training_topology": {
+    "processes": 4,
+    "per_process_batch_size": 16,
+    "gradient_accumulation_steps": 1,
+    "global_batch_size": 64,
+    "dataset_transitions": 277713,
+    "steps_per_epoch": 4340,
+    "expected_total_steps": 43400,
+    "checkpoint_step": 43400,
+    "step_count_consistent": true,
+    "note": "Process count is launcher topology and is not encoded in the resolved Hydra model config. The resolved config therefore remains the default task composition."
+  },
+  "artifacts": {
+    "checkpoint": {
+      "path": "/root/autodl-fs/fastwam/checkpoints/fastwam_idm_libero_step_043400.pt",
+      "size": 12041735601,
+      "sha256": "f6e29dd6638d19a9e60c87ab387f0cc8d5c75f1ab9262cacd8d269ea1ee43c9c"
+    },
+    "dataset_stats": {
+      "path": "/root/autodl-fs/fastwam/checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json",
+      "size": 40939,
+      "sha256": "30f81ad7d5076e97323e3328bce003e01a04cb21327b5bacd21bb72846768638"
+    },
+    "reconstructed_config": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_S0_reconstructed_input/20260720T155923Z/e_i_resolved_config.reconstructed.yaml",
+      "size": 5004,
+      "sha256": "12be4e401aec1e613f8e0fae8ba3e2bb23102e539f585092d7b834355f5a18af"
+    }
+  },
+  "limitations": [
+    "This file documents a reconstruction authorized by the user; it is not the original historical run config.",
+    "The checkpoint itself does not embed config or dataset-stats hashes.",
+    "Successful strict schema import and numerical parity validate compatibility, not independent historical provenance recovery."
+  ],
+  "stage_boundaries": {
+    "e0_skipped_by_user": true,
+    "e0_pass_claimed": false,
+    "training_allowed": false,
+    "endpoint_rollout_allowed": false
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "metrics": {
+    "completed_check": "standalone_idm_to_s0_fixed_seed_parity",
+    "evidence": [
+      {
+        "exists": true,
+        "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_warmstart_parity/20260720T162134Z_reconstructed_config_clean/parity_result.json",
+        "sha256": "618380cd431f4e8571a90fe9294f8660211bd81ad28fea8b99af582e353b67c6",
+        "size_bytes": 2472
+      }
+    ]
+  },
+  "stage": "CONTRACT",
+  "status": "PASS"
+}

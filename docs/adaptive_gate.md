@@ -22,6 +22,19 @@ python scripts/precompute_text_embeds.py task=libero_dual_regime_fused_2cam224_1
 bash scripts/train_zero1.sh 8 task=libero_dual_regime_fused_2cam224_1e-4
 ```
 
+For a storage-free diagnostic of the real training path, set both
+`save_every=0` and `save_final_checkpoint=false` together with an explicit
+small `max_steps`. `save_final_checkpoint` defaults to `true`, so normal runs
+retain the existing final weights/state behavior. A smoke run is not a pilot
+completion artifact and must not be passed to `validate_sdr_checkpoint.py` or
+used to create `pilot_selection.json`.
+
+The validated sequence and evidence are indexed under
+[`docs/validation/e1/`](validation/e1/README.md): real-Wan P0 parity first,
+standalone E-I to fused S0 forced-IDM parity second, and a one-step real LIBERO
+forward/backward/optimizer smoke last. The two full learning-rate pilots remain
+pending.
+
 The action objective is
 
 ```text

@@ -1,0 +1,97 @@
+{
+  "artifacts": {
+    "code_diff.patch": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_training_smoke/20260721T021848Z_real_libero_one_step/code_diff.patch",
+      "sha256": "2fe040f508d110f3e1640d4397c49af38275a65cc4bfa4dd6c63817807109348",
+      "size_bytes": 4601
+    },
+    "config.yaml": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_training_smoke/20260721T021848Z_real_libero_one_step/config.yaml",
+      "sha256": "155b2f2e1357baaf504c4007d7c36aaa1244347037c51b9699be1e07a0bda677",
+      "size_bytes": 5941
+    },
+    "gpu_monitor.csv": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_training_smoke/20260721T021848Z_real_libero_one_step/gpu_monitor.csv",
+      "sha256": "db19c5c0b01fdf19b28d16369b05869cfa6d62cf1bab00e8cc702e8b71f367eb",
+      "size_bytes": 95613
+    },
+    "launcher.log": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_training_smoke/20260721T021848Z_real_libero_one_step/launcher.log",
+      "sha256": "0c1f29dc868efe0e288c2d5666f108a918a3c6e5818846e3ff2ea031d7a706a9",
+      "size_bytes": 11948
+    },
+    "resolved_config.yaml": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_training_smoke/20260721T021848Z_real_libero_one_step/resolved_config.yaml",
+      "sha256": "d8ef359592e7336b2e06314250f2a3a9ef909d71ce0ada4a35c78eb3c6c3b7b8",
+      "size_bytes": 5909
+    }
+  },
+  "checkpoint_files": [],
+  "checks": {
+    "bf16_deepspeed": true,
+    "dual_regime_step": true,
+    "no_checkpoint_files": true,
+    "no_checkpoint_log": true,
+    "optimizer_step": true,
+    "strict_warm_start": true
+  },
+  "formal_e1_pilot": false,
+  "kind": "diagnostic_real_libero_one_optimizer_step",
+  "launcher_exit_code": 0,
+  "limitations": [
+    "This is a one-step diagnostic smoke test, not either preregistered E1 pilot.",
+    "Batch size was reduced to one; the model, attention contract, 33-frame 224x448 input shape, BF16 dtype, and dual-regime loss were unchanged.",
+    "The run does not establish convergence, full-schedule stability, resume behavior, checkpoint validity, or endpoint quality."
+  ],
+  "lineage": {
+    "e_i_checkpoint_sha256": "f6e29dd6638d19a9e60c87ab387f0cc8d5c75f1ab9262cacd8d269ea1ee43c9c",
+    "e_i_config_sha256": "12be4e401aec1e613f8e0fae8ba3e2bb23102e539f585092d7b834355f5a18af",
+    "e_i_stats_sha256": "30f81ad7d5076e97323e3328bce003e01a04cb21327b5bacd21bb72846768638",
+    "fastwam_base_sha": "b4b65ca70be2468c24b106f53ec706807dc51e5b"
+  },
+  "metrics": {
+    "action_regime_weight_uncond": 0.05,
+    "dual_regime_optimizer_steps": 1.0,
+    "loss": 0.0099,
+    "loss_action_combined": 0.008,
+    "loss_action_idm": 0.0005,
+    "loss_action_uncond": 0.0075,
+    "loss_video": 0.0019,
+    "peak_gpu_memory_mib": 40127,
+    "wall_clock_seconds": 880.395
+  },
+  "schema": "fastwam-e1-training-smoke-v1",
+  "scope": {
+    "batch_size": 1,
+    "checkpoint_writes_enabled": false,
+    "deepspeed_zero_stage": 1,
+    "dtype": "bf16",
+    "evaluation_enabled": false,
+    "max_steps": 1,
+    "num_frames": 33,
+    "task": "libero_dual_regime_fused_2cam224_1e-4",
+    "video_size": [
+      224,
+      448
+    ],
+    "world_size": 1
+  },
+  "status": "PASS",
+  "tests": {
+    "broader_training_fused_grouped_sdr": {
+      "failed": 0,
+      "passed": 42,
+      "skip_reason": "real-model cases require RUN_FASTWAM_MODEL_TESTS=1; this turn used the separate real one-step smoke run",
+      "skipped": 19
+    },
+    "focused_cleanup_and_no_save": {
+      "failed": 0,
+      "passed": 4,
+      "skipped": 0
+    }
+  },
+  "warning": {
+    "cleanup_fix_applied_after_run": true,
+    "nccl_destroy_process_group_warning_observed": true
+  }
+}

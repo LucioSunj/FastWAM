@@ -1,0 +1,75 @@
+{
+  "actions": {
+    "dtype": "torch.float32",
+    "shape": [
+      32,
+      7
+    ],
+    "source_sha256": "5e9f1ba1f322c4f7bcffcc17a66d0f479459c0407d8beafb74ed174a46526767",
+    "target_sha256": "5e9f1ba1f322c4f7bcffcc17a66d0f479459c0407d8beafb74ed174a46526767"
+  },
+  "artifacts": {
+    "e_i_checkpoint": {
+      "path": "/root/autodl-fs/fastwam/checkpoints/fastwam_idm_libero_step_043400.pt",
+      "sha256": "f6e29dd6638d19a9e60c87ab387f0cc8d5c75f1ab9262cacd8d269ea1ee43c9c"
+    },
+    "e_i_config": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_S0_reconstructed_input/20260720T155923Z/e_i_resolved_config.reconstructed.yaml",
+      "sha256": "12be4e401aec1e613f8e0fae8ba3e2bb23102e539f585092d7b834355f5a18af"
+    },
+    "e_i_stats": {
+      "path": "/root/autodl-fs/fastwam/checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json",
+      "sha256": "30f81ad7d5076e97323e3328bce003e01a04cb21327b5bacd21bb72846768638"
+    }
+  },
+  "comparison": {
+    "allclose_margin": 1.0,
+    "atol": 0.0005,
+    "max_abs": 0.0,
+    "rtol": 0.005,
+    "worst_normalized_error": 0.0
+  },
+  "device": {
+    "compute_capability": [
+      8,
+      0
+    ],
+    "cuda_index": 0,
+    "name": "NVIDIA A800-SXM4-80GB",
+    "requested": "cuda",
+    "total_memory_bytes": 85093777408
+  },
+  "inference_steps": 20,
+  "kind": "standalone_idm_to_s0_fixed_seed_parity",
+  "model_dtype": "bfloat16",
+  "sample_index": 0,
+  "schema": "fastwam-warmstart-parity-v1",
+  "seed": 0,
+  "sigma_shift": null,
+  "solver_contract": {
+    "action": {
+      "configured_shift": 5.0,
+      "effective_shift": 5.0,
+      "inference_steps": 20,
+      "num_train_timesteps": 1000,
+      "scheduler_class": "fastwam.models.wan22.schedulers.scheduler_continuous.WanContinuousFlowMatchScheduler"
+    },
+    "branch_semantics": {
+      "idm": "video_then_future_conditioned_action",
+      "uncond": "action_only"
+    },
+    "schema": "fastwam-inference-solver-v1",
+    "sigma_shift_override": null,
+    "video": {
+      "configured_shift": 5.0,
+      "effective_shift": 5.0,
+      "inference_steps": 20,
+      "num_train_timesteps": 1000,
+      "scheduler_class": "fastwam.models.wan22.schedulers.scheduler_continuous.WanContinuousFlowMatchScheduler"
+    }
+  },
+  "solver_contract_sha256": "7b41415199b7d744a6db9feff4323b73f95450290ce91e0c7452405eaee5e4ef",
+  "source_task": "libero_idm_2cam224_1e-4",
+  "status": "PASS",
+  "target_task": "libero_dual_regime_fused_2cam224_1e-4"
+}

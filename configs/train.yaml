@@ -20,6 +20,8 @@ num_epochs: 1
 max_steps: null
 log_every: 10
 save_every: 100
+# Diagnostic-only opt-out; production runs retain a final weights/state save.
+save_final_checkpoint: true
 eval_every: 50
 eval_num_inference_steps: 10
 eval_sigma_shift: null

@@ -1,0 +1,150 @@
+[launch] nproc_per_node=1 num_machines=1 machine_rank=0 run_id=20260721T021848Z_real_libero_one_step
+07/21 [10:26:32] INFO     | >> Loading Wan2.2-TI2V-5B              loader.py:152
+                          components...
+07/21 [10:31:21] INFO     | >> Skipping pretrained text            loader.py:206
+                          encoder/tokenizer load
+                          (`load_text_encoder=False`); training
+                          must provide cached
+                          `context/context_mask`.
+07/21 [10:31:52] INFO     | >> Finished loading Wan2.2-TI2V-5B     loader.py:211
+                          components in 320.19 seconds.
+07/21 [10:32:21] INFO     | >> ActionDiT backbone payload      action_dit.py:154
+                          policy: {'skip_prefixes':
+                          ['action_encoder.', 'head.'],
+                          'alpha_scaling': True,
+                          'interpolation':
+                          'sequential_1d_linear_align_corners_
+                          true'}
+                 INFO     | >> Loaded ActionDiT backbone from  action_dit.py:218
+                          /root/adaptive-wm-p0-repair/FastWAM/
+                          checkpoints/ActionDiT_linear_interp_
+                          Wan22_alphascale_1024hdim.pt
+                          (keys=820;
+                          random_kept_prefixes=['action_encode
+                          r.', 'head.']).
+                 INFO     | >> Initialized MoT with experts: ['video', mot.py:72
+                          'action'], num_layers=30
+                 INFO     | >>   Expert 'video': num_params=5.00 B     mot.py:75
+                 INFO     | >>   Expert 'action': num_params=1.02 B    mot.py:75
+07/21 [10:32:40] INFO     | >> PyTorch version 2.7.1+cu128          config.py:54
+                          available.
+07/21 [10:33:00] INFO     | >> Using dataset stats:   robot_video_dataset.py:104
+                          /root/autodl-fs/fastwam/che
+                          ckpoints/fastwam_release/li
+                          bero_uncond_2cam224_dataset
+                          _stats.json
+                 INFO     | >> cc -pthread -Wno-unused-result        spawn.py:77
+                          -Wsign-compare -Wunreachable-code -DNDEBUG
+                          -g -fwrapv -O3 -Wall -O3
+                          -fno-omit-frame-pointer
+                          -mno-omit-leaf-frame-pointer -fPIC -fPIC
+                          -c
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmp3sr5qjcf/tes
+                          t.c -o
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmp3sr5qjcf/tes
+                          t.o
+                 INFO     | >> cc -pthread                           spawn.py:77
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmp3sr5qjcf/tes
+                          t.o -laio -o
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmp3sr5qjcf/a.o
+                          ut
+07/21 [10:33:01] INFO     | >> cc -pthread -Wno-unused-result        spawn.py:77
+                          -Wsign-compare -Wunreachable-code -DNDEBUG
+                          -g -fwrapv -O3 -Wall -O3
+                          -fno-omit-frame-pointer
+                          -mno-omit-leaf-frame-pointer -fPIC -fPIC
+                          -c
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmpa6m1vyzp/tes
+                          t.c -o
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmpa6m1vyzp/tes
+                          t.o
+                 INFO     | >> cc -pthread                           spawn.py:77
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmpa6m1vyzp/tes
+                          t.o -L/usr/local/cuda
+                          -L/usr/local/cuda/lib64 -lcufile -o
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmpa6m1vyzp/a.o
+                          ut
+                 INFO     | >> cc -pthread -Wno-unused-result        spawn.py:77
+                          -Wsign-compare -Wunreachable-code -DNDEBUG
+                          -g -fwrapv -O3 -Wall -O3
+                          -fno-omit-frame-pointer
+                          -mno-omit-leaf-frame-pointer -fPIC -fPIC
+                          -c
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmpjb22imxf/tes
+                          t.c -o
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmpjb22imxf/tes
+                          t.o
+                 INFO     | >> cc -pthread                           spawn.py:77
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmpjb22imxf/tes
+                          t.o -laio -o
+                          /root/autodl-tmp/experiments/adaptive_wm_r
+                          easoning/E1_training_smoke/20260721T021848
+                          Z_real_libero_one_step/tmp/tmpjb22imxf/a.o
+                          ut
+07/21 [10:33:04] INFO     | >> Accelerate training:               trainer.py:204
+                          distributed_type=DistributedType.DEEPSP
+                          EED zero_stage=1 world_size=1
+                          process_index=0
+                          cfg_mixed_precision=bf16
+                          accelerator_mixed_precision=bf16
+                          grad_accum=1 grad_clip=1.0000
+                 INFO     | >> using accelerator.device=cuda:0    trainer.py:215
+07/21 [10:37:08] INFO     | >> Strict standalone-IDM warm start   trainer.py:228
+                          accepted:
+                          parent_id=standalone-idm-f6e29dd6638d19
+                          a9
+                          sha256=f6e29dd6638d19a9e60c87ab387f0cc8
+                          d5c75f1ab9262cacd8d269ea1ee43c9c
+Before initializing optimizer states
+MA 16.35 GB         Max_MA 16.35 GB         CA 16.37 GB         Max_CA 16 GB
+CPU Virtual Memory:  used = 45.29 GB, percent = 4.5%
+After initializing optimizer states
+MA 16.35 GB         Max_MA 20.15 GB         CA 20.17 GB         Max_CA 20 GB
+CPU Virtual Memory:  used = 45.35 GB, percent = 4.5%
+After initializing ZeRO optimizer
+MA 16.35 GB         Max_MA 16.35 GB         CA 20.17 GB         Max_CA 20 GB
+CPU Virtual Memory:  used = 45.37 GB, percent = 4.5%
+07/21 [10:37:11] INFO     | >> Train/val dataset size:            trainer.py:333
+                          277713/277713
+                 INFO     | >> Restoring configured train mode    trainer.py:487
+                          for groups=('action', 'proprio').
+                 INFO     | >> Starting training with            trainer.py:1026
+                          max_steps=1.
+07/21 [10:37:23] INFO     | >>  epoch=0 step=1/1 loss=0.0099     trainer.py:1143
+                          action_regime_weight_uncond=0.0500
+                          dual_regime_optimizer_steps=1.0000
+                          dual_regime_schedule_fraction=1.0000
+                          loss_action_combined=0.0080
+                          loss_action_idm=0.0005
+                          loss_action_uncond=0.0075
+                          loss_video=0.0019 lr=1.00e-07
+                          speed=0.08 step/s, 0.08 samples/s
+                          eta=00:00:00
+                 INFO     | >>  max_steps reached step=1 final   trainer.py:1213
+                          checkpoint disabled
+[rank0]:[W721 10:37:25.269576573 ProcessGroupNCCL.cpp:1479] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+real_seconds=880.395
+user_seconds=153.435
+sys_seconds=85.988

@@ -1,0 +1,225 @@
+output_dir: /root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_training_smoke/20260721T021848Z_real_libero_one_step
+batch_size: 1
+num_workers: 0
+lr_scheduler_type: cosine
+learning_rate: 1.0e-05
+num_epochs: 10
+max_steps: 1
+log_every: 1
+save_every: 0
+save_final_checkpoint: false
+eval_every: 0
+eval_num_inference_steps: 10
+eval_sigma_shift: null
+gradient_accumulation_steps: 1
+mixed_precision: bf16
+seed: 42
+max_grad_norm: 1.0
+weight_decay: 0.01
+resume: null
+warm_start:
+  kind: standalone_idm
+  checkpoint: /root/autodl-fs/fastwam/checkpoints/fastwam_idm_libero_step_043400.pt
+  expected_checkpoint_sha256: f6e29dd6638d19a9e60c87ab387f0cc8d5c75f1ab9262cacd8d269ea1ee43c9c
+  source_task: libero_idm_2cam224_1e-4
+  source_config: /root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_S0_reconstructed_input/20260720T155923Z/e_i_resolved_config.reconstructed.yaml
+  source_dataset_stats: /root/autodl-fs/fastwam/checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json
+dual_regime_training:
+  uncond_weight_schedule:
+  - fraction: 0.0
+    weight: 0.05
+  - fraction: 0.1
+    weight: 0.05
+  - fraction: 0.4
+    weight: 0.5
+  - fraction: 1.0
+    weight: 1.0
+  gradient_diagnostics_every: 200
+  optimizer:
+    action_lr_scale: 1.0
+    proprio_lr_scale: 1.0
+    video_lr_scale: 0.0
+    video_final_blocks: 4
+    video_train_start_fraction: 0.4
+  gradient_diagnostic_video_final_blocks: 2
+wandb:
+  enabled: false
+  workspace: null
+  project: fast-wam
+  name: train
+  group: null
+  mode: online
+data:
+  train:
+    _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+    pretrained_norm_stats: /root/autodl-fs/fastwam/checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json
+    dataset_dirs:
+    - ./data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_object_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot
+    - ./data/libero_mujoco3.3.2/libero_10_no_noops_lerobot
+    shape_meta:
+      images:
+      - key: image
+        raw_shape:
+        - 3
+        - 512
+        - 512
+        shape:
+        - 3
+        - 224
+        - 224
+      - key: wrist_image
+        raw_shape:
+        - 3
+        - 512
+        - 512
+        shape:
+        - 3
+        - 224
+        - 224
+      action:
+      - key: default
+        raw_shape: 7
+        shape: 7
+      state:
+      - key: default
+        raw_shape: 8
+        shape: 8
+    num_frames: 33
+    global_sample_stride: 1
+    action_video_freq_ratio: 4
+    video_size:
+    - 224
+    - 448
+    camera_key: null
+    val_set_proportion: 0.0
+    is_training_set: true
+    skip_padding_as_possible: false
+    concat_multi_camera: horizontal
+    processor:
+      _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+      shape_meta:
+        images:
+        - key: image
+          raw_shape:
+          - 3
+          - 512
+          - 512
+          shape:
+          - 3
+          - 224
+          - 224
+        - key: wrist_image
+          raw_shape:
+          - 3
+          - 512
+          - 512
+          shape:
+          - 3
+          - 224
+          - 224
+        action:
+        - key: default
+          raw_shape: 7
+          shape: 7
+        state:
+        - key: default
+          raw_shape: 8
+          shape: 8
+      num_obs_steps: 33
+      num_output_cameras: 2
+      action_output_dim: 7
+      proprio_output_dim: 8
+      delta_action_dim_mask:
+        default:
+        - true
+        - true
+        - true
+        - true
+        - true
+        - true
+        - false
+      action_state_transforms: null
+      use_stepwise_action_norm: false
+      norm_default_mode: min/max
+      norm_exception_mode: null
+      action_state_merger:
+        _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+      train_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size:
+        - 224
+        - 224
+      val_transforms:
+      - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size:
+        - 224
+        - 224
+    text_embedding_cache_dir: ./data/text_embeds_cache/libero
+    context_len: 128
+model:
+  _target_: fastwam.models.wan22.fastwam_dual_regime_fused.create_fused_dual_regime_fastwam
+  model_id: Wan-AI/Wan2.2-TI2V-5B
+  tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
+  tokenizer_max_len: 128
+  load_text_encoder: false
+  proprio_dim: 8
+  redirect_common_files: true
+  mot_checkpoint_mixed_attn: false
+  action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+  skip_dit_load_from_pretrain: false
+  video_dit_config:
+    has_image_input: false
+    patch_size:
+    - 1
+    - 2
+    - 2
+    in_dim: 48
+    hidden_dim: 3072
+    ffn_dim: 14336
+    freq_dim: 256
+    text_dim: 4096
+    out_dim: 48
+    num_heads: 24
+    attn_head_dim: 128
+    num_layers: 30
+    eps: 1.0e-06
+    seperated_timestep: true
+    require_clip_embedding: false
+    require_vae_embedding: false
+    fuse_vae_embedding_in_latents: true
+    use_gradient_checkpointing: false
+    video_attention_mask_mode: first_frame_causal
+    action_conditioned: false
+    action_dim: 7
+    action_group_causal_mask_mode: group_diagonal
+  action_dit_config:
+    action_dim: 7
+    hidden_dim: 1024
+    ffn_dim: 4096
+    num_heads: 24
+    attn_head_dim: 128
+    num_layers: 30
+    text_dim: 4096
+    freq_dim: 256
+    eps: 1.0e-06
+    use_gradient_checkpointing: false
+  video_scheduler:
+    train_shift: 5.0
+    infer_shift: 5.0
+    num_train_timesteps: 1000
+  action_scheduler:
+    train_shift: 5.0
+    infer_shift: 5.0
+    num_train_timesteps: 1000
+  loss:
+    lambda_action: 1.0
+  train:
+    action_regime_weight_uncond: 1.0
+  adaptive:
+    annotate_outputs: true
+    allow_internal_routing: false
+  checkpoint_task: libero_dual_regime_fused_2cam224_1e-4
