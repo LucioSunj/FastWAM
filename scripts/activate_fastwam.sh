@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+FASTWAM_RESOURCE_ROOT="${FASTWAM_RESOURCE_ROOT:-/root/autodl-fs/fastwam}"
+FASTWAM_REPO_ROOT="${FASTWAM_REPO_ROOT:-/root/When-will-inference-time-prediction-beneficial-/FastWAM}"
+
+export FASTWAM_RESOURCE_ROOT
+export FASTWAM_REPO_ROOT
+export VIRTUAL_ENV="${FASTWAM_RESOURCE_ROOT}/venv"
+export PATH="${VIRTUAL_ENV}/bin:${PATH}"
+export HF_HOME="${FASTWAM_RESOURCE_ROOT}/cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="${HF_HOME}/hub"
+export HF_HUB_DISABLE_XET=1
+export MODELSCOPE_CACHE="${FASTWAM_RESOURCE_ROOT}/cache/modelscope"
+export PIP_CACHE_DIR="${FASTWAM_RESOURCE_ROOT}/cache/pip"
+export TMPDIR="${FASTWAM_RESOURCE_ROOT}/tmp"
+export TORCH_HOME="${FASTWAM_RESOURCE_ROOT}/cache/torch"
+export XDG_CACHE_HOME="${FASTWAM_RESOURCE_ROOT}/cache/xdg"
+export FASTWAM_WAN22_COMPONENT_DIR="${FASTWAM_RESOURCE_ROOT}/models/wan22_components"
+export FASTWAM_ROBOT_DIT_CHECKPOINT="${FASTWAM_RESOURCE_ROOT}/models/wan22_robot/checkpoint.safetensors"
+export FASTWAM_WAN22_ROBOT_CHECKPOINT="${FASTWAM_ROBOT_DIT_CHECKPOINT}"
+export LIBERO_ROOT="${FASTWAM_RESOURCE_ROOT}/third_party/LIBERO"
+export LIBERO_CONFIG_PATH="${FASTWAM_RESOURCE_ROOT}/libero_config"
+export PYTHONPATH="${LIBERO_ROOT}:${FASTWAM_REPO_ROOT}/src:${PYTHONPATH:-}"
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export DIFFSYNTH_DOWNLOAD_SOURCE=huggingface
+export FASTWAM_RUN_ROOT="${FASTWAM_RESOURCE_ROOT}/runs"
+
+mkdir -p "${HF_HOME}" "${MODELSCOPE_CACHE}" "${PIP_CACHE_DIR}" "${TMPDIR}" \
+  "${TORCH_HOME}" "${XDG_CACHE_HOME}" "${FASTWAM_RUN_ROOT}"

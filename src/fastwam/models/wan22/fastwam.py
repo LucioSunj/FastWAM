@@ -32,6 +32,7 @@ class FastWAM(torch.nn.Module):
         vae,
         text_encoder=None,
         tokenizer=None,
+        text_encoder_device: str | torch.device | None = None,
         text_dim: Optional[int] = None,
         proprio_dim: Optional[int] = None,
         device: str = "cpu",
@@ -87,6 +88,11 @@ class FastWAM(torch.nn.Module):
         self.infer_scheduler = self.infer_video_scheduler
 
         self.device = torch.device(device)
+        self.text_encoder_device = (
+            self.device
+            if text_encoder_device is None or str(text_encoder_device).strip() == ""
+            else torch.device(text_encoder_device)
+        )
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
@@ -102,6 +108,7 @@ class FastWAM(torch.nn.Module):
         tokenizer_model_id: str = "Wan-AI/Wan2.1-T2V-1.3B",
         tokenizer_max_len: int = 512,
         load_text_encoder: bool = True,
+        text_encoder_device: str | torch.device | None = None,
         proprio_dim: Optional[int] = None,
         redirect_common_files: bool = True,
         video_dit_config: dict[str, Any] | None = None,
@@ -123,6 +130,9 @@ class FastWAM(torch.nn.Module):
         if "text_dim" not in video_dit_config:
             raise ValueError("`video_dit_config['text_dim']` is required for FastWAM.")
 
+        if text_encoder_device is None:
+            text_encoder_device = os.environ.get("FASTWAM_TEXT_ENCODER_DEVICE")
+
         components = load_wan22_ti2v_5b_components(
             device=device,
             torch_dtype=torch_dtype,
@@ -133,6 +143,7 @@ class FastWAM(torch.nn.Module):
             dit_config=video_dit_config,
             skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
             load_text_encoder=load_text_encoder,
+            text_encoder_device=text_encoder_device,
         )
 
         video_expert = components.dit
@@ -162,6 +173,7 @@ class FastWAM(torch.nn.Module):
             vae=components.vae,
             text_encoder=components.text_encoder,
             tokenizer=components.tokenizer,
+            text_encoder_device=text_encoder_device,
             text_dim=int(video_dit_config["text_dim"]),
             proprio_dim=proprio_dim,
             device=device,
@@ -186,12 +198,41 @@ class FastWAM(torch.nn.Module):
         }
         return model
 
+    @staticmethod
+    def _requested_to_device_dtype(args, kwargs):
+        requested_device = kwargs.get("device")
+        requested_dtype = kwargs.get("dtype")
+        if len(args) >= 1:
+            first = args[0]
+            if isinstance(first, (str, torch.device)):
+                requested_device = first
+            elif isinstance(first, torch.dtype):
+                requested_dtype = first
+            elif torch.is_tensor(first):
+                requested_device = first.device
+                if first.is_floating_point() or first.is_complex():
+                    requested_dtype = first.dtype
+        if len(args) >= 2 and isinstance(args[1], torch.dtype):
+            requested_dtype = args[1]
+        return requested_device, requested_dtype
+
     def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
+        requested_device, requested_dtype = self._requested_to_device_dtype(args, kwargs)
+        if requested_device is not None:
+            self.device = torch.device(requested_device)
+
         self.mot.to(*args, **kwargs)
-        if self.text_encoder is not None:
-            self.text_encoder.to(*args, **kwargs)
         self.vae.to(*args, **kwargs)
+        if self.proprio_encoder is not None:
+            self.proprio_encoder.to(*args, **kwargs)
+
+        if self.text_encoder is not None:
+            if self.text_encoder_device == self.device:
+                self.text_encoder.to(*args, **kwargs)
+            elif requested_dtype is None:
+                self.text_encoder.to(device=self.text_encoder_device)
+            else:
+                self.text_encoder.to(device=self.text_encoder_device, dtype=requested_dtype)
         return self
 
     @staticmethod
@@ -212,15 +253,19 @@ class FastWAM(torch.nn.Module):
                 "Set `load_text_encoder=true` or provide precomputed `context/context_mask`."
             )
         ids, mask = self.tokenizer(prompt, return_mask=True, add_special_tokens=True)
-        ids = ids.to(self.device)
-        mask = mask.to(self.device, dtype=torch.bool)
+        text_device = next(self.text_encoder.parameters()).device
+        ids = ids.to(text_device)
+        mask = mask.to(text_device, dtype=torch.bool)
         prompt_emb = self.text_encoder(ids, mask)
         # FIXME: original implementation's zero padding is visible in cross-attn.
         seq_lens = mask.gt(0).sum(dim=1).long()
         for i, v in enumerate(seq_lens):
             prompt_emb[i, v:] = 0
         mask = torch.ones_like(mask)
-        return prompt_emb.to(device=self.device), mask
+        return (
+            prompt_emb.to(device=self.device, dtype=self.torch_dtype),
+            mask.to(device=self.device, dtype=torch.bool),
+        )
 
     def _append_proprio_to_context(
         self,
@@ -1332,17 +1377,41 @@ class FastWAM(torch.nn.Module):
                     )
         if "mot" in payload:
             # New checkpoints are self-describing and therefore load strictly.
-            # Legacy payloads retain permissive loading for compatibility.
-            incompatible = self.mot.load_state_dict(payload["mot"], strict=provenance is not None)
-            if provenance is None and (incompatible.missing_keys or incompatible.unexpected_keys):
-                logger.warning(
-                    "Legacy checkpoint loaded non-strictly: missing=%s unexpected=%s",
-                    incompatible.missing_keys,
-                    incompatible.unexpected_keys,
-                )
+            # Legacy payloads retain permissive loading with detailed diagnostics.
+            incompatible = self.mot.load_state_dict(
+                payload["mot"],
+                strict=provenance is not None,
+            )
+            if provenance is None:
+                missing = incompatible.missing_keys
+                unexpected = incompatible.unexpected_keys
+                if missing or unexpected:
+                    logger.warning(
+                        "Loaded legacy `mot` checkpoint with strict=False: "
+                        "missing=%d unexpected=%d missing_sample=%s "
+                        "unexpected_sample=%s",
+                        len(missing),
+                        len(unexpected),
+                        missing[:10],
+                        unexpected[:10],
+                    )
+                else:
+                    logger.info(
+                        "Loaded legacy `mot` checkpoint with strict=False: "
+                        "missing=0 unexpected=0"
+                    )
         elif "dit" in payload:
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
-            self.video_expert.load_state_dict(payload["dit"], strict=False)
+            missing, unexpected = self.video_expert.load_state_dict(payload["dit"], strict=False)
+            if missing or unexpected:
+                logger.warning(
+                    "Loaded legacy `dit` checkpoint with strict=False: missing=%d unexpected=%d "
+                    "missing_sample=%s unexpected_sample=%s",
+                    len(missing),
+                    len(unexpected),
+                    missing[:10],
+                    unexpected[:10],
+                )
         else:
             raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {path}")
         if self.proprio_encoder is not None:

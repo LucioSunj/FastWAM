@@ -14,7 +14,12 @@ from omegaconf import DictConfig, ListConfig
 from tqdm import tqdm
 
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
-from fastwam.models.wan22.helpers.loader import _load_registered_model, _resolve_configs
+from fastwam.models.wan22.helpers.loader import (
+    _ensure_component_path,
+    _load_registered_model,
+    _resolve_configs,
+    _wan22_component_dir,
+)
 from fastwam.models.wan22.wan_video_text_encoder import HuggingfaceTokenizer
 from fastwam.utils.config_resolvers import register_default_resolvers
 from fastwam.utils.logging_config import get_logger, setup_logging
@@ -229,17 +234,32 @@ def main(cfg: DictConfig):
         tokenizer_model_id=tokenizer_model_id,
         redirect_common_files=redirect_common_files,
     )
-    text_config.download_if_necessary()
-    tokenizer_config.download_if_necessary()
+    component_dir = _wan22_component_dir()
+    if component_dir is None:
+        text_config.download_if_necessary()
+        tokenizer_config.download_if_necessary()
+        text_encoder_path = text_config.path
+        tokenizer_path = tokenizer_config.path
+    else:
+        text_encoder_path = _ensure_component_path(
+            config=text_config,
+            component_dir=component_dir,
+            component_name="text encoder",
+        )
+        tokenizer_path = _ensure_component_path(
+            config=tokenizer_config,
+            component_dir=component_dir,
+            component_name="tokenizer",
+        )
 
     text_encoder = _load_registered_model(
-        text_config.path,
+        text_encoder_path,
         "wan_video_text_encoder",
         torch_dtype=torch_dtype,
         device=device,
     ).eval()
     tokenizer = HuggingfaceTokenizer(
-        name=tokenizer_config.path,
+        name=tokenizer_path,
         seq_len=context_len,
         clean="whitespace",
     )

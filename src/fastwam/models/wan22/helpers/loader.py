@@ -1,5 +1,8 @@
 from dataclasses import dataclass
+import glob
 import inspect
+import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -138,6 +141,117 @@ def _resolve_configs(model_id: str, tokenizer_model_id: str, redirect_common_fil
     return dit_config, text_config, vae_config, tokenizer_config
 
 
+def _wan22_component_dir() -> Path | None:
+    raw_path = os.environ.get("FASTWAM_WAN22_COMPONENT_DIR")
+    if raw_path is None or raw_path.strip() == "":
+        return None
+    component_dir = Path(os.path.expanduser(os.path.expandvars(raw_path))).resolve()
+    component_dir.mkdir(parents=True, exist_ok=True)
+    return component_dir
+
+
+def _component_pattern_to_glob(pattern: str | None) -> str:
+    if pattern in {None, "", "./"}:
+        return "*"
+    if pattern.endswith("/"):
+        return pattern + "*"
+    return pattern
+
+
+def _component_matches(component_dir: Path, pattern: str | list[str] | None) -> list[str]:
+    patterns = pattern if isinstance(pattern, list) else [pattern]
+    matches: list[str] = []
+    for item in patterns:
+        matches.extend(glob.glob(str(component_dir / _component_pattern_to_glob(item))))
+    return sorted(str(Path(match).resolve()) for match in matches)
+
+
+def _download_component_pattern(*, model_id: str, pattern: str, component_dir: Path, component_name: str) -> None:
+    allow_pattern = _component_pattern_to_glob(pattern)
+    source = os.environ.get("DIFFSYNTH_DOWNLOAD_SOURCE", "modelscope").lower()
+    logger.info(
+        "Downloading missing Wan2.2 %s from %s to %s (pattern=%s, source=%s)",
+        component_name,
+        model_id,
+        component_dir,
+        allow_pattern,
+        source,
+    )
+    if source == "modelscope":
+        from modelscope import snapshot_download
+
+        snapshot_download(
+            model_id,
+            local_dir=str(component_dir),
+            allow_file_pattern=allow_pattern,
+            local_files_only=False,
+        )
+    elif source == "huggingface":
+        from huggingface_hub import snapshot_download as hf_snapshot_download
+
+        hf_snapshot_download(
+            model_id,
+            local_dir=str(component_dir),
+            allow_patterns=allow_pattern,
+            local_files_only=False,
+        )
+    else:
+        raise ValueError("`DIFFSYNTH_DOWNLOAD_SOURCE` should be `modelscope` or `huggingface`.")
+
+
+def _ensure_component_path(*, config: ModelConfig, component_dir: Path, component_name: str) -> str | list[str]:
+    if config.path is not None:
+        return config.path
+    if config.model_id is None:
+        raise ValueError(f"{component_name} requires a model_id when FASTWAM_WAN22_COMPONENT_DIR is set.")
+
+    matches = _component_matches(component_dir, config.origin_file_pattern)
+    if not matches:
+        patterns = config.origin_file_pattern if isinstance(config.origin_file_pattern, list) else [config.origin_file_pattern]
+        for pattern in patterns:
+            _download_component_pattern(
+                model_id=config.model_id,
+                pattern=_component_pattern_to_glob(pattern),
+                component_dir=component_dir,
+                component_name=component_name,
+            )
+        matches = _component_matches(component_dir, config.origin_file_pattern)
+
+    if isinstance(config.origin_file_pattern, str) and config.origin_file_pattern.endswith("/"):
+        directory = (component_dir / config.origin_file_pattern.rstrip("/")).resolve()
+        if directory.exists():
+            return str(directory)
+
+    if not matches:
+        raise FileNotFoundError(
+            f"Missing Wan2.2 {component_name} under {component_dir}; "
+            f"expected pattern {config.origin_file_pattern!r} from {config.model_id}."
+        )
+    if len(matches) == 1:
+        return matches[0]
+    return matches
+
+
+def _find_component_dit_path(component_dir: Path) -> str | list[str] | None:
+    explicit_path = os.environ.get("FASTWAM_WAN_VIDEO_DIT_CHECKPOINT")
+    if explicit_path is not None and explicit_path.strip() != "":
+        resolved = Path(os.path.expanduser(os.path.expandvars(explicit_path))).resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"FASTWAM_WAN_VIDEO_DIT_CHECKPOINT does not exist: {resolved}")
+        return str(resolved)
+
+    checkpoint_path = component_dir / "checkpoint.safetensors"
+    if checkpoint_path.exists():
+        return str(checkpoint_path.resolve())
+
+    matches = _component_matches(component_dir, "diffusion_pytorch_model*.safetensors")
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        return matches
+    return None
+
+
 def load_wan22_ti2v_5b_components(
     device: str = "cuda",
     torch_dtype: torch.dtype = torch.bfloat16,
@@ -148,6 +262,7 @@ def load_wan22_ti2v_5b_components(
     dit_config: dict[str, Any] | None = None,
     skip_dit_load_from_pretrain: bool = False,
     load_text_encoder: bool = True,
+    text_encoder_device: str | torch.device | None = None,
 ):
     logger.info("Loading Wan2.2-TI2V-5B components...")
     start = time.time()
@@ -162,10 +277,60 @@ def load_wan22_ti2v_5b_components(
         redirect_common_files=redirect_common_files,
     )
 
-    vae_config.download_if_necessary()
-    if load_text_encoder:
-        text_config.download_if_necessary()
-        tokenizer_config.download_if_necessary()
+    component_dir = _wan22_component_dir()
+    if component_dir is not None:
+        logger.info("Using Wan2.2 component directory from FASTWAM_WAN22_COMPONENT_DIR=%s", component_dir)
+        if not skip_dit_load_from_pretrain:
+            dit_path = _find_component_dit_path(component_dir)
+            if dit_path is None:
+                dit_path = _ensure_component_path(
+                    config=dit_model_config,
+                    component_dir=component_dir,
+                    component_name="video DiT",
+                )
+            logger.info("Using Wan video DiT checkpoint from component directory: %s", dit_path)
+            dit_model_config = ModelConfig(path=dit_path)
+
+        vae_path = _ensure_component_path(
+            config=vae_config,
+            component_dir=component_dir,
+            component_name="VAE",
+        )
+        logger.info("Using Wan VAE from component directory: %s", vae_path)
+        vae_config = ModelConfig(path=vae_path)
+
+        if load_text_encoder:
+            text_path = _ensure_component_path(
+                config=text_config,
+                component_dir=component_dir,
+                component_name="text encoder",
+            )
+            tokenizer_path = _ensure_component_path(
+                config=tokenizer_config,
+                component_dir=component_dir,
+                component_name="tokenizer",
+            )
+            logger.info("Using Wan text encoder from component directory: %s", text_path)
+            logger.info("Using Wan tokenizer from component directory: %s", tokenizer_path)
+            text_config = ModelConfig(path=text_path)
+            tokenizer_config = ModelConfig(path=tokenizer_path)
+    else:
+        explicit_wan_dit_checkpoint = os.environ.get("FASTWAM_WAN_VIDEO_DIT_CHECKPOINT")
+        if explicit_wan_dit_checkpoint and not skip_dit_load_from_pretrain:
+            if not os.path.exists(explicit_wan_dit_checkpoint):
+                raise FileNotFoundError(
+                    f"FASTWAM_WAN_VIDEO_DIT_CHECKPOINT does not exist: {explicit_wan_dit_checkpoint}"
+                )
+            logger.info(
+                "Using explicit Wan video DiT checkpoint from FASTWAM_WAN_VIDEO_DIT_CHECKPOINT=%s",
+                explicit_wan_dit_checkpoint,
+            )
+            dit_model_config = ModelConfig(path=explicit_wan_dit_checkpoint)
+
+        vae_config.download_if_necessary()
+        if load_text_encoder:
+            text_config.download_if_necessary()
+            tokenizer_config.download_if_necessary()
 
     if skip_dit_load_from_pretrain:
         logger.info(
@@ -189,11 +354,14 @@ def load_wan22_ti2v_5b_components(
     text_encoder_path: str | None = None
     tokenizer_path: str | None = None
     if load_text_encoder:
+        resolved_text_encoder_device = device if text_encoder_device is None else text_encoder_device
+        resolved_text_encoder_device = torch.device(resolved_text_encoder_device)
+        text_encoder_dtype = torch.float32 if resolved_text_encoder_device.type == "cpu" else torch_dtype
         text_encoder = _load_registered_model(
             text_config.path,
             "wan_video_text_encoder",
-            torch_dtype=torch_dtype,
-            device=device,
+            torch_dtype=text_encoder_dtype,
+            device=str(resolved_text_encoder_device),
         )
         tokenizer = HuggingfaceTokenizer(
             name=tokenizer_config.path,
