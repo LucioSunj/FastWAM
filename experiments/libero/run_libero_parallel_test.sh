@@ -335,7 +335,7 @@ run_libero_eval() {
         # When the task exits, write a status file so the scheduler can detect failures promptly.
         tmux select-pane -t $SESSION_NAME:$pane_info 2>/dev/null
         tmux send-keys -t $SESSION_NAME:$pane_info "clear" C-m 2>/dev/null
-        tmux send-keys -t $SESSION_NAME:$pane_info "source ~/.bashrc && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
+        tmux send-keys -t $SESSION_NAME:$pane_info "source ~/.bashrc && source /root/miniconda3/bin/activate /root/autodl-fs/fastwam_libero_plus_eval/conda_envs/fastwam-libero-plus && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
             STATUS_FILE='$status_file' LOG_FILE='$log_file' RESULT_FILE='$result_file' && \
             CUDA_VISIBLE_DEVICES=$gpu_id python experiments/libero/eval_libero_single.py \
             task=$CONFIG ckpt=$CKPT \
@@ -465,6 +465,14 @@ run_libero_eval() {
         task_id=$(echo $task_info | cut -d, -f2)
         
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Processing task: suite=$suite, task_id=$task_id"
+
+        result_file_pattern="$OUTPUT_DIR/$suite/gpu*_task${task_id}_results.json"
+        if ls $result_file_pattern 1> /dev/null 2>&1; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Skipping completed task: $suite task_id=$task_id"
+            grep -v "^$suite,$task_id$" "$PENDING_TASKS_FILE" > "$PENDING_TASKS_FILE.tmp" || true
+            mv "$PENDING_TASKS_FILE.tmp" "$PENDING_TASKS_FILE"
+            continue
+        fi
         
         # Find the least-loaded GPU
         gpu_id=$(find_least_loaded_gpu)
@@ -523,59 +531,71 @@ run_libero_eval() {
 
         # Try to launch new tasks
         launched_this_round=0
+        open_slots=0
+        for gpu in "${GPU_ARRAY[@]}"; do
+            load=$(get_gpu_load $gpu)
+            gpu_slots=$((MAX_TASKS_PER_GPU - load))
+            [ $gpu_slots -gt 0 ] && open_slots=$((open_slots + gpu_slots))
+        done
 
-        # Read the pending task list.
-        # Create a copy to avoid concurrent file access issues.
-        temp_pending="$PENDING_TASKS_FILE.processing"
-        cp "$PENDING_TASKS_FILE" "$temp_pending" 2>/dev/null || continue
+        if [ "$open_slots" -gt 0 ]; then
+            # Read the pending task list.
+            # Create a copy to avoid concurrent file access issues.
+            temp_pending="$PENDING_TASKS_FILE.processing"
+            cp "$PENDING_TASKS_FILE" "$temp_pending" 2>/dev/null || continue
 
-        # Create a new pending task file
-        > "$PENDING_TASKS_FILE"
+            # Create a new pending task file
+            > "$PENDING_TASKS_FILE"
 
-        while IFS=, read -r suite task_id; do
-            [ -z "$suite" ] && continue
+            while IFS=, read -r suite task_id; do
+                [ -z "$suite" ] && continue
 
-            # Check whether the task is already complete
-            result_file_pattern="$OUTPUT_DIR/$suite/gpu*_task${task_id}_results.json"
-            if ls $result_file_pattern 1> /dev/null 2>&1; then
-                continue
-            fi
+                # Check whether the task is already complete
+                result_file_pattern="$OUTPUT_DIR/$suite/gpu*_task${task_id}_results.json"
+                if ls $result_file_pattern 1> /dev/null 2>&1; then
+                    continue
+                fi
 
-            # Check whether the task is already running.
-            # The pending file should only keep tasks that are not running.
-            running_gpu=$(get_task_gpu "$suite" "$task_id")
-            if [ -n "$running_gpu" ]; then
-                continue
-            fi
+                # Check whether the task is already running.
+                # The pending file should only keep tasks that are not running.
+                running_gpu=$(get_task_gpu "$suite" "$task_id")
+                if [ -n "$running_gpu" ]; then
+                    continue
+                fi
 
-            # Find the least-loaded GPU and try to launch
-            gpu_id=$(find_least_loaded_gpu)
-            if [ -n "$gpu_id" ]; then
-                window_id=$((NEXT_PANE_INDEX / MAX_PANES))
-                pane_id=$((NEXT_PANE_INDEX % MAX_PANES))
-                pane_info="$window_id.$pane_id"
+                # Find the least-loaded GPU and try to launch
+                gpu_id=$(find_least_loaded_gpu)
+                if [ -n "$gpu_id" ]; then
+                    window_id=$((NEXT_PANE_INDEX / MAX_PANES))
+                    pane_id=$((NEXT_PANE_INDEX % MAX_PANES))
+                    pane_info="$window_id.$pane_id"
 
-                ensure_pane_exists "$window_id" "$pane_id"
-                NEXT_PANE_INDEX=$((NEXT_PANE_INDEX + 1))
+                    ensure_pane_exists "$window_id" "$pane_id"
+                    NEXT_PANE_INDEX=$((NEXT_PANE_INDEX + 1))
 
-                launch_task "$suite" "$task_id" "$gpu_id" "$pane_info"
-                ((launched_this_round++))
+                    launch_task "$suite" "$task_id" "$gpu_id" "$pane_info"
+                    ((launched_this_round++))
 
-                # Limit the number of launches per round to avoid overloading the system
-                if [ $launched_this_round -ge $max_launch_per_round ]; then
+                    # Limit the number of launches per round to avoid overloading the system.
+                    if [ $launched_this_round -ge $max_launch_per_round ]; then
+                        while IFS=, read -r remaining_suite remaining_task_id; do
+                            [ -n "$remaining_suite" ] && echo "$remaining_suite,$remaining_task_id" >> "$PENDING_TASKS_FILE"
+                        done
+                        break
+                    fi
+                else
+                    # GPUs filled up during this pass; keep the current and remaining tasks pending.
+                    echo "$suite,$task_id" >> "$PENDING_TASKS_FILE"
                     while IFS=, read -r remaining_suite remaining_task_id; do
-                        [ -n "$remaining_suite" ] && append_unique_pending_task "$remaining_suite" "$remaining_task_id"
+                        [ -n "$remaining_suite" ] && echo "$remaining_suite,$remaining_task_id" >> "$PENDING_TASKS_FILE"
                     done
                     break
                 fi
-            else
-                # GPUs are fully loaded, put the task back into the pending queue
-                append_unique_pending_task "$suite" "$task_id"
-            fi
-        done < "$temp_pending"
+            done < "$temp_pending"
 
-        # Clean up the temporary file
-        rm -f "$temp_pending"
+            # Clean up the temporary file
+            rm -f "$temp_pending"
+        fi
 
         running_count=$(wc -l < "$TASK_GPU_MAP_FILE" 2>/dev/null || echo 0)
         pending_count=$(wc -l < "$PENDING_TASKS_FILE" 2>/dev/null || echo 0)

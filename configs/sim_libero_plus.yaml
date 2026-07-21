@@ -1,0 +1,17 @@
+# @package _global_
+
+defaults:
+  - sim_libero
+  - _self_
+
+EVALUATION:
+  # LIBERO-plus evaluates one fixed initial state per generated task.
+  num_trials: 1
+  output_dir: ./evaluate_results/libero_plus/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
+
+MULTIRUN:
+  task_suite_names:
+    - libero_10
+    - libero_goal
+    - libero_spatial
+    - libero_object

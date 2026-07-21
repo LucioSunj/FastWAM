@@ -27,6 +27,14 @@ EVALUATION:
   use_action_ensembler: false
   visualize_future_video: false
   force_branch: base  # adaptive models: base (UNCOND); use idm when visualizing future
+  save_rollout_video: false
+  lazy_visual_obs: true
+  cache_text_context: true
+  text_context_cache_max_size: 512
+  profile_timing: true
+  disable_tqdm: true
+  empty_cuda_cache_each_task: false
+  gc_collect_interval: 20
 
   # Action inference
   action_horizon: null
@@ -39,6 +47,7 @@ EVALUATION:
 
   # Optional external inputs
   dataset_stats_path: null
+  text_embedding_cache_dir: null
   device: cuda
 
 MULTIRUN:

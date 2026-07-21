@@ -3,6 +3,7 @@
 import math
 import time
 import pathlib
+import re
 
 import imageio
 from PIL import Image, ImageDraw
@@ -16,16 +17,40 @@ DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 
+def _resolve_task_bddl_file(task):
+    bddl_root = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder
+    exact_path = bddl_root / task.bddl_file
+    bddl_file = task.bddl_file
+
+    if "_view_" in bddl_file and "_initstate_" in bddl_file:
+        # LIBERO-plus encodes camera and robot-init variants in a virtual BDDL
+        # filename. Its env wrapper parses this name and maps it to the base BDDL.
+        return exact_path
+
+    if exact_path.exists():
+        return exact_path
+
+    if "_language_" in bddl_file:
+        bddl_file = re.sub(r"(_language_\d+).*\.bddl$", r"\1.bddl", bddl_file)
+    elif "_view_" in bddl_file:
+        bddl_file = bddl_file.split("_view_")[0] + ".bddl"
+
+    fallback_path = bddl_root / bddl_file
+    if fallback_path.exists():
+        return fallback_path
+
+    raise FileNotFoundError(
+        f"Unable to resolve BDDL file for task {task.name}: "
+        f"tried {exact_path} and {fallback_path}"
+    )
+
+
 def get_libero_env(task, resolution, seed, env_num=1):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
-    task_bddl_file = (
-        pathlib.Path(get_libero_path("bddl_files"))
-        / task.problem_folder
-        / task.bddl_file
-    )
+    task_bddl_file = _resolve_task_bddl_file(task)
     env_args = {
-        "bddl_file_name": task_bddl_file,
+        "bddl_file_name": str(task_bddl_file),
         "camera_heights": resolution,
         "camera_widths": resolution,
     }

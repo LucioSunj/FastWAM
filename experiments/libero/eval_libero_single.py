@@ -35,6 +35,7 @@ from experiments.libero.libero_utils import (
     save_prediction_video,
     save_rollout_video,
 )
+from experiments.libero.text_embedding_cache import build_text_context_cache
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.adaptive_gate import (
     explicit_eval_branch,
@@ -260,6 +261,95 @@ def _extract_sim_state(obs: dict) -> np.ndarray:
     return state
 
 
+def _wrapped_libero_env(env):
+    return getattr(env, "env", env)
+
+
+def _visual_observable_names(env) -> list[str]:
+    wrapped_env = _wrapped_libero_env(env)
+    observables = getattr(wrapped_env, "_observables", None)
+    if observables is None:
+        return []
+
+    names = []
+    for name, observable in observables.items():
+        modality = str(getattr(observable, "modality", ""))
+        if (
+            modality == "image"
+            or name.endswith("_image")
+            or name.endswith("_depth")
+            or "segmentation" in name
+        ):
+            names.append(name)
+    return names
+
+
+def _set_visual_observables_enabled(env, enabled: bool) -> int:
+    wrapped_env = _wrapped_libero_env(env)
+    count = 0
+    for name in _visual_observable_names(env):
+        wrapped_env.modify_observable(name, "enabled", enabled)
+        count += 1
+    return count
+
+
+def _libero_plus_sensor_noise_level(env) -> int:
+    noise = getattr(env, "noise", 0)
+    try:
+        return int(noise)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _apply_libero_plus_sensor_noise(env, obs: dict) -> dict:
+    noise = _libero_plus_sensor_noise_level(env)
+    if noise == 0 or not isinstance(obs, dict) or "agentview_image" not in obs:
+        return obs
+
+    from libero.libero.envs.env_wrapper import (
+        fog,
+        gaussian_blur,
+        glass_blur,
+        motion_blur,
+        zoom_blur,
+    )
+
+    img_array = obs["agentview_image"]
+    if img_array.dtype != np.uint8:
+        img_array = (img_array * 255).astype(np.uint8)
+    pil_image = Image.fromarray(img_array)
+
+    if noise <= 10:
+        noisy = motion_blur(pil_image, severity=noise)
+    elif noise <= 20:
+        noisy = gaussian_blur(pil_image, severity=noise - 10)
+    elif noise <= 30:
+        noisy = zoom_blur(pil_image, severity=noise - 20)
+    elif noise <= 40:
+        noisy = fog(pil_image, severity=noise - 30)
+    elif noise <= 50:
+        noisy = glass_blur(pil_image, severity=noise - 40)
+    else:
+        return obs
+
+    obs["agentview_image"] = np.asarray(noisy).astype(np.uint8)
+    return obs
+
+
+def _refresh_observation(env) -> dict:
+    wrapped_env = _wrapped_libero_env(env)
+    get_observations = getattr(wrapped_env, "_get_observations", None)
+    if get_observations is None:
+        get_observations = getattr(env, "_get_observations", None)
+    if get_observations is None:
+        raise AttributeError("LIBERO env does not expose _get_observations for visual refresh.")
+    try:
+        obs = get_observations(force_update=True)
+    except TypeError:
+        obs = get_observations()
+    return _apply_libero_plus_sensor_noise(env, obs)
+
+
 def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np.ndarray:
     if action.ndim == 2:
         action = action.unsqueeze(0)
@@ -277,6 +367,47 @@ def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np
     action = action.to(dtype=torch.float32, device="cpu")
     denorm = normalizer.backward(action)
     return denorm.numpy()
+
+
+def _timing_add(timing: Optional[dict[str, Any]], key: str, value: float) -> None:
+    if timing is None:
+        return
+    timing[key] = float(timing.get(key, 0.0)) + float(value)
+
+
+def _timing_inc(timing: Optional[dict[str, Any]], key: str, value: int = 1) -> None:
+    if timing is None:
+        return
+    timing[key] = int(timing.get(key, 0)) + int(value)
+
+
+def _get_cached_text_context(
+    prompt: str,
+    model: torch.nn.Module,
+    text_context_cache: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    timing: Optional[dict[str, Any]] = None,
+    max_cache_size: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cached = text_context_cache.get(prompt)
+    if cached is not None:
+        _timing_inc(timing, "text_context_cache_hits")
+        return cached
+
+    start = time.perf_counter()
+    context, context_mask = model.encode_prompt(prompt)
+    _timing_add(timing, "text_encode_s", time.perf_counter() - start)
+    _timing_inc(timing, "text_context_cache_misses")
+
+    cached = (
+        context.detach().to(device="cpu").contiguous(),
+        context_mask.detach().to(device="cpu", dtype=torch.bool).contiguous(),
+    )
+    if max_cache_size is not None and max_cache_size > 0:
+        while len(text_context_cache) >= max_cache_size:
+            text_context_cache.pop(next(iter(text_context_cache)))
+            _timing_inc(timing, "text_context_cache_evictions")
+    text_context_cache[prompt] = cached
+    return cached
 
 
 def _get_num_video_frames(cfg: DictConfig) -> int:
@@ -371,6 +502,8 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    text_context_cache: Optional[dict[str, tuple[torch.Tensor, torch.Tensor]]] = None,
+    timing: Optional[dict[str, Any]] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -380,6 +513,7 @@ def _predict_action_chunk(
     prompt_template = DEFAULT_PROMPT
     prompt = prompt_template.format(task=task_description)
 
+    start = time.perf_counter()
     image, proprio, imgs = _obs_to_model_input(
         obs,
         cfg=cfg,
@@ -389,6 +523,7 @@ def _predict_action_chunk(
         device=model_device,
         dtype=model.torch_dtype,
     )
+    _timing_add(timing, "preprocess_obs_s", time.perf_counter() - start)
 
     infer_kwargs = {
         "prompt": prompt,
@@ -407,6 +542,22 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    if bool(cfg.EVALUATION.get("cache_text_context", True)):
+        if text_context_cache is None:
+            text_context_cache = {}
+        max_cache_size_cfg = cfg.EVALUATION.get("text_context_cache_max_size", 512)
+        max_cache_size = None if max_cache_size_cfg is None else int(max_cache_size_cfg)
+        context, context_mask = _get_cached_text_context(
+            prompt,
+            model=model,
+            text_context_cache=text_context_cache,
+            timing=timing,
+            max_cache_size=max_cache_size,
+        )
+        infer_kwargs["prompt"] = None
+        infer_kwargs["context"] = context
+        infer_kwargs["context_mask"] = context_mask
+
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
@@ -422,14 +573,18 @@ def _predict_action_chunk(
         )
     )
 
+    start = time.perf_counter()
     with torch.no_grad():
         if visualize_future_video:
             pred = model.infer_joint(**infer_kwargs)
             predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
         else:
             pred = model.infer_action(**infer_kwargs)
+    _timing_add(timing, "model_infer_s", time.perf_counter() - start)
+    _timing_inc(timing, "model_infer_calls")
     action = pred["action"]  # [T, D]
 
+    start = time.perf_counter()
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
     # The dataloader flips the sign of the gripper action to align with other datasets
@@ -438,6 +593,7 @@ def _predict_action_chunk(
     action = invert_gripper_action(action)
     if bool(cfg.EVALUATION.get("binarize_gripper", False)):
         action[..., -1] = np.sign(action[..., -1])
+    _timing_add(timing, "postprocess_action_s", time.perf_counter() - start)
     return action, imgs, predicted_future_frames
 
 
@@ -467,13 +623,22 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
+    text_context_cache: Optional[dict[str, tuple[torch.Tensor, torch.Tensor]]] = None,
+    timing: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     use_action_ensembler = bool(cfg.EVALUATION.get("use_action_ensembler", False))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+    save_rollout_video_enabled = bool(cfg.EVALUATION.get("save_rollout_video", False))
+    lazy_visual_obs = bool(cfg.EVALUATION.get("lazy_visual_obs", True))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
+
+    visual_obs_disabled = False
+    if lazy_visual_obs:
+        disabled_count = _set_visual_observables_enabled(env, False)
+        visual_obs_disabled = disabled_count > 0
 
     env.reset()
     obs = env.set_init_state(initial_state)
@@ -491,15 +656,29 @@ def run_single_episode(
 
     t = 0
     done = False
-    pbar = tqdm(total=max_steps + num_steps_wait, desc=f"Episode {episode_idx + 1}")
+    disable_tqdm = bool(cfg.EVALUATION.get("disable_tqdm", not sys.stderr.isatty()))
+    pbar = tqdm(
+        total=max_steps + num_steps_wait,
+        desc=f"Episode {episode_idx + 1}",
+        disable=disable_tqdm,
+    )
     while t < max_steps + num_steps_wait:
         pbar.update(1)
         if t < num_steps_wait:
+            start = time.perf_counter()
             obs, _, done, _ = env.step(get_libero_dummy_action())
+            _timing_add(timing, "wait_env_step_s", time.perf_counter() - start)
+            _timing_inc(timing, "wait_env_steps")
             t += 1
             continue
 
         if len(pending_actions) == 0:
+            if lazy_visual_obs and visual_obs_disabled:
+                start = time.perf_counter()
+                _set_visual_observables_enabled(env, True)
+                visual_obs_disabled = False
+                obs = _refresh_observation(env)
+                _timing_add(timing, "visual_refresh_s", time.perf_counter() - start)
             action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
                 obs=obs,
                 task_description=task_description,
@@ -510,7 +689,10 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                text_context_cache=text_context_cache,
+                timing=timing,
             )
+            _timing_inc(timing, "replans")
             if predicted_future_frames is not None:
                 current_replan_idx += 1
                 current_predicted_future_clip = {
@@ -526,16 +708,48 @@ def run_single_episode(
                 pending_actions = [ensembler.get_action(ts).tolist() for ts in range(t, t + replan_steps)]
             else:
                 pending_actions = action_chunk[:replan_steps].tolist()
-            replay_images.append(imgs.copy())
+            if save_rollout_video_enabled:
+                replay_images.append(imgs.copy())
+            if lazy_visual_obs:
+                start = time.perf_counter()
+                _set_visual_observables_enabled(env, False)
+                visual_obs_disabled = True
+                _timing_add(timing, "visual_disable_s", time.perf_counter() - start)
         else:
-            imgs = get_libero_image(obs)
-            replay_images.append(imgs.copy())
+            if save_rollout_video_enabled:
+                if lazy_visual_obs and visual_obs_disabled:
+                    start = time.perf_counter()
+                    _set_visual_observables_enabled(env, True)
+                    visual_obs_disabled = False
+                    obs = _refresh_observation(env)
+                    _timing_add(timing, "visual_refresh_s", time.perf_counter() - start)
+                imgs = get_libero_image(obs)
+                replay_images.append(imgs.copy())
+                if lazy_visual_obs:
+                    start = time.perf_counter()
+                    _set_visual_observables_enabled(env, False)
+                    visual_obs_disabled = True
+                    _timing_add(timing, "visual_disable_s", time.perf_counter() - start)
 
+        start = time.perf_counter()
         obs, _, done, _ = env.step(pending_actions.pop(0))
+        _timing_add(timing, "action_env_step_s", time.perf_counter() - start)
+        _timing_inc(timing, "action_env_steps")
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:
+                if lazy_visual_obs and visual_obs_disabled:
+                    start = time.perf_counter()
+                    _set_visual_observables_enabled(env, True)
+                    visual_obs_disabled = False
+                    obs = _refresh_observation(env)
+                    _timing_add(timing, "visual_refresh_s", time.perf_counter() - start)
                 current_predicted_future_clip["gt_frames"].append(get_libero_image(obs))
+                if lazy_visual_obs:
+                    start = time.perf_counter()
+                    _set_visual_observables_enabled(env, False)
+                    visual_obs_disabled = True
+                    _timing_add(timing, "visual_disable_s", time.perf_counter() - start)
             if done or len(pending_actions) == 0:
                 expected_frame_count = 1 + sum(
                     1 for capture_step in capture_steps if capture_step <= current_replan_step
@@ -586,6 +800,9 @@ def run_single_episode(
             break
         t += 1
     pbar.close()
+    if timing is not None:
+        timing["executed_steps"] = int(t)
+        timing["success"] = bool(done)
 
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
@@ -606,79 +823,96 @@ def run_single_task(
     input_w: int,
     input_h: int,
     model_device: str,
+    text_context_cache: Optional[dict[str, tuple[torch.Tensor, torch.Tensor]]] = None,
 ) -> dict:
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+    save_rollout_video_enabled = bool(cfg.EVALUATION.get("save_rollout_video", False))
+    profile_timing = bool(cfg.EVALUATION.get("profile_timing", False))
+    if text_context_cache is None:
+        text_context_cache = {}
     results = {
         "successes": 0,
         "failure_episodes": [],
         "success_episodes": [],
         "task_description": task_description,
     }
+    if profile_timing:
+        results["episode_timing"] = []
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
 
-    for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
-            env=env,
-            initial_state=initial_states[trial_idx],
-            task_description=task_description,
-            model=model,
-            processor=processor,
-            cfg=cfg,
-            episode_idx=trial_idx,
-            action_horizon=action_horizon,
-            input_w=input_w,
-            input_h=input_h,
-            model_device=model_device,
-        )
-        if success:
-            results["successes"] += 1
-            results["success_episodes"].append(trial_idx)
-        else:
-            results["failure_episodes"].append(trial_idx)
-        if visualize_future_video:
-            results["episode_future_video_psnr"].append(episode_mean_psnr)
-
-        save_rollout_video(
-            video_dir,
-            replay_images,
-            f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-            success=success,
-            task_description=task_description,
-        )
-        if visualize_future_video:
-            if len(predicted_future_video_clips) == 0:
-                logging.warning(
-                    "No predicted future frames collected for task %s trial %s.",
-                    cfg.EVALUATION.task_id,
-                    trial_idx,
-                )
+    try:
+        for trial_idx in range(int(cfg.EVALUATION.num_trials)):
+            episode_timing = {"episode_idx": trial_idx} if profile_timing else None
+            success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
+                env=env,
+                initial_state=initial_states[trial_idx],
+                task_description=task_description,
+                model=model,
+                processor=processor,
+                cfg=cfg,
+                episode_idx=trial_idx,
+                action_horizon=action_horizon,
+                input_w=input_w,
+                input_h=input_h,
+                model_device=model_device,
+                text_context_cache=text_context_cache,
+                timing=episode_timing,
+            )
+            if profile_timing:
+                episode_timing["text_context_cache_size"] = len(text_context_cache)
+                results["episode_timing"].append(episode_timing)
+            if success:
+                results["successes"] += 1
+                results["success_episodes"].append(trial_idx)
             else:
-                all_gt_frames = []
-                all_pred_frames = []
-                for clip in predicted_future_video_clips:
-                    all_gt_frames.extend(clip["gt_frames"])
-                    all_pred_frames.extend(clip["pred_frames"])
-                    save_prediction_video(
-                        predicted_video_dir,
-                        clip["gt_frames"],
-                        clip["pred_frames"],
-                        f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-                        clip["replan_idx"],
-                        success=success,
-                        task_description=task_description,
-                    )
-                save_prediction_video(
-                    predicted_video_dir,
-                    all_gt_frames,
-                    all_pred_frames,
+                results["failure_episodes"].append(trial_idx)
+            if visualize_future_video:
+                results["episode_future_video_psnr"].append(episode_mean_psnr)
+
+            if save_rollout_video_enabled:
+                save_rollout_video(
+                    video_dir,
+                    replay_images,
                     f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-                    "all",
                     success=success,
                     task_description=task_description,
                 )
+            if visualize_future_video:
+                if len(predicted_future_video_clips) == 0:
+                    logging.warning(
+                        "No predicted future frames collected for task %s trial %s.",
+                        cfg.EVALUATION.task_id,
+                        trial_idx,
+                    )
+                else:
+                    all_gt_frames = []
+                    all_pred_frames = []
+                    for clip in predicted_future_video_clips:
+                        all_gt_frames.extend(clip["gt_frames"])
+                        all_pred_frames.extend(clip["pred_frames"])
+                        save_prediction_video(
+                            predicted_video_dir,
+                            clip["gt_frames"],
+                            clip["pred_frames"],
+                            f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
+                            clip["replan_idx"],
+                            success=success,
+                            task_description=task_description,
+                        )
+                    save_prediction_video(
+                        predicted_video_dir,
+                        all_gt_frames,
+                        all_pred_frames,
+                        f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
+                        "all",
+                        success=success,
+                        task_description=task_description,
+                    )
+    finally:
+        env.close()
 
     if visualize_future_video:
         valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
@@ -699,6 +933,7 @@ def eval_single_process(cfg: DictConfig):
     if cfg.ckpt is None:
         raise ValueError("cfg.ckpt must not be None.")
     _validate_visualize_future_video_cfg(cfg)
+    text_context_cache = build_text_context_cache(cfg)
 
     env_num = int(cfg.EVALUATION.get("env_num", 1))
     if env_num != 1:
@@ -739,7 +974,8 @@ def eval_single_process(cfg: DictConfig):
     local_log_dir = Path(cfg.EVALUATION.output_dir)
     local_log_dir.mkdir(parents=True, exist_ok=True)
     video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "videos"
-    video_dir.mkdir(parents=True, exist_ok=True)
+    if bool(cfg.EVALUATION.get("save_rollout_video", False)):
+        video_dir.mkdir(parents=True, exist_ok=True)
     predicted_video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "predicted_videos"
     if bool(cfg.EVALUATION.get("visualize_future_video", False)):
         predicted_video_dir.mkdir(parents=True, exist_ok=True)
@@ -778,6 +1014,7 @@ def eval_single_process(cfg: DictConfig):
         input_w=input_w,
         input_h=input_h,
         model_device=model_device,
+        text_context_cache=text_context_cache,
     )
     results.update(task_results)
 
