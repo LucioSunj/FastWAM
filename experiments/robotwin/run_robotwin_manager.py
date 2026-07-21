@@ -1,4 +1,6 @@
+import ast
 import csv
+import hashlib
 import json
 import os
 import subprocess
@@ -17,6 +19,7 @@ from omegaconf import DictConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SINGLE_ENTRY = PROJECT_ROOT / "experiments" / "robotwin" / "eval_robotwin_single.py"
+PRECOMPUTE_TEXT_ENTRY = PROJECT_ROOT / "experiments" / "robotwin" / "precompute_robotwin_text_embeds.py"
 EVAL_STEP_LIMIT_FILE = PROJECT_ROOT / "third_party" / "RoboTwin" / "task_config" / "_eval_step_limit.yml"
 TERMINATE_TIMEOUT_SEC = 10
 POLL_INTERVAL_SEC = 2
@@ -100,6 +103,20 @@ def _parse_success_rate(result_file: Path) -> float:
         raise ValueError(f"Failed to parse success rate from: {result_file}")
     return last_value
 
+def _extract_missing_text_prompt(log_file: Path) -> str | None:
+    if not log_file.exists():
+        return None
+    for line in reversed(log_file.read_text(encoding="utf-8", errors="replace").splitlines()):
+        marker = "Prompt: "
+        if "Missing precomputed text embedding cache:" not in line or marker not in line:
+            continue
+        raw_prompt = line.split(marker, 1)[1].strip()
+        try:
+            prompt = ast.literal_eval(raw_prompt)
+        except (SyntaxError, ValueError):
+            return None
+        return prompt if isinstance(prompt, str) and prompt else None
+
 
 def _phase_result_filename(phase: str) -> str:
     if phase == "clean":
@@ -149,16 +166,23 @@ def main(cfg: DictConfig):
     num_gpus = int(cfg.MULTIRUN.num_gpus)
     if num_gpus <= 0:
         raise ValueError("`MULTIRUN.num_gpus` must be > 0.")
+    gpu_offset = int(cfg.MULTIRUN.get("gpu_offset", 0))
+    if gpu_offset < 0:
+        raise ValueError("`MULTIRUN.gpu_offset` must be >= 0.")
     max_tasks_per_gpu = int(cfg.MULTIRUN.max_tasks_per_gpu)
     if max_tasks_per_gpu <= 0:
         raise ValueError("`MULTIRUN.max_tasks_per_gpu` must be > 0.")
-    gpu_ids = list(range(num_gpus))
+    gpu_ids = list(range(gpu_offset, gpu_offset + num_gpus))
 
-    output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
+    raw_output_dir = str(cfg.EVALUATION.output_dir)
+    output_dir = _resolve_path(raw_output_dir, base=PROJECT_ROOT)
     run_ts = output_dir.name
     if run_ts == "":
         raise ValueError(f"Invalid EVALUATION.output_dir (missing run_ts): {output_dir}")
-    run_output_dir = PROJECT_ROOT / "evaluate_results" / "robotwin" / ckpt_tag / run_ts
+    if Path(os.path.expanduser(os.path.expandvars(raw_output_dir))).is_absolute():
+        run_output_dir = output_dir
+    else:
+        run_output_dir = PROJECT_ROOT / "evaluate_results" / "robotwin" / ckpt_tag / run_ts
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
     manager_log = run_output_dir / "manager.log"
@@ -186,12 +210,104 @@ def main(cfg: DictConfig):
         "random": "demo_randomized",
     }
 
+    text_cache_value = cfg.EVALUATION.get("text_embedding_cache_dir")
+    if text_cache_value is None or str(text_cache_value).strip() == "":
+        raise ValueError("`EVALUATION.text_embedding_cache_dir` is required.")
+    text_cache_dir = _resolve_path(str(text_cache_value), base=PROJECT_ROOT)
+    context_len = int(cfg.EVALUATION.get("context_len", 128))
+    recovery_dir = run_output_dir / "missing_text_cache_recovery"
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+    max_missing_cache_retries = int(cfg.EVALUATION.get("max_missing_cache_retries", 64))
+    missing_cache_retries: dict[tuple[str, str], int] = {}
+
     def log(msg: str) -> None:
+
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
         print(line, flush=True)
         with manager_log.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
             f.flush()
+
+    def latest_worker_log(task_name: str) -> Path | None:
+        candidates = list(run_output_dir.glob(f"eval_{task_name}_*.log"))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
+    def recover_missing_text_cache(state: RunningState) -> bool:
+        log_file = latest_worker_log(state.task_name)
+        if log_file is None:
+            return False
+        prompt = _extract_missing_text_prompt(log_file)
+        if prompt is None:
+            return False
+
+        retry_key = (state.task_name, state.phase)
+        retry_count = missing_cache_retries.get(retry_key, 0) + 1
+        if retry_count > max_missing_cache_retries:
+            log(
+                f"missing text cache retry limit exceeded: task={state.task_name} "
+                f"phase={state.phase} gpu={state.gpu_id} retries={retry_count - 1}"
+            )
+            return False
+        missing_cache_retries[retry_key] = retry_count
+
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        cache_name = f"{prompt_hash}.t5_len{context_len}.wan22ti2v5b.pt"
+        cache_path = text_cache_dir / cache_name
+        prompt_file = recovery_dir / f"{state.task_name}_{state.phase}_{prompt_hash}.json"
+        recovery_log = recovery_dir / f"{state.task_name}_{state.phase}_{prompt_hash}.log"
+        prompt_file.write_text(
+            json.dumps([prompt], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        cmd = [
+            sys.executable,
+            str(PRECOMPUTE_TEXT_ENTRY),
+            "--robotwin-root",
+            str(robotwin_root),
+            "--cache-dir",
+            str(text_cache_dir),
+            "--prompts-json",
+            str(prompt_file),
+            "--skip-collect",
+            "--context-len",
+            str(context_len),
+            "--device",
+            "cuda:0",
+            "--batch-size",
+            "1",
+        ]
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(state.gpu_id)
+        env.setdefault("FASTWAM_WAN22_COMPONENT_DIR", "/root/autodl-fs/Wan2.2-5B-Robot")
+        log(
+            f"recover missing text cache: task={state.task_name} phase={state.phase} "
+            f"gpu={state.gpu_id} retry={retry_count} cache={cache_name}"
+        )
+        with recovery_log.open("w", encoding="utf-8") as recovery_f:
+            recovery = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                env=env,
+                stdout=recovery_f,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        if recovery.returncode != 0 or not cache_path.is_file():
+            log(
+                f"missing text cache recovery failed: task={state.task_name} "
+                f"phase={state.phase} gpu={state.gpu_id} return_code={recovery.returncode} "
+                f"log={recovery_log}"
+            )
+            return False
+        log(
+            f"missing text cache recovered: task={state.task_name} phase={state.phase} "
+            f"gpu={state.gpu_id} cache={cache_name}"
+        )
+        return True
 
     def build_cmd(*, task_name: str, gpu_id: int, phase: str) -> list[str]:
         task_config = phase_to_task_config[phase]
@@ -252,10 +368,36 @@ def main(cfg: DictConfig):
                 count += 1
         return count
 
+    def phase_result_file(task_name: str, phase: str) -> Path:
+        return run_output_dir / task_name / _phase_result_filename(phase)
+
+    def try_record_existing_result(task_name: str, phase: str) -> bool:
+        if task_rates[task_name][phase] is not None:
+            return True
+        result_file = phase_result_file(task_name, phase)
+        if not result_file.exists():
+            return False
+        success_rate = _parse_success_rate(result_file)
+        task_rates[task_name][phase] = success_rate
+        log(
+            f"skip existing task={task_name} phase={phase} "
+            f"success_rate={success_rate:.4f}"
+        )
+        return True
+
     def try_launch_pending(gpu_id: int) -> None:
         while len(pending_tasks) > 0 and gpu_running_count(gpu_id) < max_tasks_per_gpu:
             task_name = pending_tasks.popleft()
-            running_states.append(launch_phase(task_name=task_name, gpu_id=gpu_id, phase="clean"))
+
+            clean_done = try_record_existing_result(task_name, "clean")
+            if not clean_done:
+                running_states.append(launch_phase(task_name=task_name, gpu_id=gpu_id, phase="clean"))
+                continue
+
+            random_done = try_record_existing_result(task_name, "random")
+            if not random_done:
+                running_states.append(launch_phase(task_name=task_name, gpu_id=gpu_id, phase="random"))
+                continue
 
     def write_outputs() -> None:
         clean_mean = _mean_or_none([task_rates[t]["clean"] for t in tasks])
@@ -323,6 +465,19 @@ def main(cfg: DictConfig):
             running_states.remove(state)
 
             if return_code != 0:
+                if recover_missing_text_cache(state):
+                    log(
+                        f"retry phase after text cache recovery: task={state.task_name} "
+                        f"phase={state.phase} gpu={gpu_id}"
+                    )
+                    running_states.append(
+                        launch_phase(
+                            task_name=state.task_name,
+                            gpu_id=gpu_id,
+                            phase=state.phase,
+                        )
+                    )
+                    continue
                 has_failure = True
                 failure_message = (
                     f"worker failed: task={state.task_name}, phase={state.phase}, "
@@ -342,7 +497,7 @@ def main(cfg: DictConfig):
                 running_states.clear()
                 break
 
-            result_file = run_output_dir / state.task_name / _phase_result_filename(state.phase)
+            result_file = phase_result_file(state.task_name, state.phase)
             try:
                 success_rate = _parse_success_rate(result_file)
             except Exception as exc:
@@ -372,11 +527,14 @@ def main(cfg: DictConfig):
             )
 
             if state.phase == "clean":
-                running_states.append(launch_phase(
-                    task_name=state.task_name,
-                    gpu_id=gpu_id,
-                    phase="random",
-                ))
+                if not try_record_existing_result(state.task_name, "random"):
+                    running_states.append(launch_phase(
+                        task_name=state.task_name,
+                        gpu_id=gpu_id,
+                        phase="random",
+                    ))
+                else:
+                    try_launch_pending(gpu_id)
                 continue
 
             try_launch_pending(gpu_id)

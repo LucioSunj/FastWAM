@@ -9,7 +9,7 @@ ckpt: null
 gpu_id: 0
 
 model:
-  load_text_encoder: true
+  load_text_encoder: false
   skip_dit_load_from_pretrain: true
   action_dit_pretrained_path: null
 
@@ -34,14 +34,26 @@ EVALUATION:
   timing_enabled: false
   skip_get_obs_within_replan: true
   force_branch: base  # adaptive models: base (UNCOND) or idm
+  render_every_frame: true
+  eval_video_log: false
+  eval_video_max_episodes: 1
+  clear_cache_freq: 1
+  visualize_future_video: false
+  predicted_video_log_dir: null
+  predicted_video_fps: 8
+  predicted_video_max_episodes: 1
+  predicted_video_max_replans_per_episode: null
 
   # Runtime inputs
   dataset_stats_path: null
   device: cuda
+  text_embedding_cache_dir: /root/autodl-fs/fastwam_text_embeds_cache/robotwin_eval
+  context_len: ${data.train.context_len}
 
 MULTIRUN:
   enabled: false
   num_gpus: 8
+  gpu_offset: 0
   max_tasks_per_gpu: 2
 
 hydra:

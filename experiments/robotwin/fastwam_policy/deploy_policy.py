@@ -1,3 +1,6 @@
+import hashlib
+import io
+import json
 import logging
 import os
 import sys
@@ -30,8 +33,62 @@ from fastwam.adaptive_gate import (
     explicit_eval_branch,
     validate_dataset_stats_fingerprint,
 )
+from fastwam.utils.video_io import save_mp4
 
 logger = logging.getLogger(__name__)
+
+PACKED_CACHE_BIN = "packed_cache.bin"
+PACKED_CACHE_INDEX = "packed_cache.index.jsonl"
+
+
+class PackedTextEmbeddingCache:
+    def __init__(self, cache_dir: Path):
+        self.cache_dir = Path(cache_dir)
+        self.bin_path = self.cache_dir / PACKED_CACHE_BIN
+        self.index_path = self.cache_dir / PACKED_CACHE_INDEX
+        self._index: dict[str, tuple[int, int]] = {}
+        if self.bin_path.exists() and self.index_path.exists():
+            self._load_index()
+
+    @property
+    def available(self) -> bool:
+        return bool(self._index)
+
+    def _load_index(self) -> None:
+        with self.index_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                self._index[str(record["name"])] = (int(record["offset"]), int(record["length"]))
+        logger.info(
+            "Loaded packed text embedding cache: entries=%d bin=%s index=%s",
+            len(self._index),
+            self.bin_path,
+            self.index_path,
+        )
+
+    def get(self, name: str) -> Optional[dict[str, torch.Tensor]]:
+        span = self._index.get(name)
+        if span is None:
+            return None
+        offset, length = span
+        with self.bin_path.open("rb") as f:
+            f.seek(offset)
+            payload_bytes = f.read(length)
+        if len(payload_bytes) != length:
+            raise IOError(
+                f"Packed cache entry {name} is truncated: expected {length} bytes, got {len(payload_bytes)}"
+            )
+        return torch.load(io.BytesIO(payload_bytes), map_location="cpu")
+
+    def source(self, name: str) -> str:
+        span = self._index.get(name)
+        if span is None:
+            return str(self.bin_path)
+        offset, length = span
+        return f"{self.bin_path}:{offset}+{length}"
 
 
 def _is_none_like(value: Any) -> bool:
@@ -133,6 +190,33 @@ def _resolve_dataset_stats_path(dataset_stats_path: Optional[str]) -> Path:
     return resolved
 
 
+def _resolve_text_embedding_cache_dir(text_embedding_cache_dir: Optional[str]) -> Path:
+    if _is_none_like(text_embedding_cache_dir):
+        raise FileNotFoundError(
+            "`text_embedding_cache_dir` is required for RoboTwin FastWAM eval. "
+            "Run experiments/robotwin/precompute_robotwin_text_embeds.py first."
+        )
+    raw_path = Path(os.path.expanduser(os.path.expandvars(str(text_embedding_cache_dir))))
+    if not raw_path.is_absolute():
+        raw_path = (PROJECT_ROOT / raw_path).resolve()
+    resolved = raw_path.resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"Text embedding cache dir not found: {resolved}. "
+            "Run experiments/robotwin/precompute_robotwin_text_embeds.py first."
+        )
+    return resolved
+
+
+def _resolve_optional_output_dir(path_value: Optional[str]) -> Optional[Path]:
+    if _is_none_like(path_value):
+        return None
+    raw_path = Path(os.path.expanduser(os.path.expandvars(str(path_value))))
+    if not raw_path.is_absolute():
+        raw_path = (Path.cwd() / raw_path).resolve()
+    return raw_path.resolve()
+
+
 def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     pil_image = Image.fromarray(image.astype(np.uint8), mode="RGB")
     resized = pil_image.resize(size_wh, resample=Image.BILINEAR)
@@ -159,10 +243,17 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        text_embedding_cache_dir: Path,
+        context_len: int,
+        visualize_future_video: bool,
+        predicted_video_log_dir: Optional[Path],
+        predicted_video_fps: int,
+        predicted_video_max_episodes: Optional[int],
+        predicted_video_max_replans_per_episode: Optional[int],
         force_branch: str = "base",
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
-        model_cfg_copy.load_text_encoder = True
+        model_cfg_copy.load_text_encoder = False
 
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
@@ -184,22 +275,131 @@ class WorldActionRobotWinPolicy:
         self.tiled = bool(tiled)
         self.timing_enabled = bool(timing_enabled)
         self._num_video_frames = int(num_video_frames)
+        self.text_embedding_cache_dir = Path(text_embedding_cache_dir)
+        self._packed_text_cache = PackedTextEmbeddingCache(self.text_embedding_cache_dir)
+        self.context_len = int(context_len)
+        self._text_context_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.visualize_future_video = bool(visualize_future_video)
+        self.predicted_video_log_dir = predicted_video_log_dir
+        self.predicted_video_fps = int(max(1, predicted_video_fps))
+        self.predicted_video_max_episodes = predicted_video_max_episodes
+        self.predicted_video_max_replans_per_episode = predicted_video_max_replans_per_episode
+        if self.visualize_future_video:
+            if self.predicted_video_log_dir is None:
+                self.predicted_video_log_dir = (Path.cwd() / "fastwam_predicted_videos").resolve()
+            self.predicted_video_log_dir.mkdir(parents=True, exist_ok=True)
+
         self.force_branch = str(force_branch)
         # Validate once at construction; vanilla models return an empty mapping.
-        explicit_eval_branch(self.model, "infer_action", self.force_branch)
+        explicit_eval_branch(
+            self.model,
+            "infer_joint" if self.visualize_future_video else "infer_action",
+            self.force_branch,
+            require_video=self.visualize_future_video,
+        )
 
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
+        self.replan_count = 0
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d | text_cache=%s",
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
             self.replan_steps,
+            self.text_embedding_cache_dir,
         )
+
+    def _should_save_predicted_video(self) -> bool:
+        if not self.visualize_future_video or self.predicted_video_log_dir is None:
+            return False
+        episode_idx = max(0, self.episode_count - 1)
+        if self.predicted_video_max_episodes is not None and episode_idx >= self.predicted_video_max_episodes:
+            return False
+        if (
+            self.predicted_video_max_replans_per_episode is not None
+            and self.replan_count >= self.predicted_video_max_replans_per_episode
+        ):
+            return False
+        return True
+
+    def _save_predicted_video_clip(self, frames: list[Image.Image], instruction: str) -> None:
+        if not self._should_save_predicted_video():
+            return
+        if len(frames) == 0:
+            logger.warning("Skip empty predicted future video clip.")
+            return
+
+        assert self.predicted_video_log_dir is not None
+        episode_idx = max(0, self.episode_count - 1)
+        replan_idx = self.replan_count
+        step_idx = self.step_count
+        filename = f"episode{episode_idx:04d}_replan{replan_idx:04d}_step{step_idx:06d}_pred.mp4"
+        video_path = self.predicted_video_log_dir / filename
+        save_mp4(frames, str(video_path), fps=self.predicted_video_fps)
+
+        metadata = {
+            "episode": episode_idx,
+            "replan": replan_idx,
+            "step": step_idx,
+            "num_frames": len(frames),
+            "fps": self.predicted_video_fps,
+            "instruction": instruction,
+        }
+        video_path.with_suffix(".json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        logger.info("Saved FastWAM predicted future video: %s", video_path)
+
+    def _get_cached_text_context(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+        cached = self._text_context_cache.get(prompt)
+        if cached is not None:
+            return cached
+
+        hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        cache_name = f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt"
+        cache_path = self.text_embedding_cache_dir / cache_name
+        payload = self._packed_text_cache.get(cache_name)
+        cache_source = self._packed_text_cache.source(cache_name) if payload is not None else str(cache_path)
+        if payload is None:
+            if not cache_path.exists():
+                raise FileNotFoundError(
+                    f"Missing precomputed text embedding cache: {cache_path} "
+                    f"or packed entry {cache_name} under {self.text_embedding_cache_dir}. "
+                    f"Prompt: {prompt!r}"
+                )
+            payload = torch.load(str(cache_path), map_location="cpu")
+
+        context = payload["context"]
+        context_mask = payload["mask"].bool()
+        if context.ndim != 2:
+            raise ValueError(
+                f"Cached `context` must be 2D [L,D], got {tuple(context.shape)} in {cache_source}"
+            )
+        if context_mask.ndim != 1:
+            raise ValueError(
+                f"Cached `mask` must be 1D [L], got {tuple(context_mask.shape)} in {cache_source}"
+            )
+        if context.shape[0] != self.context_len:
+            raise ValueError(
+                f"Cached context_len mismatch: expected {self.context_len}, got {context.shape[0]} in {cache_source}"
+            )
+        if context_mask.shape[0] != self.context_len:
+            raise ValueError(
+                f"Cached mask_len mismatch: expected {self.context_len}, got {context_mask.shape[0]} in {cache_source}"
+            )
+
+        context = context.detach().to(device="cpu", dtype=torch.bfloat16).contiguous().clone()
+        context_mask = context_mask.detach().to(device="cpu", dtype=torch.bool).contiguous()
+        context[~context_mask] = 0.0
+        context_mask = torch.ones_like(context_mask)
+        cached = (context, context_mask)
+        self._text_context_cache[prompt] = cached
+        return cached
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
         state_meta = self.processor.shape_meta["state"]
@@ -248,8 +448,11 @@ class WorldActionRobotWinPolicy:
         proprio = self._normalize_state(state_vector)
 
         prompt = DEFAULT_PROMPT.format(task=instruction)
+        context, context_mask = self._get_cached_text_context(prompt)
         infer_kwargs = {
-            "prompt": prompt,
+            "prompt": None,
+            "context": context,
+            "context_mask": context_mask,
             "input_image": image_tensor,
             "action_horizon": self.action_horizon,
             "proprio": proprio,
@@ -261,16 +464,28 @@ class WorldActionRobotWinPolicy:
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
-        if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
+        infer_method_name = "infer_joint" if self.visualize_future_video else "infer_action"
+        infer_method = getattr(self.model, infer_method_name)
+        if "num_video_frames" in inspect.signature(infer_method).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
         infer_kwargs.update(
-            explicit_eval_branch(self.model, "infer_action", self.force_branch)
+            explicit_eval_branch(
+                self.model,
+                infer_method_name,
+                self.force_branch,
+                require_video=self.visualize_future_video,
+            )
         )
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
-            pred = self.model.infer_action(**infer_kwargs)
+            pred = infer_method(**infer_kwargs)
         if self.timing_enabled:
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
+        if self.visualize_future_video:
+            pred_video = pred.get("video")
+            if pred_video is None:
+                raise KeyError("`visualize_future_video=true` requires model.infer_joint() to return `video`.")
+            self._save_predicted_video_clip(list(pred_video), instruction=instruction)
 
         action_tensor = pred["action"]  # [T, D]
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
@@ -278,6 +493,7 @@ class WorldActionRobotWinPolicy:
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
+        self.replan_count += 1
         n_exec = min(self.replan_steps, action_chunk.shape[0])
         for i in range(n_exec):
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
@@ -319,6 +535,7 @@ class WorldActionRobotWinPolicy:
     def reset(self) -> None:
         self.pending_actions.clear()
         self.episode_count += 1
+        self.replan_count = 0
         self.step_count = 0
         self.reset_timing_rollout()
 
@@ -348,10 +565,21 @@ def get_model(usr_args: Dict[str, Any]):
 
     mixed_precision = str(usr_args.get("mixed_precision") or cfg.get("mixed_precision", "bf16"))
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
+    model_cfg = OmegaConf.create(OmegaConf.to_container(cfg.model, resolve=True))
+    if not _is_none_like(usr_args.get("load_text_encoder")):
+        model_cfg.load_text_encoder = _parse_bool(usr_args.get("load_text_encoder"))
+    if not _is_none_like(usr_args.get("skip_dit_load_from_pretrain")):
+        model_cfg.skip_dit_load_from_pretrain = _parse_bool(usr_args.get("skip_dit_load_from_pretrain"))
 
     dataset_stats_path = _resolve_dataset_stats_path(
         dataset_stats_path=usr_args.get("dataset_stats_path"),
     )
+    text_embedding_cache_dir = _resolve_text_embedding_cache_dir(
+        usr_args.get("text_embedding_cache_dir", cfg.EVALUATION.get("text_embedding_cache_dir"))
+    )
+    context_len = _parse_optional_int(usr_args.get("context_len"))
+    if context_len is None:
+        context_len = int(cfg.EVALUATION.get("context_len", cfg.data.train.get("context_len", 128)))
 
     action_horizon = _parse_optional_int(usr_args.get("action_horizon"))
     if action_horizon is None:
@@ -381,9 +609,28 @@ def get_model(usr_args: Dict[str, Any]):
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
     force_branch = str(usr_args.get("force_branch", cfg.EVALUATION.get("force_branch", "base")))
+    visualize_future_video = _parse_bool(
+        usr_args.get("visualize_future_video", cfg.EVALUATION.get("visualize_future_video", False))
+    )
+    predicted_video_log_dir = _resolve_optional_output_dir(
+        usr_args.get("predicted_video_log_dir", cfg.EVALUATION.get("predicted_video_log_dir", None))
+    )
+    predicted_video_fps = int(usr_args.get("predicted_video_fps", cfg.EVALUATION.get("predicted_video_fps", 8)))
+    predicted_video_max_episodes = _parse_optional_int(
+        usr_args.get(
+            "predicted_video_max_episodes",
+            cfg.EVALUATION.get("predicted_video_max_episodes", None),
+        )
+    )
+    predicted_video_max_replans_per_episode = _parse_optional_int(
+        usr_args.get(
+            "predicted_video_max_replans_per_episode",
+            cfg.EVALUATION.get("predicted_video_max_replans_per_episode", None),
+        )
+    )
 
     policy = WorldActionRobotWinPolicy(
-        model_cfg=cfg.model,
+        model_cfg=model_cfg,
         processor_cfg=cfg.data.train.processor,
         checkpoint_path=str(checkpoint_path),
         dataset_stats_path=dataset_stats_path,
@@ -401,6 +648,13 @@ def get_model(usr_args: Dict[str, Any]):
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
         force_branch=force_branch,
+        text_embedding_cache_dir=text_embedding_cache_dir,
+        context_len=context_len,
+        visualize_future_video=visualize_future_video,
+        predicted_video_log_dir=predicted_video_log_dir,
+        predicted_video_fps=predicted_video_fps,
+        predicted_video_max_episodes=predicted_video_max_episodes,
+        predicted_video_max_replans_per_episode=predicted_video_max_replans_per_episode,
     )
     return policy
 

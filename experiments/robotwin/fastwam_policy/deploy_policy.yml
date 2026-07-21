@@ -14,6 +14,8 @@ sim_cfg_name: sim_robotwin.yaml
 mixed_precision: bf16
 device: cuda
 dataset_stats_path: null
+load_text_encoder: false
+skip_dit_load_from_pretrain: null
 action_horizon: null
 replan_steps: 8
 num_inference_steps: 10
@@ -24,3 +26,8 @@ rand_device: cpu
 tiled: false
 timing_enabled: false
 skip_get_obs_within_replan: false
+visualize_future_video: false
+predicted_video_log_dir: null
+predicted_video_fps: 8
+predicted_video_max_episodes: 1
+predicted_video_max_replans_per_episode: null

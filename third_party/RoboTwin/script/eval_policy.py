@@ -124,6 +124,15 @@ def main(usr_args):
     args['task_name'] = task_name
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
+    if "eval_video_log" in usr_args:
+        args["eval_video_log"] = parse_bool(usr_args["eval_video_log"])
+    args["eval_video_max_episodes"] = int(
+        usr_args.get("eval_video_max_episodes", args.get("eval_video_max_episodes", 1))
+    )
+    if args["eval_video_max_episodes"] < 0:
+        raise ValueError(
+            f"`eval_video_max_episodes` must be >= 0, got: {args['eval_video_max_episodes']}"
+        )
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -260,6 +269,8 @@ def eval_policy(task_name,
     now_seed = st_seed
     task_total_reward = 0
     clear_cache_freq = args["clear_cache_freq"]
+    eval_video_saved = 0
+    eval_video_max_episodes = int(args.get("eval_video_max_episodes", 1))
 
     args["eval_mode"] = True
 
@@ -303,6 +314,8 @@ def eval_policy(task_name,
 
         try:
             TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+            if TASK_ENV.eval_video_path is not None and eval_video_saved >= eval_video_max_episodes:
+                TASK_ENV.eval_video_path = None
         except UnStableError as e:
             # This seed passed expert_check but failed during rollout env init.
             # Roll back the accepted-seed counter and skip to next seed.
@@ -331,6 +344,7 @@ def eval_policy(task_name,
 
         current_video_path = None
         if TASK_ENV.eval_video_path is not None:
+            eval_video_saved += 1
             episode_idx = TASK_ENV.test_num
             current_video_path = Path(TASK_ENV.eval_video_path) / f"episode{episode_idx}.mp4"
             ffmpeg = subprocess.Popen(
