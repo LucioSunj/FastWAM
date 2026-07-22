@@ -18,10 +18,22 @@ lr_scheduler_type: "cosine"
 learning_rate: 1.0e-4
 num_epochs: 1
 max_steps: null
+# Optional staged-run boundary. The scheduler and checkpoint provenance still
+# use max_steps; this only pauses one process at a successful-step fraction.
+run_until_step_fraction: null
+run_until_step: null
 log_every: 10
 save_every: 100
+# Additional exact successful optimizer steps for weights-only snapshots.
+save_steps: []
+# Converted to successful optimizer steps after the real train sampler is built.
+save_step_fractions: []
 # Diagnostic-only opt-out; production runs retain a final weights/state save.
 save_final_checkpoint: true
+# Probe/formal launchers may retain weights without a DeepSpeed optimizer state.
+save_optimizer_state: true
+# One of: full, action_dit_delta. Deltas bind the exact parent E-I checkpoint.
+weights_checkpoint_kind: full
 eval_every: 50
 eval_num_inference_steps: 10
 eval_sigma_shift: null

@@ -36,6 +36,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pretrained_norm_stats=None,
         val_set_proportion=0.05,
         is_training_set=False,
+        episode_split_manifest: Optional[str] = None,
+        manifest_split: Optional[str] = None,
         global_sample_stride=1,
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
@@ -50,6 +52,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             action_size=num_frames - 1,
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
+            episode_split_manifest=episode_split_manifest,
+            manifest_split=manifest_split,
             global_sample_stride=global_sample_stride,
         )
     

@@ -30,6 +30,8 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         val_set_proportion: float = 0.05, 
         is_training_set: bool = False,
         seed: int = 42,
+        episode_split_manifest: Optional[str] = None,
+        manifest_split: Optional[Literal["train", "validation"]] = None,
 
         # sampling
         global_sample_stride: int = 1,
@@ -86,7 +88,32 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
         episodes = {}
-        if val_set_proportion < 1e-6:
+        if episode_split_manifest is not None:
+            if val_set_proportion >= 1e-6:
+                raise ValueError(
+                    "episode_split_manifest is mutually exclusive with "
+                    "val_set_proportion."
+                )
+            if manifest_split not in {"train", "validation"}:
+                raise ValueError(
+                    "manifest_split must be 'train' or 'validation' when "
+                    "episode_split_manifest is set."
+                )
+            from fastwam.adaptive_gate.sdr_validation import (
+                episodes_for_manifest_split,
+                read_manifest,
+            )
+
+            episodes = episodes_for_manifest_split(
+                dataset_dirs=self.dataset_dirs,
+                manifest=read_manifest(episode_split_manifest),
+                split=manifest_split,
+            )
+        elif manifest_split is not None:
+            raise ValueError(
+                "manifest_split requires episode_split_manifest."
+            )
+        elif val_set_proportion < 1e-6:
             for meta in metas:
                 episodes.update({meta.repo_id: list(range(meta.total_episodes))})
         else:

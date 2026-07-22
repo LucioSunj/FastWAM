@@ -55,6 +55,7 @@ from typing import Any
 import torch
 
 from fastwam.utils.logging_config import get_logger
+from fastwam.adaptive_gate.sdr_preflight import couple_action_noise_draws
 from fastwam.adaptive_gate.training import normalized_dual_regime_action_loss
 
 from .dual_regime_masks import build_multi_regime_attention_mask, merge_action_draft_payloads
@@ -103,7 +104,10 @@ class _FusedDualRegimeTrainingMixin:
             ],
         }
         self._sample_variant_draws(inputs, draws)
-        return draws
+        coupling = getattr(self, "_diagnostic_action_noise_coupling", None)
+        if coupling is None:
+            return draws
+        return couple_action_noise_draws(draws, mode=str(coupling))
 
     def _sample_variant_draws(self, inputs: dict, draws: dict) -> None:
         """Hook for variant-specific extra draws (idm cond branch)."""
@@ -312,6 +316,10 @@ class _FusedDualRegimeTrainingMixin:
         base_contribution = self.loss_lambda_action * base_raw_contribution
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            f"loss_action_{self.main_regime_name}_raw": float(
+                loss_action_main.detach().item()
+            ),
+            "loss_action_uncond_raw": float(loss_action_base.detach().item()),
             f"loss_action_{self.main_regime_name}": float(main_contribution.detach().item()),
             "loss_action_uncond": float(base_contribution.detach().item()),
             "loss_action_combined": self.loss_lambda_action

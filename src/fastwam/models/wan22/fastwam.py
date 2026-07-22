@@ -1181,7 +1181,7 @@ class FastWAM(torch.nn.Module):
             tiled=tiled,
         )
 
-    def save_checkpoint(self, path, optimizer=None, step=None):
+    def _checkpoint_provenance(self):
         import uuid
 
         adaptive_regimes = tuple(getattr(self, "adaptive_regimes", ()))
@@ -1253,17 +1253,43 @@ class FastWAM(torch.nn.Module):
                 if warm_start is None
                 else warm_start.get("parent_dataset_stats_sha256")
             )
+        return provenance
+
+    def save_checkpoint(self, path, optimizer=None, step=None):
         payload = {
             "mot": self.mot.state_dict(),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
-            "fastwam_provenance": provenance,
+            "fastwam_provenance": FastWAM._checkpoint_provenance(self),
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
+
+    def save_action_dit_delta(self, path, step=None):
+        provenance = FastWAM._checkpoint_provenance(self)
+        parent_sha = provenance.get("parent_checkpoint_sha256")
+        if (
+            not isinstance(parent_sha, str)
+            or len(parent_sha) != 64
+            or any(char not in "0123456789abcdef" for char in parent_sha)
+        ):
+            raise ValueError(
+                "ActionDiT delta requires an exact parent_checkpoint_sha256."
+            )
+        torch.save(
+            {
+                "schema": "fastwam-action-dit-delta-v1",
+                "step": step,
+                "torch_dtype": str(self.torch_dtype),
+                "parent_checkpoint_sha256": parent_sha,
+                "action_expert": self.action_expert.state_dict(),
+                "fastwam_provenance": provenance,
+            },
+            path,
+        )
 
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu", weights_only=False)

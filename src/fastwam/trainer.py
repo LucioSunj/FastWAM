@@ -124,9 +124,62 @@ class Wan22Trainer:
         self.num_epochs = int(cfg.num_epochs)
         max_steps = cfg.max_steps
         self.max_steps = int(max_steps) if max_steps is not None else None
+        raw_run_until_step = cfg.get("run_until_step")
+        self.requested_run_until_step = (
+            int(raw_run_until_step)
+            if raw_run_until_step is not None
+            else None
+        )
+        raw_run_until_fraction = cfg.get("run_until_step_fraction")
+        self.run_until_step_fraction = (
+            float(raw_run_until_fraction)
+            if raw_run_until_fraction is not None
+            else None
+        )
+        if (
+            self.requested_run_until_step is not None
+            and self.run_until_step_fraction is not None
+        ):
+            raise ValueError(
+                "run_until_step and run_until_step_fraction are mutually exclusive."
+            )
+        if (
+            self.requested_run_until_step is not None
+            and self.requested_run_until_step <= 0
+        ):
+            raise ValueError("run_until_step must be a positive integer.")
+        if self.run_until_step_fraction is not None and not (
+            0.0 < self.run_until_step_fraction <= 1.0
+        ):
+            raise ValueError("run_until_step_fraction must be in (0, 1].")
         self.log_every = int(cfg.log_every)
         self.save_every = int(cfg.save_every)
+        raw_save_steps = cfg.get("save_steps", ())
+        self.save_steps = {
+            int(step) for step in (raw_save_steps or ())
+        }
+        if any(step <= 0 for step in self.save_steps):
+            raise ValueError("save_steps must contain only positive integers.")
+        self.save_step_fractions = tuple(
+            float(fraction)
+            for fraction in (cfg.get("save_step_fractions", ()) or ())
+        )
+        if any(
+            not 0.0 < fraction < 1.0
+            for fraction in self.save_step_fractions
+        ):
+            raise ValueError(
+                "save_step_fractions must be strictly between 0 and 1."
+            )
         self.save_final_checkpoint = bool(cfg.get("save_final_checkpoint", True))
+        self.save_optimizer_state = bool(cfg.get("save_optimizer_state", True))
+        self.weights_checkpoint_kind = str(
+            cfg.get("weights_checkpoint_kind", "full")
+        )
+        if self.weights_checkpoint_kind not in {"full", "action_dit_delta"}:
+            raise ValueError(
+                "weights_checkpoint_kind must be 'full' or 'action_dit_delta'."
+            )
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
@@ -145,6 +198,13 @@ class Wan22Trainer:
             tuple(getattr(model, "adaptive_regimes", ())) == ("uncond", "idm")
             and getattr(model, "adaptive_backbone_kind", None) == "idm"
         )
+        if (
+            self.weights_checkpoint_kind == "action_dit_delta"
+            and not self.is_dual_regime
+        ):
+            raise ValueError(
+                "ActionDiT deltas are only supported for dual-regime training."
+            )
         dual_cfg = cfg.get("dual_regime_training") or {}
         if isinstance(dual_cfg, DictConfig):
             dual_cfg = OmegaConf.to_container(dual_cfg, resolve=True)
@@ -258,6 +318,30 @@ class Wan22Trainer:
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
         self.max_steps = total_train_steps
+        if self.requested_run_until_step is not None:
+            self.run_until_step = self.requested_run_until_step
+        elif self.run_until_step_fraction is not None:
+            self.run_until_step = max(
+                1,
+                int(math.ceil(self.run_until_step_fraction * self.max_steps)),
+            )
+        else:
+            self.run_until_step = self.max_steps
+        if self.run_until_step > self.max_steps:
+            raise ValueError(
+                "run_until_step cannot exceed the contracted total optimizer "
+                f"steps: {self.run_until_step} > {self.max_steps}."
+            )
+        self.save_steps.update(
+            max(
+                1,
+                min(
+                    self.max_steps - 1,
+                    int(math.ceil(fraction * self.max_steps)),
+                ),
+            )
+            for fraction in self.save_step_fractions
+        )
         schedule_points = self.dual_regime_cfg.get("uncond_weight_schedule")
         if self.is_dual_regime:
             if schedule_points is None:
@@ -312,6 +396,9 @@ class Wan22Trainer:
         ensure_dir(self.weights_dir)
         ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
+        self.training_metrics_path = os.path.join(
+            self.output_dir, "training_metrics.jsonl"
+        )
 
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, self.train_loader, self.scheduler
@@ -328,6 +415,11 @@ class Wan22Trainer:
             unwrapped, "warm_start_provenance", self.warm_start_provenance
         )
         self._validate_loaded_training_contract(unwrapped)
+        if self.global_step > self.run_until_step:
+            raise ValueError(
+                "Loaded training state is already beyond this staged boundary: "
+                f"global_step={self.global_step}, run_until_step={self.run_until_step}."
+            )
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
@@ -356,6 +448,14 @@ class Wan22Trainer:
             self.cfg.wandb.project,
             self.cfg.wandb.name,
         )
+
+    def _append_training_metrics(self, payload: dict) -> None:
+        if not self.accelerator.is_main_process:
+            return
+        with open(self.training_metrics_path, "a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(payload, sort_keys=True, allow_nan=False) + "\n"
+            )
 
     def _wandb_log(self, payload: dict):
         if self.wandb_run is None:
@@ -814,8 +914,16 @@ class Wan22Trainer:
                 "Adaptive checkpoint provenance requires training dataset stats at "
                 f"{stats_path}."
             )
-        ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
-        model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
+        suffix = (
+            ".action_dit_delta.pt"
+            if self.weights_checkpoint_kind == "action_dit_delta"
+            else ".pt"
+        )
+        ckpt_path = os.path.join(self.weights_dir, f"{step_tag}{suffix}")
+        if self.weights_checkpoint_kind == "action_dit_delta":
+            model.save_action_dit_delta(ckpt_path, step=self.global_step)
+        else:
+            model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
         return ckpt_path
 
     def _save_trainer_state(self, state_path: str):
@@ -848,12 +956,14 @@ class Wan22Trainer:
             ckpt_path = self._save_weights_checkpoint(step_tag=step_tag)
         self.accelerator.wait_for_everyone()
 
-        state_path = os.path.join(self.state_dir, step_tag)
-        ensure_dir(state_path)
-        self.accelerator.save_state(output_dir=state_path)
-        if self.accelerator.is_main_process:
-            self._save_trainer_state(state_path)
-        self.accelerator.wait_for_everyone()
+        state_path = None
+        if self.save_optimizer_state:
+            state_path = os.path.join(self.state_dir, step_tag)
+            ensure_dir(state_path)
+            self.accelerator.save_state(output_dir=state_path)
+            if self.accelerator.is_main_process:
+                self._save_trainer_state(state_path)
+            self.accelerator.wait_for_everyone()
 
         return {"weights_path": ckpt_path, "state_path": state_path}
 
@@ -891,7 +1001,8 @@ class Wan22Trainer:
             if "epoch" in payload and "batch_in_epoch" in payload:
                 self.epoch = int(payload["epoch"])
                 self.batch_in_epoch = int(payload["batch_in_epoch"])
-                self.train_sampler.set_epoch_offset(self.epoch)
+                self.train_sampler.set_epoch(self.epoch)
+                self.train_sampler.set_epoch_offset(0)
                 self.train_sampler.set_resume_batch_offset(self.batch_in_epoch)
                 logger.info(
                     "Restored dataloader progress: epoch=%d batch_in_epoch=%d sample_offset=%d",
@@ -1023,18 +1134,24 @@ class Wan22Trainer:
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
 
-        logger.info("Starting training with max_steps=%d.", self.max_steps)
+        logger.info(
+            "Starting training with max_steps=%d run_until_step=%d.",
+            self.max_steps,
+            self.run_until_step,
+        )
         data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
+        self.last_successful_step_time = self.run_start_time
 
-        while self.global_step < self.max_steps:
+        while self.global_step < self.run_until_step:
             try:
                 sample = next(data_iter)
                 self.batch_in_epoch += 1
             except StopIteration:
                 self.epoch += 1
                 self.batch_in_epoch = 0
+                self.train_sampler.set_epoch(self.epoch)
                 self.train_sampler.clear_resume_batch_offset()
                 data_iter = iter(self.train_loader)
                 continue
@@ -1121,6 +1238,57 @@ class Wan22Trainer:
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
+                    finite_values = [
+                        global_loss,
+                        global_grad_norm,
+                        current_lr,
+                        *global_loss_metrics.values(),
+                    ]
+                    if not all(math.isfinite(value) for value in finite_values):
+                        raise FloatingPointError(
+                            "Non-finite training metric detected after optimizer step."
+                        )
+                    metric_time = time.perf_counter()
+                    step_duration_seconds = (
+                        metric_time - self.last_successful_step_time
+                    )
+                    self.last_successful_step_time = metric_time
+                    self._append_training_metrics(
+                        {
+                            "schema": "fastwam-training-metric-v1",
+                            "epoch": int(self.epoch),
+                            "global_step": int(self.global_step),
+                            "dual_regime_optimizer_steps": int(
+                                self.dual_regime_optimizer_steps
+                            ),
+                            "loss": global_loss,
+                            "losses": global_loss_metrics,
+                            "grad_norm_before_clip": global_grad_norm,
+                            "gradient_clipped": bool(
+                                global_grad_norm > self.max_grad_norm
+                            ),
+                            "max_grad_norm": self.max_grad_norm,
+                            "learning_rate": current_lr,
+                            "elapsed_seconds": float(
+                                metric_time - self.run_start_time
+                            ),
+                            "step_duration_seconds": float(
+                                step_duration_seconds
+                            ),
+                            "samples_per_second": float(
+                                self.batch_size
+                                * self.accelerator.num_processes
+                                * self.gradient_accumulation_steps
+                                / max(step_duration_seconds, 1e-12)
+                            ),
+                            "peak_gpu_memory_bytes": (
+                                int(torch.cuda.max_memory_allocated())
+                                if torch.cuda.is_available()
+                                else 0
+                            ),
+                            "optimizer_step_was_skipped": False,
+                        }
+                    )
 
                     periodic_log = self.log_every > 0 and self.global_step % self.log_every == 0
                     if (periodic_log or diagnostic_metrics) and self.accelerator.is_main_process:
@@ -1191,7 +1359,11 @@ class Wan22Trainer:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
                             self._wandb_log(eval_payload)
 
-                    if self.save_every > 0 and self.global_step % self.save_every == 0:
+                    periodic_save = (
+                        self.save_every > 0
+                        and self.global_step % self.save_every == 0
+                    )
+                    if periodic_save or self.global_step in self.save_steps:
                         ckpt_info = self.save_checkpoint()
                         if self.accelerator.is_main_process:
                             logger.info(
@@ -1201,8 +1373,13 @@ class Wan22Trainer:
                                 ckpt_info["state_path"],
                             )
 
-                    if self.global_step >= self.max_steps:
-                        self._finish_training("max_steps reached")
+                    if self.global_step >= self.run_until_step:
+                        reason = (
+                            "max_steps reached"
+                            if self.global_step >= self.max_steps
+                            else "run_until_step reached"
+                        )
+                        self._finish_training(reason)
                         return
 
         self._finish_training("training finished")

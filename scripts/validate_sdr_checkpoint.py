@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate completed S-DR checkpoints and register the two-LR pilot choice."""
+"""Validate completed S-DR checkpoints and register canonical selections."""
 from __future__ import annotations
 
 import argparse
@@ -11,10 +11,18 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from fastwam.adaptive_gate.provenance import dual_regime_schedule_fingerprint
+from fastwam.adaptive_gate.sdr_contracts import (
+    FORMAL_TRAINING_DECISION_SCHEMA,
+    artifact_record,
+    validate_formal_training_contract,
+    validate_learning_probe_contract,
+    validate_stage_decision,
+)
 
 
 SCHEMA = "fastwam-sdr-completion-v1"
 SELECTION_SCHEMA = "fastwam-sdr-pilot-selection-v1"
+SINGLE_FORMAL_SELECTION_SCHEMA = "fastwam-sdr-single-formal-selection-v1"
 CANONICAL_UNCOND_WEIGHT_SCHEDULE = (
     (0.0, 0.05),
     (0.1, 0.05),
@@ -57,7 +65,11 @@ def _is_sha256(value: object) -> bool:
     )
 
 
-def _validate_schedule_provenance(provenance: Mapping[str, Any]) -> Mapping[str, Any]:
+def _validate_schedule_provenance(
+    provenance: Mapping[str, Any],
+    *,
+    expected_schedule: tuple[tuple[float, float], ...] = CANONICAL_UNCOND_WEIGHT_SCHEDULE,
+) -> Mapping[str, Any]:
     contract = provenance.get("dual_regime_training_contract")
     if not isinstance(contract, Mapping):
         raise ValueError("S-DR checkpoint lacks its training contract")
@@ -66,10 +78,10 @@ def _validate_schedule_provenance(provenance: Mapping[str, Any]) -> Mapping[str,
         schedule = tuple(tuple(float(value) for value in point) for point in raw_schedule)
     except (TypeError, ValueError) as exc:
         raise ValueError("S-DR checkpoint has an invalid UNCOND weight schedule") from exc
-    if schedule != CANONICAL_UNCOND_WEIGHT_SCHEDULE:
+    if schedule != expected_schedule:
         raise ValueError(
             "S-DR checkpoint does not use the preregistered UNCOND schedule: "
-            f"expected={CANONICAL_UNCOND_WEIGHT_SCHEDULE}, observed={schedule}"
+            f"expected={expected_schedule}, observed={schedule}"
         )
     expected_fingerprint = dual_regime_schedule_fingerprint(contract)
     if provenance.get("schedule_fingerprint") != expected_fingerprint:
@@ -107,7 +119,23 @@ def validate(args: argparse.Namespace) -> None:
         raise ValueError("S-DR checkpoint must use the IDM backbone")
     if provenance.get("initialization_type") != "standalone_idm":
         raise ValueError("S-DR checkpoint was not initialized from standalone E-I")
-    contract = _validate_schedule_provenance(provenance)
+    preflight_path = getattr(args, "preflight_decision", None)
+    if preflight_path:
+        preflight = validate_learning_probe_contract(read_json(preflight_path))
+        expected_schedule = tuple(
+            tuple(float(value) for value in point)
+            for point in preflight["schedule"]
+        )
+        expected_final_weight = float(preflight["w_cap"])
+        contract_kind = "single_formal_run"
+    else:
+        expected_schedule = CANONICAL_UNCOND_WEIGHT_SCHEDULE
+        expected_final_weight = 1.0
+        contract_kind = "legacy_two_lr_pilot"
+    contract = _validate_schedule_provenance(
+        provenance,
+        expected_schedule=expected_schedule,
+    )
     dual_steps = provenance.get("dual_regime_optimizer_steps")
     total_steps = contract.get("total_optimizer_steps")
     if (
@@ -123,8 +151,14 @@ def validate(args: argparse.Namespace) -> None:
             f"dual={dual_steps!r}, contracted={total_steps!r}"
         )
     final_weight = float(provenance.get("action_regime_weight_uncond", float("nan")))
-    if not math.isfinite(final_weight) or abs(final_weight - 1.0) > 1e-9:
-        raise ValueError(f"final S-DR UNCOND loss weight is not 1.0: {final_weight}")
+    if (
+        not math.isfinite(final_weight)
+        or abs(final_weight - expected_final_weight) > 1e-9
+    ):
+        raise ValueError(
+            "final S-DR UNCOND loss weight does not match its contract: "
+            f"expected={expected_final_weight}, observed={final_weight}"
+        )
     stats_sha = sha256_file(stats_path)
     if provenance.get("dataset_stats_fingerprint") != stats_sha:
         raise ValueError("S-DR checkpoint and dataset_stats.json do not match")
@@ -171,6 +205,7 @@ def validate(args: argparse.Namespace) -> None:
         "dual_regime_optimizer_steps": dual_steps,
         "total_optimizer_steps": total_steps,
         "base_learning_rate": expected_lr,
+        "training_contract_kind": contract_kind,
         "resolved_config": str(config_path),
         "resolved_config_sha256": sha256_file(config_path),
         "dataset_stats": str(stats_path),
@@ -214,8 +249,137 @@ def select(args: argparse.Namespace) -> None:
     atomic_json(args.out, result)
 
 
+def register_formal(args: argparse.Namespace) -> None:
+    preflight_path = Path(args.preflight_decision).expanduser().resolve()
+    probe_path = Path(args.learning_probe_decision).expanduser().resolve()
+    formal_path = Path(args.formal_training_decision).expanduser().resolve()
+    lineage_path = Path(args.lineage_manifest).expanduser().resolve()
+    for path in (preflight_path, probe_path, formal_path, lineage_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    preflight = read_json(preflight_path)
+    probe = read_json(probe_path)
+    formal = read_json(formal_path)
+    lineage = read_json(lineage_path)
+    contract = validate_formal_training_contract(
+        preflight_decision=preflight,
+        learning_probe_decision=probe,
+        lineage_manifest=lineage,
+    )
+    validate_stage_decision(
+        formal,
+        expected_schema=FORMAL_TRAINING_DECISION_SCHEMA,
+        expected_bindings=contract["artifact_bindings"],
+    )
+    checkpoint = Path(args.checkpoint).expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    checkpoint_record = artifact_record(checkpoint)
+    expected_checkpoint = formal.get("final_checkpoint")
+    if not isinstance(expected_checkpoint, Mapping):
+        raise ValueError("Formal decision has no final_checkpoint record.")
+    if (
+        Path(str(expected_checkpoint.get("path", ""))).expanduser().resolve()
+        != checkpoint
+        or expected_checkpoint.get("sha256") != checkpoint_record["sha256"]
+    ):
+        raise ValueError(
+            "Formal decision does not bind the exact preregistered final checkpoint."
+        )
+    artifact_kind = str(formal.get("final_checkpoint_kind", ""))
+    if artifact_kind not in {"full_weights", "action_dit_delta"}:
+        raise ValueError("Unknown formal final_checkpoint_kind.")
+    result = {
+        "schema": SINGLE_FORMAL_SELECTION_SCHEMA,
+        "status": "PASS",
+        "selection_basis": "preregistered_final",
+        "plus_full_used": False,
+        "selected_checkpoint": str(checkpoint),
+        "selected_checkpoint_sha256": checkpoint_record["sha256"],
+        "selected_checkpoint_kind": artifact_kind,
+        "parent_e_i_checkpoint_sha256": contract["artifact_bindings"][
+            "e_i_checkpoint"
+        ],
+        "evidence": {
+            "preflight_decision": artifact_record(preflight_path),
+            "learning_probe_decision": artifact_record(probe_path),
+            "formal_training_decision": artifact_record(formal_path),
+            "lineage_manifest": artifact_record(lineage_path),
+        },
+        "artifact_bindings": {
+            name: {"sha256": sha}
+            for name, sha in contract["artifact_bindings"].items()
+        },
+    }
+    atomic_json(args.out, result)
+
+
+def _check_single_formal(
+    selection: Mapping[str, Any],
+    *,
+    checkpoint: Path,
+) -> None:
+    if selection.get("status") != "PASS":
+        raise ValueError("Single formal S-DR selection is not PASS.")
+    if selection.get("selection_basis") != "preregistered_final":
+        raise ValueError("Single formal selection must use the preregistered final.")
+    if selection.get("plus_full_used") is not False:
+        raise ValueError("Single formal selection must state plus_full_used=false.")
+    actual = sha256_file(checkpoint)
+    if (
+        checkpoint != Path(str(selection.get("selected_checkpoint", ""))).resolve()
+        or actual != selection.get("selected_checkpoint_sha256")
+    ):
+        raise ValueError("Configured SHARED_CKPT is not the registered formal final.")
+    evidence = selection.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise ValueError("Single formal selection has no evidence mapping.")
+    payloads = {}
+    for name in (
+        "preflight_decision",
+        "learning_probe_decision",
+        "formal_training_decision",
+        "lineage_manifest",
+    ):
+        record = evidence.get(name)
+        if not isinstance(record, Mapping):
+            raise ValueError(f"Single formal selection is missing {name}.")
+        path = Path(str(record.get("path", ""))).expanduser().resolve()
+        if not path.is_file() or sha256_file(path) != record.get("sha256"):
+            raise ValueError(f"Single formal evidence changed: {name}={path}.")
+        payloads[name] = read_json(path)
+    contract = validate_formal_training_contract(
+        preflight_decision=payloads["preflight_decision"],
+        learning_probe_decision=payloads["learning_probe_decision"],
+        lineage_manifest=payloads["lineage_manifest"],
+    )
+    validate_stage_decision(
+        payloads["formal_training_decision"],
+        expected_schema=FORMAL_TRAINING_DECISION_SCHEMA,
+        expected_bindings=contract["artifact_bindings"],
+    )
+    formal_final = payloads["formal_training_decision"].get("final_checkpoint")
+    if (
+        not isinstance(formal_final, Mapping)
+        or Path(str(formal_final.get("path", ""))).resolve() != checkpoint
+        or formal_final.get("sha256") != actual
+    ):
+        raise ValueError("Formal evidence no longer binds the selected checkpoint.")
+    if selection.get("parent_e_i_checkpoint_sha256") != contract[
+        "artifact_bindings"
+    ].get("e_i_checkpoint"):
+        raise ValueError("Single formal selection parent E-I SHA changed.")
+    print(json.dumps({"status": "PASS", "checkpoint_sha256": actual}, sort_keys=True))
+
+
 def check(args: argparse.Namespace) -> None:
     selection = read_json(args.selection)
+    checkpoint = Path(args.checkpoint).expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(checkpoint)
+    if selection.get("schema") == SINGLE_FORMAL_SELECTION_SCHEMA:
+        _check_single_formal(selection, checkpoint=checkpoint)
+        return
     if selection.get("schema") != SELECTION_SCHEMA or selection.get("status") != "PASS":
         raise ValueError("shared checkpoint requires a PASS two-LR pilot selection")
     if not str(selection.get("selection_basis", "")).strip():
@@ -241,9 +405,6 @@ def check(args: argparse.Namespace) -> None:
         != selection.get("selected_checkpoint_step")
     ):
         raise ValueError("shared checkpoint selection disagrees with its pilot evidence")
-    checkpoint = Path(args.checkpoint).expanduser().resolve()
-    if not checkpoint.is_file():
-        raise FileNotFoundError(checkpoint)
     actual = sha256_file(checkpoint)
     expected = selection.get("selected_checkpoint_sha256")
     if actual != expected or checkpoint != Path(selection["selected_checkpoint"]).resolve():
@@ -271,6 +432,7 @@ def parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--resolved-config", required=True)
     validate_parser.add_argument("--dataset-stats", required=True)
     validate_parser.add_argument("--expected-base-lr", type=float, required=True)
+    validate_parser.add_argument("--preflight-decision")
     validate_parser.add_argument("--out", required=True)
     validate_parser.set_defaults(func=validate)
     select_parser = sub.add_parser("select")
@@ -279,6 +441,14 @@ def parser() -> argparse.ArgumentParser:
     select_parser.add_argument("--selection-basis", required=True)
     select_parser.add_argument("--out", required=True)
     select_parser.set_defaults(func=select)
+    formal_parser = sub.add_parser("register-formal")
+    formal_parser.add_argument("--checkpoint", required=True)
+    formal_parser.add_argument("--preflight-decision", required=True)
+    formal_parser.add_argument("--learning-probe-decision", required=True)
+    formal_parser.add_argument("--formal-training-decision", required=True)
+    formal_parser.add_argument("--lineage-manifest", required=True)
+    formal_parser.add_argument("--out", required=True)
+    formal_parser.set_defaults(func=register_formal)
     check_parser = sub.add_parser("check-selection")
     check_parser.add_argument("--selection", required=True)
     check_parser.add_argument("--checkpoint", required=True)
