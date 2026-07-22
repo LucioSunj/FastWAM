@@ -30,8 +30,10 @@ not be silently substituted for this file.
 
 This archive upgrades the earlier config reconstruction with direct
 user-provided metadata. It is not, by itself, a cryptographic proof that the
-checkpoint was produced from these files: the original run manifest, world
-size/launcher record, Wan-Robot base config, and an end-to-end lineage manifest
-were not supplied with these two attachments. Any strict training gate should
-record that distinction rather than relabel this archive as independently
-verified provenance.
+checkpoint was produced from these files: the original run manifest and
+world-size/launcher record were not supplied with these two attachments. The
+user subsequently clarified that this E-I was initialized from the original
+`Wan-AI/Wan2.2-TI2V-5B` video/VAE components plus the recorded ActionDiT
+initializer, not from Wan-Robot. A continuation manifest may therefore bind
+the exact local parent components and record that parent relation as
+user-attested, but must not relabel it as training-emitted provenance.

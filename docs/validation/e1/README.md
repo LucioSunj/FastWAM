@@ -30,9 +30,12 @@ config confirms per-process batch 16, gradient accumulation 1, learning rate
 `1e-4`, 10 epochs, BF16, seed 42, and mixed-attention gradient checkpointing.
 It does not record world size; global batch 64 would imply four processes. The
 supplied stats have the same 1,712-episode/277,713-transition counts but a
-different hash from the earlier UNCOND-named candidate. These files materially
-improve the E-I record, but without the original run/lineage manifest and base
-config they do not independently prove checkpoint ancestry.
+different hash from the earlier UNCOND-named candidate. The user also clarified
+that the parent was original `Wan-AI/Wan2.2-TI2V-5B` plus the configured
+ActionDiT initializer, not Wan-Robot. Exact local parent artifacts can be hash
+bound for continuation, but without the original training-emitted run/lineage
+manifest the parent relation remains user-attested rather than independently
+proven.
 
 The subsequent smoke run used the real fused task, real LIBERO 33-frame
 two-camera 224x448 input, BF16, DeepSpeed ZeRO-1, and the accepted E-I warm

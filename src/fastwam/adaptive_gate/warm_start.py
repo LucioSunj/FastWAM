@@ -102,6 +102,18 @@ def _task_family(task: str) -> str:
     return family
 
 
+def _architecture_value(config: Mapping[str, Any], key: str) -> Any:
+    value = config.get(key)
+    if key in {"video_dit_config", "action_dit_config"} and isinstance(
+        value, Mapping
+    ):
+        value = dict(value)
+        # Activation checkpointing changes memory/compute, not parameter schema
+        # or forward numerics, and may legitimately differ at continuation time.
+        value.pop("use_gradient_checkpointing", None)
+    return value
+
+
 def strict_standalone_idm_warm_start(
     model,
     config: Any,
@@ -183,9 +195,13 @@ def strict_standalone_idm_warm_start(
             f"{configured_source_task!r} != {source_task!r}."
         )
     architecture_mismatches = {
-        key: (source_model_cfg.get(key), target_model_cfg.get(key))
+        key: (
+            _architecture_value(source_model_cfg, key),
+            _architecture_value(target_model_cfg, key),
+        )
         for key in _ARCHITECTURE_KEYS
-        if source_model_cfg.get(key) != target_model_cfg.get(key)
+        if _architecture_value(source_model_cfg, key)
+        != _architecture_value(target_model_cfg, key)
     }
     if architecture_mismatches:
         raise ValueError(

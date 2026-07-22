@@ -7,7 +7,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 parse_launcher_args "$@"
 
 for name in \
-    WAN_ROBOT_BASE_CKPT WAN_ROBOT_BASE_CONFIG E_I_CKPT E_I_CONFIG \
+    E_I_BASE_MODEL_MANIFEST E_I_CKPT E_I_CONFIG \
     E_I_LINEAGE_MANIFEST DATASET_STATS WARMSTART_DECISION SDR_VAL_MANIFEST \
     SDR_PREFLIGHT_DECISION; do
     require_env "${name}"
@@ -15,8 +15,7 @@ for name in \
 done
 
 run_command python scripts/sdr_stage_contract.py check-lineage \
-    --wan-robot-base-checkpoint "${WAN_ROBOT_BASE_CKPT}" \
-    --wan-robot-base-config "${WAN_ROBOT_BASE_CONFIG}" \
+    --base-model-manifest "${E_I_BASE_MODEL_MANIFEST}" \
     --e-i-checkpoint "${E_I_CKPT}" \
     --e-i-config "${E_I_CONFIG}" \
     --dataset-stats "${DATASET_STATS}" \

@@ -16,12 +16,11 @@ def _bindings():
     return {
         name: {"path": f"/immutable/{name}", "sha256": char * 64}
         for name, char in (
-            ("wan_robot_base_checkpoint", "a"),
-            ("wan_robot_base_config", "b"),
-            ("e_i_checkpoint", "c"),
-            ("e_i_config", "d"),
-            ("dataset_stats", "e"),
-            ("validation_manifest", "f"),
+            ("base_model_manifest", "a"),
+            ("e_i_checkpoint", "b"),
+            ("e_i_config", "c"),
+            ("dataset_stats", "d"),
+            ("validation_manifest", "e"),
             ("solver_contract", "1"),
             ("code_commit", "2"),
         )
@@ -51,7 +50,7 @@ def test_learning_probe_contract_accepts_locked_schedule_and_bindings():
 
     assert result["w0"] == 0.05
     assert result["w_cap"] == 0.5
-    assert result["artifact_bindings"]["e_i_checkpoint"] == "c" * 64
+    assert result["artifact_bindings"]["e_i_checkpoint"] == "b" * 64
 
 
 @pytest.mark.parametrize(
@@ -77,8 +76,7 @@ def test_lineage_audit_is_not_run_when_training_artifacts_are_missing(tmp_path):
     checkpoint.write_bytes(b"checkpoint")
 
     result = audit_e_i_lineage_inputs(
-        wan_robot_base_checkpoint=None,
-        wan_robot_base_config=None,
+        base_model_manifest=None,
         e_i_checkpoint=checkpoint,
         e_i_config=None,
         dataset_stats=None,

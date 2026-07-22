@@ -301,6 +301,8 @@ def test_strict_standalone_idm_warm_start_imports_only_verified_weights(tmp_path
     source_config = _architecture_config(
         "fastwam.runtime.create_fastwam_idm", source_task
     )
+    source_config["video_dit_config"]["use_gradient_checkpointing"] = True
+    source_config["action_dit_config"]["use_gradient_checkpointing"] = True
     source_config_path = tmp_path / "source_config.yaml"
     OmegaConf.save(OmegaConf.create({"model": source_config}), source_config_path)
     checkpoint_path = tmp_path / "standalone_idm.pt"
@@ -335,6 +337,8 @@ def test_strict_standalone_idm_warm_start_imports_only_verified_weights(tmp_path
         "source_dataset_stats": str(stats_path),
     }
     target_config = _architecture_config("unused.target", target.checkpoint_task)
+    target_config["video_dit_config"]["use_gradient_checkpointing"] = False
+    target_config["action_dit_config"]["use_gradient_checkpointing"] = False
     record = strict_standalone_idm_warm_start(
         target,
         warm_config,

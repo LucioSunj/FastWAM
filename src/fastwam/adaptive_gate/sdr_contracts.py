@@ -11,17 +11,25 @@ from typing import Any
 from .provenance import sha256_file
 
 
-E_I_LINEAGE_SCHEMA = "fastwam-ei-lineage-v1"
+E_I_LINEAGE_SCHEMA = "fastwam-ei-lineage-v2"
+ORIGINAL_WAN_BASE_SCHEMA = "fastwam-original-wan-base-v1"
 PREFLIGHT_DECISION_SCHEMA = "fastwam-sdr-preflight-decision-v1"
 LEARNING_PROBE_DECISION_SCHEMA = "fastwam-sdr-learning-probe-decision-v1"
 FORMAL_TRAINING_DECISION_SCHEMA = "fastwam-sdr-formal-training-decision-v1"
 
 E_I_ARTIFACT_NAMES = (
-    "wan_robot_base_checkpoint",
-    "wan_robot_base_config",
+    "base_model_manifest",
     "e_i_checkpoint",
     "e_i_config",
     "dataset_stats",
+)
+ORIGINAL_WAN_COMPONENT_NAMES = (
+    "wan_video_dit_index",
+    "wan_video_dit_shard_1",
+    "wan_video_dit_shard_2",
+    "wan_video_dit_shard_3",
+    "wan_video_vae",
+    "action_dit_initial_checkpoint",
 )
 
 
@@ -74,23 +82,60 @@ def _validated_record(name: str, value: object) -> dict[str, Any]:
     }
 
 
+def _validate_original_wan_base_manifest(
+    manifest_path: str | os.PathLike[str],
+) -> dict[str, dict[str, Any]]:
+    manifest = read_json(manifest_path)
+    if manifest.get("schema") != ORIGINAL_WAN_BASE_SCHEMA:
+        raise ValueError(
+            "Unsupported original-Wan base schema: "
+            f"{manifest.get('schema')!r}."
+        )
+    if manifest.get("status") != "PASS":
+        raise ValueError("Original-Wan base manifest is not PASS.")
+    if manifest.get("model_id") != "Wan-AI/Wan2.2-TI2V-5B":
+        raise ValueError("Original-Wan base manifest has the wrong model_id.")
+    if manifest.get("plus_full_used") is not False:
+        raise ValueError("Original-Wan base manifest must state plus_full_used=false.")
+    raw_components = manifest.get("artifacts")
+    if not isinstance(raw_components, Mapping):
+        raise ValueError("Original-Wan base manifest has no artifacts mapping.")
+    if set(raw_components) != set(ORIGINAL_WAN_COMPONENT_NAMES):
+        raise ValueError(
+            "Original-Wan base component names must be exactly "
+            f"{list(ORIGINAL_WAN_COMPONENT_NAMES)}, got {sorted(raw_components)}."
+        )
+    return {
+        name: _validated_record(name, raw_components[name])
+        for name in ORIGINAL_WAN_COMPONENT_NAMES
+    }
+
+
 def validate_e_i_lineage_manifest(
     manifest: Mapping[str, Any],
     *,
     expected_paths: Mapping[str, str | os.PathLike[str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Verify training-emitted Wan-Robot to LIBERO E-I provenance."""
+    """Verify the user-confirmed original-Wan to LIBERO E-I artifact chain."""
     if manifest.get("schema") != E_I_LINEAGE_SCHEMA:
         raise ValueError(
             f"Unsupported E-I lineage schema: {manifest.get('schema')!r}."
         )
     if manifest.get("status") != "PASS":
         raise ValueError("E-I lineage manifest is not PASS.")
-    if manifest.get("config_origin") != "training_emitted":
+    if manifest.get("config_origin") not in {
+        "training_emitted",
+        "user_provided_training_config",
+    }:
         raise ValueError(
-            "E-I lineage requires an original training-emitted config; "
-            "a reconstructed config is not admissible."
+            "E-I lineage requires a training-emitted or directly user-provided "
+            "training config; a reconstructed config is not admissible."
         )
+    if manifest.get("lineage_assertion_origin") not in {
+        "training_emitted_manifest",
+        "user_attested",
+    }:
+        raise ValueError("E-I lineage assertion origin is not admissible.")
     if manifest.get("plus_full_used") is not False:
         raise ValueError("E-I lineage manifest must state plus_full_used=false.")
 
@@ -102,8 +147,10 @@ def validate_e_i_lineage_manifest(
         for name in E_I_ARTIFACT_NAMES
     }
     if expected_paths is not None:
-        for name in E_I_ARTIFACT_NAMES:
-            expected = Path(expected_paths[name]).expanduser().resolve()
+        for name, raw_expected in expected_paths.items():
+            if name not in artifacts:
+                raise ValueError(f"Unexpected E-I lineage path binding: {name}.")
+            expected = Path(raw_expected).expanduser().resolve()
             if expected != Path(artifacts[name]["path"]):
                 raise ValueError(
                     f"E-I lineage path mismatch for {name}: "
@@ -113,10 +160,13 @@ def validate_e_i_lineage_manifest(
     training = manifest.get("training")
     if not isinstance(training, Mapping):
         raise ValueError("E-I lineage manifest has no training relation.")
+    base_components = _validate_original_wan_base_manifest(
+        artifacts["base_model_manifest"]["path"]
+    )
     required_relations = {
-        "initializer_kind": "wan_robot_base",
-        "parent_checkpoint_sha256": artifacts["wan_robot_base_checkpoint"]["sha256"],
-        "parent_config_sha256": artifacts["wan_robot_base_config"]["sha256"],
+        "initializer_kind": "original_wan2.2_ti2v_5b",
+        "model_id": "Wan-AI/Wan2.2-TI2V-5B",
+        "parent_manifest_sha256": artifacts["base_model_manifest"]["sha256"],
         "output_checkpoint_sha256": artifacts["e_i_checkpoint"]["sha256"],
         "output_config_sha256": artifacts["e_i_config"]["sha256"],
         "dataset_stats_sha256": artifacts["dataset_stats"]["sha256"],
@@ -141,6 +191,58 @@ def validate_e_i_lineage_manifest(
     task = str(training.get("task", "")).lower()
     if "libero" not in task or "idm" not in task:
         raise ValueError("E-I lineage task must identify LIBERO FastWAM-IDM.")
+
+    import yaml
+
+    config = yaml.safe_load(
+        Path(artifacts["e_i_config"]["path"]).read_text(encoding="utf-8")
+    )
+    model = config.get("model") if isinstance(config, Mapping) else None
+    if not isinstance(model, Mapping):
+        raise ValueError("E-I config has no model mapping.")
+    config_requirements = {
+        "_target_": "fastwam.runtime.create_fastwam_idm",
+        "model_id": "Wan-AI/Wan2.2-TI2V-5B",
+        "skip_dit_load_from_pretrain": False,
+        "load_text_encoder": False,
+    }
+    config_mismatches = {
+        key: (model.get(key), expected)
+        for key, expected in config_requirements.items()
+        if model.get(key) != expected
+    }
+    if config_mismatches:
+        raise ValueError(
+            "E-I config does not describe the original-Wan IDM initializer: "
+            f"{config_mismatches}."
+        )
+    action_initializer = Path(
+        str(model.get("action_dit_pretrained_path", ""))
+    ).name
+    expected_action_initializer = Path(
+        base_components["action_dit_initial_checkpoint"]["path"]
+    ).name
+    if action_initializer != expected_action_initializer:
+        raise ValueError(
+            "E-I config ActionDiT initializer differs from the base manifest: "
+            f"{action_initializer!r} != {expected_action_initializer!r}."
+        )
+
+    stats = read_json(artifacts["dataset_stats"]["path"])
+    dataset_relations = {
+        "num_episodes": stats.get("num_episodes"),
+        "num_transition": stats.get("num_transition"),
+    }
+    dataset_mismatches = {
+        key: (training.get(key), expected)
+        for key, expected in dataset_relations.items()
+        if training.get(key) != expected
+    }
+    if dataset_mismatches:
+        raise ValueError(
+            "E-I lineage dataset relation is inconsistent: "
+            f"{dataset_mismatches}."
+        )
     return artifacts
 
 
@@ -224,8 +326,7 @@ def validate_warmstart_parity_evidence(
 
 def audit_e_i_lineage_inputs(
     *,
-    wan_robot_base_checkpoint: str | os.PathLike[str] | None,
-    wan_robot_base_config: str | os.PathLike[str] | None,
+    base_model_manifest: str | os.PathLike[str] | None,
     e_i_checkpoint: str | os.PathLike[str] | None,
     e_i_config: str | os.PathLike[str] | None,
     dataset_stats: str | os.PathLike[str] | None,
@@ -233,8 +334,7 @@ def audit_e_i_lineage_inputs(
 ) -> dict[str, Any]:
     """Return PASS or NOT-RUN without inferring missing provenance."""
     supplied = {
-        "wan_robot_base_checkpoint": wan_robot_base_checkpoint,
-        "wan_robot_base_config": wan_robot_base_config,
+        "base_model_manifest": base_model_manifest,
         "e_i_checkpoint": e_i_checkpoint,
         "e_i_config": e_i_config,
         "dataset_stats": dataset_stats,
@@ -287,7 +387,8 @@ def audit_e_i_lineage_inputs(
         ),
         "blockers": blockers,
         "claim": (
-            "Verified Wan-Robot base -> LIBERO FastWAM-IDM E-I lineage."
+            "Verified exact artifact bindings for the user-attested original-Wan "
+            "base -> LIBERO FastWAM-IDM E-I lineage."
             if status == "PASS"
             else "No training update is authorized by this audit."
         ),
@@ -400,15 +501,7 @@ def validate_formal_training_contract(
     )
     lineage_artifacts = validate_e_i_lineage_manifest(lineage_manifest)
     lineage_sha = {
-        "wan_robot_base_checkpoint": lineage_artifacts[
-            "wan_robot_base_checkpoint"
-        ]["sha256"],
-        "wan_robot_base_config": lineage_artifacts["wan_robot_base_config"][
-            "sha256"
-        ],
-        "e_i_checkpoint": lineage_artifacts["e_i_checkpoint"]["sha256"],
-        "e_i_config": lineage_artifacts["e_i_config"]["sha256"],
-        "dataset_stats": lineage_artifacts["dataset_stats"]["sha256"],
+        name: record["sha256"] for name, record in lineage_artifacts.items()
     }
     mismatches = {
         name: (probe_bindings.get(name), sha)

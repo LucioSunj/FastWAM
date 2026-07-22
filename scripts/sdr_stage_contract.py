@@ -14,8 +14,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastwam.adaptive_gate.sdr_contracts import (
+    E_I_LINEAGE_SCHEMA,
     LEARNING_PROBE_DECISION_SCHEMA,
     FORMAL_TRAINING_DECISION_SCHEMA,
+    ORIGINAL_WAN_BASE_SCHEMA,
     PREFLIGHT_DECISION_SCHEMA,
     artifact_record,
     atomic_json,
@@ -30,8 +32,7 @@ from fastwam.adaptive_gate.sdr_contracts import (
 
 def audit_lineage(args: argparse.Namespace) -> None:
     result = audit_e_i_lineage_inputs(
-        wan_robot_base_checkpoint=args.wan_robot_base_checkpoint,
-        wan_robot_base_config=args.wan_robot_base_config,
+        base_model_manifest=args.base_model_manifest,
         e_i_checkpoint=args.e_i_checkpoint,
         e_i_config=args.e_i_config,
         dataset_stats=args.dataset_stats,
@@ -44,8 +45,7 @@ def audit_lineage(args: argparse.Namespace) -> None:
 def check_lineage(args: argparse.Namespace) -> None:
     manifest = read_json(args.lineage_manifest)
     expected = {
-        "wan_robot_base_checkpoint": args.wan_robot_base_checkpoint,
-        "wan_robot_base_config": args.wan_robot_base_config,
+        "base_model_manifest": args.base_model_manifest,
         "e_i_checkpoint": args.e_i_checkpoint,
         "e_i_config": args.e_i_config,
         "dataset_stats": args.dataset_stats,
@@ -58,6 +58,96 @@ def check_lineage(args: argparse.Namespace) -> None:
                 "artifact_sha256": {
                     name: value["sha256"] for name, value in artifacts.items()
                 },
+            },
+            sort_keys=True,
+        )
+    )
+
+
+def write_original_wan_lineage(args: argparse.Namespace) -> None:
+    component_dir = Path(args.component_dir).expanduser().resolve()
+    if not component_dir.is_dir():
+        raise FileNotFoundError(component_dir)
+    component_paths = {
+        "wan_video_dit_index": component_dir
+        / "diffusion_pytorch_model.safetensors.index.json",
+        "wan_video_dit_shard_1": component_dir
+        / "diffusion_pytorch_model-00001-of-00003.safetensors",
+        "wan_video_dit_shard_2": component_dir
+        / "diffusion_pytorch_model-00002-of-00003.safetensors",
+        "wan_video_dit_shard_3": component_dir
+        / "diffusion_pytorch_model-00003-of-00003.safetensors",
+        "wan_video_vae": component_dir / "Wan2.2_VAE.safetensors",
+        "action_dit_initial_checkpoint": Path(
+            args.action_dit_initial_checkpoint
+        ).expanduser().resolve(),
+    }
+    base_manifest_path = Path(args.base_manifest_out).expanduser().resolve()
+    lineage_path = Path(args.lineage_out).expanduser().resolve()
+    now = datetime.now(timezone.utc).isoformat()
+    base_manifest = {
+        "schema": ORIGINAL_WAN_BASE_SCHEMA,
+        "status": "PASS",
+        "created_at_utc": now,
+        "model_id": "Wan-AI/Wan2.2-TI2V-5B",
+        "plus_full_used": False,
+        "artifacts": {
+            name: artifact_record(path)
+            for name, path in component_paths.items()
+        },
+        "scope": (
+            "Exact local original-Wan video/vae and ActionDiT initializer "
+            "artifacts used to instantiate the user-attested E-I lineage."
+        ),
+    }
+    atomic_json(base_manifest_path, base_manifest)
+
+    stats = read_json(args.dataset_stats)
+    artifacts = {
+        "base_model_manifest": artifact_record(base_manifest_path),
+        "e_i_checkpoint": artifact_record(args.e_i_checkpoint),
+        "e_i_config": artifact_record(args.e_i_config),
+        "dataset_stats": artifact_record(args.dataset_stats),
+    }
+    lineage = {
+        "schema": E_I_LINEAGE_SCHEMA,
+        "status": "PASS",
+        "created_at_utc": now,
+        "config_origin": "user_provided_training_config",
+        "lineage_assertion_origin": "user_attested",
+        "provenance_level": "user_attested_exact_artifact_binding",
+        "plus_full_used": False,
+        "artifacts": artifacts,
+        "training": {
+            "initializer_kind": "original_wan2.2_ti2v_5b",
+            "model_id": "Wan-AI/Wan2.2-TI2V-5B",
+            "parent_manifest_sha256": artifacts["base_model_manifest"]["sha256"],
+            "output_checkpoint_sha256": artifacts["e_i_checkpoint"]["sha256"],
+            "output_config_sha256": artifacts["e_i_config"]["sha256"],
+            "dataset_stats_sha256": artifacts["dataset_stats"]["sha256"],
+            "completed_step": int(args.completed_step),
+            "task": str(args.task),
+            "num_episodes": stats.get("num_episodes"),
+            "num_transition": stats.get("num_transition"),
+        },
+        "limitations": [
+            "The original launcher/world-size record was not supplied.",
+            "The parent relation is user-attested rather than recovered from a training-emitted run manifest.",
+        ],
+    }
+    atomic_json(lineage_path, lineage)
+    validate_e_i_lineage_manifest(
+        read_json(lineage_path),
+        expected_paths={
+            name: record["path"] for name, record in artifacts.items()
+        },
+    )
+    print(
+        json.dumps(
+            {
+                "status": "PASS",
+                "base_model_manifest": str(base_manifest_path),
+                "lineage_manifest": str(lineage_path),
             },
             sort_keys=True,
         )
@@ -471,8 +561,7 @@ def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="command", required=True)
     audit = sub.add_parser("audit-lineage")
-    audit.add_argument("--wan-robot-base-checkpoint")
-    audit.add_argument("--wan-robot-base-config")
+    audit.add_argument("--base-model-manifest")
     audit.add_argument("--e-i-checkpoint")
     audit.add_argument("--e-i-config")
     audit.add_argument("--dataset-stats")
@@ -480,13 +569,25 @@ def parser() -> argparse.ArgumentParser:
     audit.add_argument("--out", required=True)
     audit.set_defaults(func=audit_lineage)
     lineage = sub.add_parser("check-lineage")
-    lineage.add_argument("--wan-robot-base-checkpoint", required=True)
-    lineage.add_argument("--wan-robot-base-config", required=True)
+    lineage.add_argument("--base-model-manifest", required=True)
     lineage.add_argument("--e-i-checkpoint", required=True)
     lineage.add_argument("--e-i-config", required=True)
     lineage.add_argument("--dataset-stats", required=True)
     lineage.add_argument("--lineage-manifest", required=True)
     lineage.set_defaults(func=check_lineage)
+    write_lineage = sub.add_parser("write-original-wan-lineage")
+    write_lineage.add_argument("--component-dir", required=True)
+    write_lineage.add_argument(
+        "--action-dit-initial-checkpoint", required=True
+    )
+    write_lineage.add_argument("--e-i-checkpoint", required=True)
+    write_lineage.add_argument("--e-i-config", required=True)
+    write_lineage.add_argument("--dataset-stats", required=True)
+    write_lineage.add_argument("--completed-step", type=int, required=True)
+    write_lineage.add_argument("--task", required=True)
+    write_lineage.add_argument("--base-manifest-out", required=True)
+    write_lineage.add_argument("--lineage-out", required=True)
+    write_lineage.set_defaults(func=write_original_wan_lineage)
     probe = sub.add_parser("check-probe")
     probe.add_argument("--preflight-decision", required=True)
     probe.set_defaults(func=check_probe)

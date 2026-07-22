@@ -838,11 +838,8 @@ def main() -> None:
     lineage_artifacts = validate_e_i_lineage_manifest(
         lineage,
         expected_paths={
-            "wan_robot_base_checkpoint": lineage["artifacts"][
-                "wan_robot_base_checkpoint"
-            ]["path"],
-            "wan_robot_base_config": lineage["artifacts"][
-                "wan_robot_base_config"
+            "base_model_manifest": lineage["artifacts"][
+                "base_model_manifest"
             ]["path"],
             "e_i_checkpoint": e_i_checkpoint,
             "e_i_config": e_i_config,
