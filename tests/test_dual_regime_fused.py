@@ -711,6 +711,32 @@ class TestFusedDualRegimeTraining:
         assert out["action"].shape[0] == horizon
         assert out["_routing"]["selected_branch"] == branch
 
+    def test_no_read_matches_forced_base_exactly(self, fused_model):
+        m = fused_model
+        num_frames, height, width = 5, 64, 64
+        horizon = (num_frames - 1) * 2
+        common = dict(
+            prompt=None,
+            input_image=torch.rand(1, 3, height, width),
+            action_horizon=horizon,
+            num_video_frames=num_frames,
+            context=torch.randn(1, 16, 4096),
+            context_mask=torch.ones(1, 16, dtype=torch.bool),
+            num_inference_steps=2,
+            seed=7,
+        )
+        if getattr(m, "proprio_dim", None) is not None:
+            common["proprio"] = torch.randn(1, int(m.proprio_dim))
+
+        no_read = m.infer_action(
+            **common,
+            force_branch="idm",
+            idm_control="no_read",
+        )["action"]
+        uncond = m.infer_action(**common, force_branch="base")["action"]
+
+        assert torch.equal(no_read, uncond)
+
     def test_checkpoint_records_provenance(self, fused_model, tmp_path):
         m = fused_model
         m.dataset_stats_fingerprint = "test-stats-sha256"

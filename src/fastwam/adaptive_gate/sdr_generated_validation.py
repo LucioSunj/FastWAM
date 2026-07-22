@@ -16,7 +16,6 @@ from .sdr_contracts import artifact_record
 from .controls import (
     IDMControl,
     ShuffledFutureDonor,
-    block_action_future_reads,
     coerce_idm_control,
     intervene_video_latents,
 )
@@ -331,12 +330,6 @@ def infer_action_from_cached_video_latents(
         video_tokens_per_frame=tokens_per_frame,
         device=video_pre["tokens"].device,
     )
-    if selected is IDMControl.NO_READ:
-        attention_mask = block_action_future_reads(
-            attention_mask,
-            video_seq_len=video_seq_len,
-            video_tokens_per_frame=tokens_per_frame,
-        )
     video_kv_cache = model.mot.prefill_video_cache(
         video_tokens=video_pre["tokens"],
         video_freqs=video_pre["freqs"],
@@ -347,6 +340,39 @@ def infer_action_from_cached_video_latents(
         },
         video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
     )
+    if selected is IDMControl.NO_READ:
+        # Pay the full generated-video cache work above, then use the same
+        # single-frame action path as forced UNCOND. A masked long sequence is
+        # not BF16-equivalent because the attention kernel still sees a
+        # different K/V length.
+        video_pre = model.video_expert.pre_dit(
+            x=first_frame_latents,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+        video_seq_len = int(video_pre["tokens"].shape[1])
+        tokens_per_frame = int(video_pre["meta"]["tokens_per_frame"])
+        attention_mask = model._build_mot_attention_mask(
+            video_seq_len=video_seq_len,
+            action_seq_len=latents_action.shape[1],
+            video_tokens_per_frame=tokens_per_frame,
+            device=video_pre["tokens"].device,
+        )
+        video_kv_cache = model.mot.prefill_video_cache(
+            video_tokens=video_pre["tokens"],
+            video_freqs=video_pre["freqs"],
+            video_t_mod=video_pre["t_mod"],
+            video_context_payload={
+                "context": video_pre["context"],
+                "mask": video_pre["context_mask"],
+            },
+            video_attention_mask=attention_mask[
+                :video_seq_len, :video_seq_len
+            ],
+        )
     timesteps, deltas = model.infer_action_scheduler.build_inference_schedule(
         num_inference_steps=int(action_inference_steps),
         device=model.device,

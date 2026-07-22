@@ -7,7 +7,6 @@ from fastwam.utils.logging_config import get_logger
 from fastwam.adaptive_gate.controls import (
     IDMControl,
     ShuffledFutureDonor,
-    block_action_future_reads,
     coerce_idm_control,
     intervene_video_latents,
 )
@@ -477,12 +476,6 @@ class FastWAMIDM(FastWAMJoint):
             video_tokens_per_frame=int(video_pre_cond["meta"]["tokens_per_frame"]),
             device=video_pre_cond["tokens"].device,
         )
-        if selected_control is IDMControl.NO_READ:
-            attention_mask = block_action_future_reads(
-                attention_mask,
-                video_seq_len=video_seq_len,
-                video_tokens_per_frame=int(video_pre_cond["meta"]["tokens_per_frame"]),
-            )
         video_kv_cache = self.mot.prefill_video_cache(
             video_tokens=video_pre_cond["tokens"],
             video_freqs=video_pre_cond["freqs"],
@@ -493,6 +486,40 @@ class FastWAMIDM(FastWAMJoint):
             },
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
+        if selected_control is IDMControl.NO_READ:
+            # Preserve the full generated-video cache cost above, but make the
+            # action read path numerically identical to forced UNCOND. Masking
+            # future columns in a long BF16 attention call is not equivalent
+            # to running the one-frame K/V sequence.
+            video_pre_cond = self.video_expert.pre_dit(
+                x=first_frame_latents,
+                timestep=timestep_video_cond,
+                context=context,
+                context_mask=context_mask,
+                action=None,
+                fuse_vae_embedding_in_latents=fuse_flag,
+            )
+            video_seq_len = int(video_pre_cond["tokens"].shape[1])
+            attention_mask = self._build_mot_attention_mask(
+                video_seq_len=video_seq_len,
+                action_seq_len=latents_action.shape[1],
+                video_tokens_per_frame=int(
+                    video_pre_cond["meta"]["tokens_per_frame"]
+                ),
+                device=video_pre_cond["tokens"].device,
+            )
+            video_kv_cache = self.mot.prefill_video_cache(
+                video_tokens=video_pre_cond["tokens"],
+                video_freqs=video_pre_cond["freqs"],
+                video_t_mod=video_pre_cond["t_mod"],
+                video_context_payload={
+                    "context": video_pre_cond["context"],
+                    "mask": video_pre_cond["context_mask"],
+                },
+                video_attention_mask=attention_mask[
+                    :video_seq_len, :video_seq_len
+                ],
+            )
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=action_steps,

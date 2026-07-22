@@ -384,9 +384,14 @@ def _generate_future_validation(
             source_validation.get("schema") != VALIDATION_SCHEMA
             or source_validation.get("status") != "PASS"
             or source_validation.get("cache_created") is not True
+            or source_validation.get(
+                "direct_generated_cached_valid_parity", {}
+            ).get("pass")
+            is not True
         ):
             raise ValueError(
-                "Generated-future cache source is not a PASS S0 cache creation."
+                "Generated-future cache source is not a PASS S0 cache creation "
+                "with direct/cached generated-IDM parity."
             )
         if source_validation.get("solver_fingerprint") != (
             inference_solver_fingerprint(solver)

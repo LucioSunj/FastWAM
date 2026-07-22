@@ -89,6 +89,13 @@ PREFLIGHT_CMD=(
 if [[ -n "${SIGMA_SHIFT:-}" ]]; then
     PREFLIGHT_CMD+=(--sigma-shift "${SIGMA_SHIFT}")
 fi
+if [[ -n "${GENERATED_FUTURE_CACHE_SOURCE:-}" ]]; then
+    require_dir "${GENERATED_FUTURE_CACHE_SOURCE}"
+    PREFLIGHT_CMD+=(
+        --generated-future-cache-source
+        "${GENERATED_FUTURE_CACHE_SOURCE}"
+    )
+fi
 run_command "${PREFLIGHT_CMD[@]}"
 if [[ "${DRY_RUN}" -eq 0 ]]; then
     run_command python scripts/sdr_stage_contract.py check-probe \
