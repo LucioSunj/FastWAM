@@ -387,6 +387,7 @@ class TestFusedDualRegimeTraining:
         assert torch.isfinite(loss)
         expected_keys = {
             "loss_video", f"loss_action_{m.main_regime_name}", "loss_action_uncond",
+            f"loss_action_{m.main_regime_name}_raw", "loss_action_uncond_raw",
             "loss_action_combined", "action_regime_weight_uncond",
         }
         assert set(loss_dict.keys()) == expected_keys
