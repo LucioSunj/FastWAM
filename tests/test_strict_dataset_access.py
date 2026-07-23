@@ -52,3 +52,18 @@ def test_robot_video_get_strict_sets_strict_flag():
     assert method(Fake(), 4) == (4, True)
     with pytest.raises(IndexError):
         method(Fake(), 5)
+
+
+def test_pretrained_dataset_stats_are_persisted_byte_exactly(tmp_path):
+    module = pytest.importorskip("fastwam.datasets.lerobot.robot_video_dataset")
+    source = tmp_path / "source.json"
+    target = tmp_path / "output" / "dataset_stats.json"
+    target.parent.mkdir()
+    payload = b'{\n  "value": 1\n}\n'
+    source.write_bytes(payload)
+
+    module._copy_pretrained_dataset_stats(source, target)
+
+    assert target.read_bytes() == payload
+    module._copy_pretrained_dataset_stats(target, target)
+    assert target.read_bytes() == payload
