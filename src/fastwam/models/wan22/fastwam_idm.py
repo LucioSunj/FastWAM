@@ -226,6 +226,23 @@ class FastWAMIDM(FastWAMJoint):
         }
         return loss_total, loss_dict
 
+    def _video_denoise_step_compiled(
+        self,
+        latents_video: torch.Tensor,
+        timestep_video: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        fuse_flag: bool,
+    ) -> torch.Tensor:
+        return self.video_expert(
+            x=latents_video,
+            timestep=timestep_video,
+            context=context,
+            context_mask=context_mask,
+            action=None,
+            fuse_vae_embedding_in_latents=fuse_flag,
+        )
+
     @torch.no_grad()
     def infer_action(
         self,
@@ -378,6 +395,15 @@ class FastWAMIDM(FastWAMJoint):
             )
 
         # Stage 1: denoise video only.
+        if not hasattr(self, "_video_denoise_step_is_compiled"):
+            if self.device.type == "cuda":
+                self._video_denoise_step_compiled = torch.compile(
+                    self._video_denoise_step_compiled,
+                    mode="default",
+                    fullgraph=False,
+                )
+            self._video_denoise_step_is_compiled = True
+
         infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
@@ -386,13 +412,12 @@ class FastWAMIDM(FastWAMJoint):
         )
         for step_t_video, step_delta_video in zip(infer_timesteps_video, infer_deltas_video):
             timestep_video = step_t_video.unsqueeze(0).to(dtype=latents_video.dtype, device=self.device)
-            pred_video = self.video_expert(
-                x=latents_video,
-                timestep=timestep_video,
+            pred_video = self._video_denoise_step_compiled(
+                latents_video=latents_video,
+                timestep_video=timestep_video,
                 context=context,
                 context_mask=context_mask,
-                action=None,
-                fuse_vae_embedding_in_latents=fuse_flag,
+                fuse_flag=fuse_flag,
             )
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_video[:, :, 0:1] = first_frame_latents.clone()
