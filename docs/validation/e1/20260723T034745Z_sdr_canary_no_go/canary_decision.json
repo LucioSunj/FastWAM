@@ -1,0 +1,120 @@
+{
+  "artifact_bindings": {
+    "base_model_manifest": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_lineage/20260722T134012Z/original_wan_base_manifest.json",
+      "sha256": "7310f453f86f64b02f815ff4d4973241c0ba552e3be964b90039b17b43d84622",
+      "size_bytes": 1910
+    },
+    "code_commit": {
+      "path": "git:1434fc914a51d9078aae546b53cc9e7610cc250d",
+      "sha256": "203305360521e78b99254791244541bb14baa03d4ce026a9d7e8c2ec179ec0dd"
+    },
+    "dataset_stats": {
+      "path": "/root/When-will-inference-time-prediction-beneficial-/FastWAM/docs/validation/e1/20260722T123926Z_e_i_step_043400_user_metadata/dataset_stats.json",
+      "sha256": "4018617a46d738499288dde749f126c645c7617e4da938bd308d3670b3c35658",
+      "size_bytes": 40949
+    },
+    "e_i_checkpoint": {
+      "path": "/autodl-fs/data/fastwam/checkpoints/fastwam_idm_libero_step_043400.pt",
+      "sha256": "f6e29dd6638d19a9e60c87ab387f0cc8d5c75f1ab9262cacd8d269ea1ee43c9c",
+      "size_bytes": 12041735601
+    },
+    "e_i_config": {
+      "path": "/root/When-will-inference-time-prediction-beneficial-/FastWAM/docs/validation/e1/20260722T123926Z_e_i_step_043400_user_metadata/config.yaml",
+      "sha256": "d81e530feb48392badb97cb44ab757778b3e3acdc4b2542f247db146c4f6b9d6",
+      "size_bytes": 4716
+    },
+    "lineage_manifest": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_lineage/20260722T134012Z/e_i_lineage_manifest.json",
+      "sha256": "31242731cc48c9c98c1fcc552c268364693121b88533aadca6ca77bba8c22b92",
+      "size_bytes": 2242
+    },
+    "resolved_config": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_P0_5/20260723T033214Z/resolved_config.yaml",
+      "sha256": "78b8f733adbfed5a84a3efd033f3e1cdecf5f4a03f9a3a12ebd6875c8e2f63b2",
+      "size_bytes": 6089
+    },
+    "solver_contract": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_P0_5/20260723T033214Z/solver_contract.json",
+      "sha256": "41e904011e64087162d81aba0dfa600d2dae866233a9094a442160cf645338ca",
+      "size_bytes": 677
+    },
+    "validation_manifest": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_lineage/20260722T134012Z/validation_manifest.json",
+      "sha256": "5665634dcfd6ce209a23eead8d02219f2024192aec225639c304ce27cdfb6c09",
+      "size_bytes": 73807
+    },
+    "warmstart_decision": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_warmstart_parity/20260722T134459Z/decision.json",
+      "sha256": "b1ad64a410127621a5d803165c289d35789e5c14a84ac218ef2ecb1071437430",
+      "size_bytes": 434
+    },
+    "warmstart_parity_result": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_warmstart_parity/20260722T134459Z/parity_result.json",
+      "sha256": "9cde7afebd3eb5ce25d17aa1cf1a5146277fe235a5ebed0acfe3ab1763b8d545",
+      "size_bytes": 2533
+    }
+  },
+  "artifacts": {
+    "canary_delta": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_P1/20260723T034745Z/canary/train/checkpoints/weights/step_000050.action_dit_delta.pt",
+      "sha256": "fd0baa7fb5d7989ac0f6f67bf73c38b5f9596bede2bc0d63b8c2188efe763ca2",
+      "size_bytes": 2041906044
+    },
+    "preflight_decision": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_P0_5/20260723T033214Z/preflight_decision.json",
+      "sha256": "f56bd8ef6dd9b307226c6ceb52edf94857c223cb8add0a340d68235f56644a16",
+      "size_bytes": 23905
+    },
+    "training_metrics": {
+      "path": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_P1/20260723T034745Z/canary/train/training_metrics.jsonl",
+      "sha256": "609c449a854014580382ac97a5400491d67c7debf8c2cec652e80c849bb92e78",
+      "size_bytes": 42952
+    }
+  },
+  "baseline": {
+    "common_action_all_idm_margin": 0.08747474908193852,
+    "common_action_all_uncond_margin": 4.489646104313103,
+    "final_blocks_negative_idm_margin_fraction": 0.125,
+    "finite": true,
+    "generated_idm_action_l2": 0.10685092313215136,
+    "gt_idm_action_l2": 0.023864255077205597,
+    "idm_raw_loss": 0.004630712192101783,
+    "no_read_uncond_parity": true,
+    "run_dir": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_P0_5/20260723T033214Z",
+    "sensitivity_median": 0.40676963329315186,
+    "uncond_raw_loss": 0.2864014893537387
+  },
+  "failure_conditions": [
+    "common-noise IDM margin is not positive"
+  ],
+  "initializer_stage": "e_i_s0",
+  "plus_full_used": false,
+  "probe_500_authorized": false,
+  "schema": "fastwam-sdr-canary-decision-v1",
+  "status": "FAIL-DIAGNOSED",
+  "step50": {
+    "common_action_all_idm_margin": -0.09031246519895042,
+    "common_action_all_uncond_margin": 1.591884816957619,
+    "final_blocks_negative_idm_margin_fraction": 0.75,
+    "finite": true,
+    "generated_idm_action_l2": 0.10878058336675167,
+    "gt_idm_action_l2": 0.02726589555386454,
+    "idm_raw_loss": 0.00579976576318586,
+    "no_read_uncond_parity": true,
+    "run_dir": "/root/autodl-tmp/experiments/adaptive_wm_reasoning/E1_P1/20260723T034745Z/canary/diagnostics_step50_cache_root",
+    "sensitivity_median": 0.404273584485054,
+    "uncond_raw_loss": 0.1739948267408181
+  },
+  "training": {
+    "all_finite": true,
+    "clip_fraction": 0.0,
+    "final_segment_elapsed_seconds": 1692.9196329321712,
+    "longest_clipping_streak": 0,
+    "mean_samples_per_second": 1.8919809793240248,
+    "peak_gpu_memory_bytes": 33920923136,
+    "schedule_verified": true,
+    "successful_steps": 50,
+    "total_step_time_seconds": 1692.9196329321712
+  }
+}

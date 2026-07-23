@@ -11,6 +11,7 @@ fused model without changing its forced-IDM action output.
 | 20260720T162134Z | Standalone E-I to fused S0 forced-IDM parity | PASS under user-confirmed legacy config reconstruction; max_abs=0 | [S0 archive](20260720T162134Z_s0_reconstructed_config_clean/) |
 | 20260721T021848Z | Real LIBERO fused S-DR training smoke | PASS diagnostic; one optimizer step, no checkpoint | [smoke archive](20260721T021848Z_real_libero_one_step/) |
 | 20260722T123926Z | Preserve E-I step 43,400 training config and dataset stats | USER-PROVIDED; exact files archived, checkpoint binding not independently verified | [metadata archive](20260722T123926Z_e_i_step_043400_user_metadata/) |
+| 20260723T034745Z | P0.5 plus 50-step shared S-DR Canary | FAIL-DIAGNOSED; UNCOND learned, but common IDM margin became negative | [Canary archive](20260723T034745Z_sdr_canary_no_go/) |
 
 The S0 run used sample 0, seed 0, BF16, 20 video/action solver steps, the
 unchanged `atol=5e-4` and `rtol=5e-3`, and produced identical `[32, 7]` source
@@ -43,7 +44,9 @@ start. Batch size and maximum steps were deliberately limited to one. It
 completed forward, backward, and one optimizer step with finite IDM, UNCOND,
 and video losses, while writing zero checkpoint files.
 
-Neither archive is an E1 pilot completion claim. The two preregistered S-DR
-pilots, post-pilot selection, forced shared endpoints, controls, and downstream
-E2-E6 experiments remain pending. E0 was skipped by explicit user direction;
-no E0 PASS decision was created.
+The later P0.5 preflight passed, but the first completed 50-step Canary stopped
+E1-P1 with a preregistered No-Go: the common action-all IDM margin at
+`w=0.5` changed from positive to negative. The 500-step probe, formal
+10-epoch training, post-pilot selection, forced shared endpoints, and
+downstream E2-E6 experiments therefore remain pending. E0 was skipped by
+explicit user direction; no E0 PASS decision was created.
