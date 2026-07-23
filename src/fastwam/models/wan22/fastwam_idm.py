@@ -57,6 +57,10 @@ class FastWAMIDM(FastWAMJoint):
 
     def training_loss(self, sample, tiled: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)
+        return self.training_loss_from_inputs(inputs)
+
+    def training_loss_from_inputs(self, inputs):
+        """Compute the IDM teacher-forcing loss from pre-encoded inputs."""
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
         context = inputs["context"]
