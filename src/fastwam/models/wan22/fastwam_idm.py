@@ -427,6 +427,26 @@ class FastWAMIDM(FastWAMJoint):
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
 
+        action_seq_len = latents_action.shape[1]
+        action_freqs = self.action_expert.freqs[:action_seq_len].view(
+            action_seq_len, 1, -1
+        ).to(latents_action.device)
+        total_seq_len = video_seq_len + action_seq_len
+        action_attention_mask = attention_mask[
+            video_seq_len:total_seq_len, :total_seq_len
+        ]
+        cache_k_list = [layer_cache["k"] for layer_cache in video_kv_cache]
+        cache_v_list = [layer_cache["v"] for layer_cache in video_kv_cache]
+
+        if not hasattr(self, "_denoise_step_is_compiled"):
+            if self.device.type == "cuda":
+                self._denoise_step_compiled = torch.compile(
+                    self._denoise_step_compiled,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                )
+            self._denoise_step_is_compiled = True
+
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
@@ -435,14 +455,15 @@ class FastWAMIDM(FastWAMJoint):
         )
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
-            pred_action = self._predict_action_noise_with_cache(
+            pred_action = self._denoise_step_compiled(
                 latents_action=latents_action,
                 timestep_action=timestep_action,
                 context=context,
                 context_mask=context_mask,
-                video_kv_cache=video_kv_cache,
-                attention_mask=attention_mask,
-                video_seq_len=video_seq_len,
+                video_cache_k=cache_k_list,
+                video_cache_v=cache_v_list,
+                action_attention_mask=action_attention_mask,
+                action_freqs=action_freqs,
             )
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
