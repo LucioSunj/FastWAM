@@ -179,7 +179,7 @@ def check_decision(args: argparse.Namespace) -> None:
 def print_schedule(args: argparse.Namespace) -> None:
     result = validate_learning_probe_contract(read_json(args.preflight_decision))
     schedule = [
-        {"fraction": fraction, "weight": weight}
+        [fraction, weight]
         for fraction, weight in result["schedule"]
     ]
     print(json.dumps(schedule, separators=(",", ":"), allow_nan=False))
