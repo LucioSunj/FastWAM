@@ -185,6 +185,34 @@ def print_schedule(args: argparse.Namespace) -> None:
     print(json.dumps(schedule, separators=(",", ":"), allow_nan=False))
 
 
+def print_cache_source(args: argparse.Namespace) -> None:
+    preflight_path = Path(args.preflight_decision).expanduser().resolve()
+    validation_path = preflight_path.parent / "generated_future_validation.json"
+    validation = read_json(validation_path)
+    source_path = validation_path
+    if validation.get("cache_created") is not True:
+        source_record = validation.get("cache_source")
+        if not isinstance(source_record, dict):
+            raise ValueError("Reused generated-future validation has no cache source.")
+        source_path = Path(str(source_record.get("path", ""))).expanduser().resolve()
+        actual = artifact_record(source_path)
+        if source_record.get("sha256") != actual["sha256"]:
+            raise ValueError("Generated-future cache source validation changed.")
+        validation = read_json(source_path)
+    if (
+        validation.get("schema")
+        != "fastwam-sdr-generated-future-validation-v1"
+        or validation.get("status") != "PASS"
+        or validation.get("cache_created") is not True
+        or validation.get("direct_generated_cached_valid_parity", {}).get("pass")
+        is not True
+    ):
+        raise ValueError(
+            "Resolved cache source is not a PASS cache creation with direct parity."
+        )
+    print(str(source_path.parent))
+
+
 def _package_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -607,6 +635,9 @@ def parser() -> argparse.ArgumentParser:
     schedule = sub.add_parser("print-schedule")
     schedule.add_argument("--preflight-decision", required=True)
     schedule.set_defaults(func=print_schedule)
+    cache_source = sub.add_parser("print-cache-source")
+    cache_source.add_argument("--preflight-decision", required=True)
+    cache_source.set_defaults(func=print_cache_source)
     formal_manifest = sub.add_parser("write-formal-manifest")
     formal_manifest.add_argument("--preflight-decision", required=True)
     formal_manifest.add_argument("--learning-probe-decision", required=True)

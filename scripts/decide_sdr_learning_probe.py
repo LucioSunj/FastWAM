@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import struct
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,10 @@ def _mean(values: Sequence[float]) -> float:
     if not values:
         raise ValueError("Cannot average an empty sequence.")
     return sum(float(value) for value in values) / len(values)
+
+
+def _float32(value: float) -> float:
+    return struct.unpack("!f", struct.pack("!f", float(value)))[0]
 
 
 def _longest_true_streak(values: Sequence[bool]) -> int:
@@ -142,10 +147,12 @@ def _training_summary(
             observed = float(
                 row["losses"]["action_regime_weight_uncond"]
             )
-            expected_weight = uncond_weight_at_step(
-                schedule,
-                optimizer_step=step - 1,
-                total_optimizer_steps=schedule_total,
+            expected_weight = _float32(
+                uncond_weight_at_step(
+                    schedule,
+                    optimizer_step=step - 1,
+                    total_optimizer_steps=schedule_total,
+                )
             )
             if not math.isclose(
                 observed,

@@ -35,6 +35,8 @@ prepare_run_dir "${CANARY_DIR}"
 prepare_run_dir "${PROBE_DIR}"
 SCHEDULE=$(python scripts/sdr_stage_contract.py print-schedule \
     --preflight-decision "${SDR_PREFLIGHT_DECISION}")
+CACHE_SOURCE_DIR=$(python scripts/sdr_stage_contract.py print-cache-source \
+    --preflight-decision "${SDR_PREFLIGHT_DECISION}")
 E_I_SHA256=$(file_sha256 "${E_I_CKPT}")
 
 common_overrides() {
@@ -96,7 +98,7 @@ run_delta_diagnostics() {
         --warmstart-decision "${WARMSTART_DECISION}" \
         --validation-manifest "${SDR_VAL_MANIFEST}" \
         --action-delta "${delta}" \
-        --generated-future-cache-source "${BASELINE_DIR}" \
+        --generated-future-cache-source "${CACHE_SOURCE_DIR}" \
         --output-dir "${output_dir}" \
         --replays-per-mode 2 \
         --inference-steps 20 \

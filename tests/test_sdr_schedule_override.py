@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 import sys
@@ -83,3 +84,54 @@ def test_learning_launcher_binds_expected_checkpoint_sha256():
     ).read_text(encoding="utf-8")
     assert 'E_I_SHA256=$(file_sha256 "${E_I_CKPT}")' in launcher
     assert '"warm_start.expected_checkpoint_sha256=${E_I_SHA256}"' in launcher
+
+
+def test_cache_source_resolves_verified_original_creation(tmp_path):
+    project_root = Path(__file__).resolve().parents[1]
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_validation = source_root / "generated_future_validation.json"
+    source_validation.write_text(
+        json.dumps(
+            {
+                "schema": "fastwam-sdr-generated-future-validation-v1",
+                "status": "PASS",
+                "cache_created": True,
+                "direct_generated_cached_valid_parity": {"pass": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    baseline = tmp_path / "baseline"
+    baseline.mkdir()
+    decision = baseline / "preflight_decision.json"
+    decision.write_text("{}", encoding="utf-8")
+    (baseline / "generated_future_validation.json").write_text(
+        json.dumps(
+            {
+                "cache_created": False,
+                "cache_source": {
+                    "path": str(source_validation),
+                    "sha256": hashlib.sha256(
+                        source_validation.read_bytes()
+                    ).hexdigest(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(project_root / "scripts/sdr_stage_contract.py"),
+            "print-cache-source",
+            "--preflight-decision",
+            str(decision),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == str(source_root.resolve())
