@@ -35,6 +35,7 @@ prepare_run_dir "${CANARY_DIR}"
 prepare_run_dir "${PROBE_DIR}"
 SCHEDULE=$(python scripts/sdr_stage_contract.py print-schedule \
     --preflight-decision "${SDR_PREFLIGHT_DECISION}")
+E_I_SHA256=$(file_sha256 "${E_I_CKPT}")
 
 common_overrides() {
     local output_dir=$1
@@ -59,6 +60,7 @@ common_overrides() {
         "+data.train.manifest_split=train"
         "warm_start.kind=standalone_idm"
         "warm_start.checkpoint=${E_I_CKPT}"
+        "warm_start.expected_checkpoint_sha256=${E_I_SHA256}"
         "warm_start.source_task=${SOURCE_TASK}"
         "warm_start.source_config=${E_I_CONFIG}"
         "warm_start.source_dataset_stats=${DATASET_STATS}"

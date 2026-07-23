@@ -74,3 +74,12 @@ def test_print_schedule_emits_hydra_compatible_sequence(tmp_path):
         resolve=True,
     )
     assert resolved_schedule == schedule
+
+
+def test_learning_launcher_binds_expected_checkpoint_sha256():
+    project_root = Path(__file__).resolve().parents[1]
+    launcher = (
+        project_root / "scripts/adaptive_gate/run_e1_sdr_learning_probe.sh"
+    ).read_text(encoding="utf-8")
+    assert 'E_I_SHA256=$(file_sha256 "${E_I_CKPT}")' in launcher
+    assert '"warm_start.expected_checkpoint_sha256=${E_I_SHA256}"' in launcher
