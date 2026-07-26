@@ -1,24 +1,58 @@
 # FastWAM CI (work order W13): CPU-only contract/unit suite.
 #
 # Scope decision, stated up front: this runs the full `tests/` suite on a
-# CPU-only runner with a curated dependency set. Tests that need real model
-# checkpoints, datasets, CUDA, DeepSpeed, or the simulator stack already guard
-# themselves with importorskip/skip markers and are EXPECTED to skip here —
-# that is the same behaviour as a CPU-only developer machine. What must hold:
+# CPU-only runner with a curated, fully pinned dependency set. Tests that need
+# real model checkpoints, datasets, CUDA, DeepSpeed, or the simulator stack
+# already guard themselves with importorskip/skip markers and are EXPECTED to
+# skip here — that is the same behaviour as a CPU-only developer machine. What
+# must hold:
 #   * zero collection errors (lazy-import hygiene),
 #   * zero failures among the tests that do run.
 #
-# Measured reference on a CPU machine (Python 3.13, torch 2.8, WITHOUT
-# safetensors/imageio): 131 passed, 24 skipped, 3 failed, 1 collection error,
-# where all four red items were caused purely by the missing safetensors and
-# imageio imports — both installed here. The first live run of this workflow
-# calibrates the authoritative green count; treat a later DROP in passed count
-# as a regression, not noise.
+# Review finding fixed here (severity high): three tests in
+# tests/test_wam_mode_adapter.py
+#   - test_checkpoint_provenance_roundtrip_sets_stable_fingerprint
+#   - test_idm_action_only_uses_explicit_parent_dispatch_without_router_recursion
+#   - test_video_seed_is_independent_but_action_seed_stays_paired
+# guard only on importorskip("imageio") and then hard-import
+# fastwam.models.wan22.fastwam{,_idm}. That module chain has two top-level
+# imports the previous dependency list did not cover:
+#   * transformers  (helpers/loader.py:16 -> wan_video_text_encoder.py:5)
+#   * rich          (fastwam.py:9 -> fastwam/utils/logging_config.py:7)
+# so the first live run would have broken the zero-failures invariant with
+# ModuleNotFoundError. Chosen fix: INSTALL both at the repo pins rather than
+# --deselect the three tests, because (a) they are stage-2 IDM-path contract
+# tests (checkpoint provenance, explicit parent dispatch, video/action seed
+# pairing) — exactly the coverage this CI exists to protect; (b) the CPU
+# install cost is tens of MB / well under a minute, far cheaper than permanent
+# coverage loss; and (c) deselection would not fix the class of failure — any
+# future test importing the wan22 model stack would hit the same trap, whereas
+# installing the pinned deps also lets the importorskip-gated contract files
+# (test_dual_regime_fused.py, test_metric_adaptive_training.py, ...) run their
+# CPU subset instead of skipping wholesale.
+#
+# Determinism (second review finding): every directly installed package is
+# pinned. Where pyproject.toml pins a version, that exact pin is used
+# (numpy, pillow, einops, hydra-core, omegaconf, safetensors, imageio, tqdm,
+# rich, transformers, huggingface-hub, regex, packaging). pip, pytest, and
+# pyyaml have no repo pin, so they are pinned here explicitly. huggingface-hub,
+# regex, and packaging are transitive deps of transformers but are pinned to
+# the repo versions anyway because they are the classic upstream-drift vectors;
+# the remaining transitives (tokenizers, requests, filelock, ...) are
+# version-bounded by their pinned parents.
 #
 # Deliberately NOT `pip install -e .`: pyproject pins torch==2.7.1+cu128,
-# which is pointless on a CPU runner. Dependencies are installed explicitly
-# and the package is used via PYTHONPATH=src, exactly like the local test
-# instructions.
+# which is pointless on a CPU runner. torch is instead pinned to the same
+# release from the official CPU wheel index (pip resolves torch==2.7.1 to the
+# 2.7.1+cpu wheel there), and the package is used via PYTHONPATH=src, exactly
+# like the local test instructions.
+#
+# The prior "131 passed / 24 skipped" reference was measured on a full dev env
+# (Python 3.13, torch 2.8) missing only safetensors/imageio and does not apply
+# 1:1 to this pinned set; with transformers+rich now installed the expected
+# green count is HIGHER (the model-contract files import and run). The first
+# live run of this workflow calibrates the authoritative green count; treat a
+# later DROP in passed count as a regression, not noise.
 name: ci
 
 on:
@@ -39,11 +73,26 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-      - name: Install CPU dependencies (must fail loudly, no || true)
+      - name: Install pinned CPU dependencies (must fail loudly, no || true)
         run: |
-          python -m pip install --upgrade pip
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pytest numpy pillow einops hydra-core omegaconf safetensors imageio pyyaml tqdm
+          python -m pip install "pip==25.1.1"
+          pip install "torch==2.7.1" --index-url https://download.pytorch.org/whl/cpu
+          pip install \
+            "pytest==8.3.5" \
+            "numpy==1.26.4" \
+            "pillow==12.0.0" \
+            "einops==0.8.1" \
+            "hydra-core==1.3.2" \
+            "omegaconf==2.3.0" \
+            "safetensors==0.5.3" \
+            "imageio==2.37.0" \
+            "pyyaml==6.0.2" \
+            "tqdm==4.66.5" \
+            "rich==14.2.0" \
+            "transformers==4.49.0" \
+            "huggingface-hub==0.29.2" \
+            "regex==2025.11.3" \
+            "packaging==25.0"
       - name: Test suite (CPU subset; heavy deps skip via importorskip)
         env:
           PYTHONPATH: src
