@@ -1,0 +1,50 @@
+# FastWAM CI (work order W13): CPU-only contract/unit suite.
+#
+# Scope decision, stated up front: this runs the full `tests/` suite on a
+# CPU-only runner with a curated dependency set. Tests that need real model
+# checkpoints, datasets, CUDA, DeepSpeed, or the simulator stack already guard
+# themselves with importorskip/skip markers and are EXPECTED to skip here —
+# that is the same behaviour as a CPU-only developer machine. What must hold:
+#   * zero collection errors (lazy-import hygiene),
+#   * zero failures among the tests that do run.
+#
+# Measured reference on a CPU machine (Python 3.13, torch 2.8, WITHOUT
+# safetensors/imageio): 131 passed, 24 skipped, 3 failed, 1 collection error,
+# where all four red items were caused purely by the missing safetensors and
+# imageio imports — both installed here. The first live run of this workflow
+# calibrates the authoritative green count; treat a later DROP in passed count
+# as a regression, not noise.
+#
+# Deliberately NOT `pip install -e .`: pyproject pins torch==2.7.1+cu128,
+# which is pointless on a CPU runner. Dependencies are installed explicitly
+# and the package is used via PYTHONPATH=src, exactly like the local test
+# instructions.
+name: ci
+
+on:
+  push:
+    branches: [metric-adaptive, "stage2/**"]
+  pull_request:
+
+concurrency:
+  group: fastwam-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install CPU dependencies (must fail loudly, no || true)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pytest numpy pillow einops hydra-core omegaconf safetensors imageio pyyaml tqdm
+      - name: Test suite (CPU subset; heavy deps skip via importorskip)
+        env:
+          PYTHONPATH: src
+        run: python -m pytest tests -q
