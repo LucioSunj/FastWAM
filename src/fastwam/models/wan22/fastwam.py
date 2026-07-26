@@ -85,6 +85,13 @@ def _validate_velocity_delta(delta_v: Any, *, reference: torch.Tensor) -> torch.
             f"({delta_v.dtype}, {delta_v.device}) must match the velocity prediction "
             f"({reference.dtype}, {reference.device}); cast inside the hook."
         )
+    if torch.is_grad_enabled():
+        # Gradient-carrying forward (stage-2 W17): keep the delta's graph so a
+        # hook output computed from `x_t`/`v` stays differentiable end-to-end.
+        # Every `@torch.no_grad()` entry point runs with grad disabled and takes
+        # the detach branch below, so this branch is reachable only from
+        # `infer_action_with_grad`.
+        return delta_v
     # Guidance never differentiates through the sampler; detaching also keeps a
     # hook's local `torch.enable_grad()` from leaking graph state outward.
     return delta_v.detach()
@@ -892,8 +899,7 @@ class FastWAM(torch.nn.Module):
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
         return pred_action
 
-    @torch.no_grad()
-    def _predict_action_noise_with_cache(
+    def _predict_action_noise_with_cache_impl(
         self,
         latents_action: torch.Tensor,
         timestep_action: torch.Tensor,
@@ -903,6 +909,14 @@ class FastWAM(torch.nn.Module):
         attention_mask: torch.Tensor,
         video_seq_len: int,
     ) -> torch.Tensor:
+        """Grad-transparent body of ``_predict_action_noise_with_cache``.
+
+        Stage-2 W17: the statements below are the verbatim pre-W17 method body,
+        moved out of the ``@torch.no_grad()`` wrapper so the gradient-carrying
+        forced-regime forward (`infer_action_with_grad`) can run the identical
+        per-step action forward with autograd recording. The public wrapper
+        below keeps the historical no-grad behaviour for every existing caller.
+        """
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
@@ -922,6 +936,27 @@ class FastWAM(torch.nn.Module):
             video_seq_len=video_seq_len,
         )
         return self.action_expert.post_dit(action_tokens, action_pre)
+
+    @torch.no_grad()
+    def _predict_action_noise_with_cache(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+    ) -> torch.Tensor:
+        return self._predict_action_noise_with_cache_impl(
+            latents_action=latents_action,
+            timestep_action=timestep_action,
+            context=context,
+            context_mask=context_mask,
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=video_seq_len,
+        )
 
     @torch.no_grad()
     def infer_joint(
@@ -1104,8 +1139,7 @@ class FastWAM(torch.nn.Module):
             "action": action_out,
         }
 
-    @torch.no_grad()
-    def infer_action(
+    def _infer_action_impl(
         self,
         prompt: Optional[str],
         input_image: torch.Tensor,
@@ -1123,29 +1157,24 @@ class FastWAM(torch.nn.Module):
         tiled: bool = False,
         init_noise: Optional[torch.Tensor] = None,
         velocity_hook: Optional[VelocityHook] = None,
-        return_init_noise: bool = False,
-    ) -> dict[str, Any]:
-        """Action-only inference (stage-2 W8 sampler interface).
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Grad-transparent action-only solver body (stage-2 W17).
 
-        New optional knobs — every default preserves the pre-W8 behaviour
-        bit-for-bit:
+        The statements below are the verbatim pre-W17 ``infer_action`` body up
+        to (and excluding) result-dict construction, moved out of the
+        ``@torch.no_grad()`` wrapper so both entry points share one solver
+        loop. The single deliberate difference is that the per-step forward
+        calls ``_predict_action_noise_with_cache_impl`` (the undecorated body
+        of the same helper), so autograd recording is controlled entirely by
+        the caller's grad mode: ``infer_action`` runs this under its unchanged
+        ``@torch.no_grad()`` decorator (bitwise-identical to the pre-W17
+        path), while ``infer_action_with_grad`` runs it under
+        ``torch.enable_grad()``.
 
-        * ``init_noise``: externally supplied initial action noise ``[T, D]``
-          or ``[1, T, D]`` (float). It substitutes the internal float32
-          ``torch.randn`` draw and then follows the identical
-          ``.to(device, torch_dtype)`` conversion, so injecting the noise a
-          given ``seed`` would have produced yields a bit-identical action.
-          Mutually exclusive with ``seed``.
-        * ``velocity_hook``: per-step correction ``hook(x_t, v, timestep,
-          step_index) -> delta_v | None`` added to the predicted velocity
-          BEFORE the scheduler step (see :data:`VelocityHook`); ``v`` is the
-          model's raw velocity prediction, enabling x0_hat-space guidance
-          without re-running the model. This method stays under
-          ``@torch.no_grad()``; a hook needing gradients for its own critic
-          must open a local ``with torch.enable_grad():`` block — the
-          returned delta is detached either way.
-        * ``return_init_noise``: also return the float32 pre-conversion noise
-          under ``"init_noise"`` (CPU), for (noise -> action) replay caches.
+        Returns ``(latents_action, init_noise_f32)``: the final action latents
+        ``[1, T, D]`` on ``self.device`` in ``self.torch_dtype``
+        (graph-carrying when grad is enabled), and the float32 pre-conversion
+        initial noise.
         """
         self.eval()
         validate_action_only_attention_mode(
@@ -1275,7 +1304,7 @@ class FastWAM(torch.nn.Module):
         ):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            pred_action_posi = self._predict_action_noise_with_cache(
+            pred_action_posi = self._predict_action_noise_with_cache_impl(
                 latents_action=latents_action,
                 timestep_action=timestep_action,
                 context=context,
@@ -1301,8 +1330,155 @@ class FastWAM(torch.nn.Module):
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
+        return latents_action, init_noise_f32
+
+    @torch.no_grad()
+    def infer_action(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        first_frame_latents: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+        init_noise: Optional[torch.Tensor] = None,
+        velocity_hook: Optional[VelocityHook] = None,
+        return_init_noise: bool = False,
+    ) -> dict[str, Any]:
+        """Action-only inference (stage-2 W8 sampler interface).
+
+        New optional knobs — every default preserves the pre-W8 behaviour
+        bit-for-bit:
+
+        * ``init_noise``: externally supplied initial action noise ``[T, D]``
+          or ``[1, T, D]`` (float). It substitutes the internal float32
+          ``torch.randn`` draw and then follows the identical
+          ``.to(device, torch_dtype)`` conversion, so injecting the noise a
+          given ``seed`` would have produced yields a bit-identical action.
+          Mutually exclusive with ``seed``.
+        * ``velocity_hook``: per-step correction ``hook(x_t, v, timestep,
+          step_index) -> delta_v | None`` added to the predicted velocity
+          BEFORE the scheduler step (see :data:`VelocityHook`); ``v`` is the
+          model's raw velocity prediction, enabling x0_hat-space guidance
+          without re-running the model. This method stays under
+          ``@torch.no_grad()``; a hook needing gradients for its own critic
+          must open a local ``with torch.enable_grad():`` block — the
+          returned delta is detached either way.
+        * ``return_init_noise``: also return the float32 pre-conversion noise
+          under ``"init_noise"`` (CPU), for (noise -> action) replay caches.
+
+        Stage-2 W17: the solver body lives in ``_infer_action_impl``; this
+        method delegates under its unchanged ``@torch.no_grad()`` decorator,
+        so its outputs stay bitwise identical to the pre-W17 code. For a
+        gradient-carrying rollout use :meth:`infer_action_with_grad`.
+        """
+        latents_action, init_noise_f32 = self._infer_action_impl(
+            prompt=prompt,
+            input_image=input_image,
+            action_horizon=action_horizon,
+            first_frame_latents=first_frame_latents,
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+            negative_prompt=negative_prompt,
+            text_cfg_scale=text_cfg_scale,
+            num_inference_steps=num_inference_steps,
+            sigma_shift=sigma_shift,
+            seed=seed,
+            rand_device=rand_device,
+            tiled=tiled,
+            init_noise=init_noise,
+            velocity_hook=velocity_hook,
+        )
         result = {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
+        }
+        if return_init_noise:
+            result["init_noise"] = init_noise_f32.detach().to(device="cpu", dtype=torch.float32)
+        return result
+
+    def infer_action_with_grad(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        first_frame_latents: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+        init_noise: Optional[torch.Tensor] = None,
+        velocity_hook: Optional[VelocityHook] = None,
+        return_init_noise: bool = False,
+    ) -> dict[str, Any]:
+        """Gradient-carrying forced-regime action forward (stage-2 W17).
+
+        Runs the exact ``infer_action`` solver loop (``_infer_action_impl``)
+        under ``torch.enable_grad()`` so the returned action chunk keeps its
+        autograd graph: with any parameter requiring grad (e.g. a UNCOND-gated
+        additive LoRA on the action expert), a scalar loss built from
+        ``result["action"]`` back-propagates into every parameter the forward
+        used. On this base class the forward IS the base/UNCOND regime (single
+        clean first-frame conditioning); ``MetricAdaptiveFastWAM`` dispatches
+        its ``force_branch="base"`` grad calls here and fails closed on the
+        IDM branch, whose future-video rollout has no gradient path (out of
+        W17 scope).
+
+        Contract differences from ``infer_action`` (which stays bitwise
+        unchanged):
+
+        * ``result["action"]`` is the graph-carrying ``[T, D]`` action latent
+          on ``self.device`` in ``self.torch_dtype`` — NOT detached, NOT moved
+          to CPU, NOT cast to float32. Convert only after building the loss.
+        * ``velocity_hook`` deltas are NOT detached under grad (see
+          ``_validate_velocity_delta``), so a hook output computed from
+          ``x_t``/``v`` stays inside the graph.
+        * ``result["init_noise"]`` (when requested) is detached CPU float32
+          exactly like ``infer_action``: the initial noise is an autograd
+          leaf, so there is no graph to preserve.
+        * Forward numerics are bitwise identical to ``infer_action`` for the
+          same inputs/seed — autograd recording does not change values.
+
+        Grad reaches every module the forward touches (action expert, MoT
+        projections, the video-side KV prefill, proprio encoder). Parameter
+        freezing decides what accumulates: keep the base weights frozen and
+        leave only the adapter parameters trainable.
+        """
+        with torch.enable_grad():
+            latents_action, init_noise_f32 = self._infer_action_impl(
+                prompt=prompt,
+                input_image=input_image,
+                action_horizon=action_horizon,
+                first_frame_latents=first_frame_latents,
+                proprio=proprio,
+                context=context,
+                context_mask=context_mask,
+                negative_prompt=negative_prompt,
+                text_cfg_scale=text_cfg_scale,
+                num_inference_steps=num_inference_steps,
+                sigma_shift=sigma_shift,
+                seed=seed,
+                rand_device=rand_device,
+                tiled=tiled,
+                init_noise=init_noise,
+                velocity_hook=velocity_hook,
+            )
+        result = {
+            "action": latents_action[0],
         }
         if return_init_noise:
             result["init_noise"] = init_noise_f32.detach().to(device="cpu", dtype=torch.float32)

@@ -351,37 +351,26 @@ class WAMModeAdapter:
         """Compatibility helper; prefer ``encode_world_state`` to reuse the latent."""
         return self.encode_world_state(input_image).world_feat
 
-    @torch.no_grad()
-    def act(
+    def _validate_act_inputs(
         self,
         *,
         input_image: torch.Tensor,
-        mode,
-        proprio: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-        context_mask: Optional[torch.Tensor] = None,
-        prompt: Optional[str] = None,
-        generation_horizon: Optional[int] = None,
-        num_video_frames: Optional[int] = None,
-        encoded_state: Optional[EncodedWorldState] = None,
-        seed: Optional[int] = None,
-        init_noise: Optional[torch.Tensor] = None,
-        velocity_hook: Optional[Any] = None,
-        return_init_noise: bool = False,
-    ) -> dict[str, Any]:
-        selected = coerce_mode(mode)
-        # Stage-2 W8 sampler interface: UNCOND-only by contract. The IDM branch
-        # dispatch filters unknown kwargs, so allowing these through for IDM
-        # would silently return an unguided rollout — fail closed here instead.
-        if selected is not WAMMode.UNCOND and (
-            init_noise is not None or velocity_hook is not None or return_init_noise
-        ):
-            raise ValueError(
-                "init_noise/velocity_hook/return_init_noise are UNCOND-only; got "
-                f"mode={selected.value!r}."
-            )
-        if init_noise is not None and seed is not None:
-            raise ValueError("`init_noise` and `seed` are mutually exclusive.")
+        proprio: Optional[torch.Tensor],
+        context: Optional[torch.Tensor],
+        context_mask: Optional[torch.Tensor],
+        generation_horizon: Optional[int],
+        num_video_frames: Optional[int],
+        encoded_state: Optional[EncodedWorldState],
+    ) -> tuple[int, int, EncodedWorldState]:
+        """Shared ``act()``/``act_with_grad()`` input validation (stage-2 W17).
+
+        The statements below are the verbatim pre-W17 validation prefix of
+        ``act()``, moved into one helper so the gradient-carrying entry point
+        cannot drift from the production checks. Pure validation plus the
+        (no-grad) world-state encode — no rollout numerics live here.
+
+        Returns ``(requested_horizon, requested_frames, encoded_state)``.
+        """
         self._validate_cost_resolution(input_image)
         expected_proprio_dim = getattr(self.model, "proprio_dim", None)
         if expected_proprio_dim is not None:
@@ -441,6 +430,48 @@ class WAMModeAdapter:
                 f"encoded world feature must have {self.world_feat_dim} elements, got "
                 f"{encoded_state.world_feat.numel()}."
             )
+        return requested_horizon, requested_frames, encoded_state
+
+    @torch.no_grad()
+    def act(
+        self,
+        *,
+        input_image: torch.Tensor,
+        mode,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        prompt: Optional[str] = None,
+        generation_horizon: Optional[int] = None,
+        num_video_frames: Optional[int] = None,
+        encoded_state: Optional[EncodedWorldState] = None,
+        seed: Optional[int] = None,
+        init_noise: Optional[torch.Tensor] = None,
+        velocity_hook: Optional[Any] = None,
+        return_init_noise: bool = False,
+    ) -> dict[str, Any]:
+        selected = coerce_mode(mode)
+        # Stage-2 W8 sampler interface: UNCOND-only by contract. The IDM branch
+        # dispatch filters unknown kwargs, so allowing these through for IDM
+        # would silently return an unguided rollout — fail closed here instead.
+        if selected is not WAMMode.UNCOND and (
+            init_noise is not None or velocity_hook is not None or return_init_noise
+        ):
+            raise ValueError(
+                "init_noise/velocity_hook/return_init_noise are UNCOND-only; got "
+                f"mode={selected.value!r}."
+            )
+        if init_noise is not None and seed is not None:
+            raise ValueError("`init_noise` and `seed` are mutually exclusive.")
+        requested_horizon, requested_frames, encoded_state = self._validate_act_inputs(
+            input_image=input_image,
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+            generation_horizon=generation_horizon,
+            num_video_frames=num_video_frames,
+            encoded_state=encoded_state,
+        )
 
         branch, steps = mode_to_branch_steps(selected, inference_steps=self.inference_steps)
         # An injected noise replaces the seed entirely; backfilling default_seed
@@ -491,6 +522,111 @@ class WAMModeAdapter:
         if return_init_noise:
             # Hard index: if the branch ever stops returning the key, replay
             # bookkeeping must fail loudly rather than cache a silent None.
+            result["init_noise"] = out["init_noise"]
+        return result
+
+    def act_with_grad(
+        self,
+        *,
+        input_image: torch.Tensor,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        prompt: Optional[str] = None,
+        generation_horizon: Optional[int] = None,
+        num_video_frames: Optional[int] = None,
+        encoded_state: Optional[EncodedWorldState] = None,
+        seed: Optional[int] = None,
+        init_noise: Optional[torch.Tensor] = None,
+        velocity_hook: Optional[Any] = None,
+        return_init_noise: bool = False,
+    ) -> dict[str, Any]:
+        """Gradient-carrying forced-UNCOND rollout (stage-2 W17 RL entry).
+
+        Same input contract and validation as ``act(mode=UNCOND)`` — the
+        shared ``_validate_act_inputs`` helper is the single source of truth —
+        but dispatches through ``infer_action_with_grad``, so
+        ``result["action_chunk"]`` keeps its autograd graph: the ``[T, D]``
+        action latent on the model device/dtype, NOT detached / NOT moved to
+        CPU / NOT cast to float32. Back-propagating a scalar loss built from
+        it populates ``.grad`` on every parameter the forward used (with the
+        base frozen, only the UNCOND-gated adapter parameters accumulate).
+
+        There is deliberately no ``mode`` parameter: the gradient path exists
+        only for the base/UNCOND branch (the IDM future-video rollout has no
+        gradient path in W17 scope), and the dual-regime model fails closed on
+        any other ``force_branch``. ``encode_world_state`` remains no-grad —
+        the first-frame latent is conditioning, not a differentiation target.
+        Forward numerics are bitwise identical to ``act(mode=UNCOND)`` for the
+        same inputs/seed.
+        """
+        if not hasattr(self.model, "infer_action_with_grad"):
+            raise TypeError(
+                "Loaded WAM does not expose `infer_action_with_grad`; "
+                "act_with_grad requires a stage-2 W17 dual-regime model."
+            )
+        if init_noise is not None and seed is not None:
+            raise ValueError("`init_noise` and `seed` are mutually exclusive.")
+        requested_horizon, requested_frames, encoded_state = self._validate_act_inputs(
+            input_image=input_image,
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+            generation_horizon=generation_horizon,
+            num_video_frames=num_video_frames,
+            encoded_state=encoded_state,
+        )
+
+        branch, steps = mode_to_branch_steps(
+            WAMMode.UNCOND, inference_steps=self.inference_steps
+        )
+        # Mirrors act(): an injected noise replaces the seed entirely, and the
+        # sampler-interface kwargs are forwarded only when engaged.
+        effective_seed = (
+            None
+            if init_noise is not None
+            else (seed if seed is not None else self.default_seed)
+        )
+        sampler_kwargs: dict[str, Any] = {}
+        if init_noise is not None:
+            sampler_kwargs["init_noise"] = init_noise
+        if velocity_hook is not None:
+            sampler_kwargs["velocity_hook"] = velocity_hook
+        if return_init_noise:
+            sampler_kwargs["return_init_noise"] = True
+        out = self.model.infer_action_with_grad(
+            prompt=prompt,
+            input_image=input_image,
+            first_frame_latents=encoded_state.first_frame_latents,
+            action_horizon=requested_horizon,
+            num_video_frames=requested_frames,
+            proprio=proprio,
+            context=context,
+            context_mask=context_mask,
+            num_inference_steps=steps,
+            sigma_shift=self.sigma_shift,
+            seed=effective_seed,
+            force_branch=branch,
+            return_routing_info=True,
+            **sampler_kwargs,
+        )
+        result = {
+            "action_chunk": out["action"],
+            "world_feat": encoded_state.world_feat,
+            "cost": float(self.cost_table[WAMMode.UNCOND.value]),
+            "aux": {
+                "mode": WAMMode.UNCOND.value,
+                "branch": branch,
+                "video_inference_steps": None,
+                "action_inference_steps": steps,
+                "num_inference_steps": steps,
+                "grad_enabled": True,
+                "routing": out.get("_routing"),
+            },
+        }
+        if return_init_noise:
+            # Hard index, mirroring act(): replay bookkeeping must fail loudly
+            # rather than cache a silent None.
             result["init_noise"] = out["init_noise"]
         return result
 
