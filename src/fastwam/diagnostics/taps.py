@@ -2,23 +2,50 @@
 
 Decision point DP2 does not ask "H1 or H2"; it asks *where* the information is
 lost under texture shift. Answering that needs the same linear read-out fitted at
-three loci:
+three loci. AUC collapsing at the VAE latent means the encoder itself lost it ->
+an external semantic encoder is required (route C2). At the video-expert hidden
+state -> a video-side UNCOND-gated LoRA (route C1). Nowhere -> the information
+survives and route A suffices.
 
-    (a) VAE latent            -> `WAMModeAdapter.encode_world_state`
-                                 (adaptive_gate/wam_mode_adapter.py:325)
-    (b) video-expert hidden   -> `video_expert.pre_dit` output, and after N MoT blocks
-    (c) action-expert readout -> the input to `action_expert.post_dit`
-                                 (models/wan22/action_dit.py:301)
+**Not every locus is reachable by a forward hook**, and getting this wrong is easy
+because the obvious names are methods rather than submodules. Statically verified
+against FastWAM `ac7d376`:
 
-AUC collapsing at (a) means the encoder itself lost it -> an external semantic
-encoder is required (route C2). At (b) -> a video-side UNCOND-gated LoRA (route
-C1). Nowhere -> the information survives and route A suffices.
+===========================  =====================================================
+locus                        how to obtain it
+===========================  =====================================================
+(a) VAE latent               **not hookable via the adapter.** `WAMModeAdapter` is
+                             a plain class, not an `nn.Module`
+                             (`adaptive_gate/wam_mode_adapter.py:36`), so
+                             `encode_world_state` (`:325`) carries no hooks. Either
+                             call it and keep its returned
+                             `EncodedWorldState.first_frame_latents` directly -- no
+                             taps needed, `probe_taps` accepts plain arrays -- or
+                             hook the `model.vae` submodule
+                             (`models/wan22/fastwam.py:56`).
+(b) video-expert hidden      `video_expert.pre_dit` is a **method**
+                             (`wan_video_dit.py:509`) and cannot be hooked. Hook
+                             `video_expert.blocks.N` instead
+                             (`nn.ModuleList`, `wan_video_dit.py:381`).
+(c) action-expert readout    `action_expert.post_dit` is a **method**
+                             (`action_dit.py:301`); it is a thin wrapper over
+                             `self.head`. Hook `action_expert.head`
+                             (`nn.Linear`, `action_dit.py:98`) with
+                             ``site="input"`` -- that input *is* the readout state.
+===========================  =====================================================
+
+`CANDIDATE_FASTWAM_TAPS` below encodes this. It is derived from the class
+definitions only: **no real forward pass has ever been run through it**, so the
+firing order, tensor shapes and correct `feature_dim` values are unverified. The
+measurement work order must check them against a live model before trusting any
+number.
 
 **This module must never modify `models/wan22/`.** Extraction is done purely with
 `torch.nn.Module.register_forward_hook` / `register_forward_pre_hook`, for two
 reasons: another development lane owns those files, and a hook cannot perturb the
 numerical path the way an inline edit could. A probe that changed the thing it
 measures would be worthless.
+
 """
 
 from __future__ import annotations
@@ -30,6 +57,7 @@ import torch
 from torch import nn
 
 __all__ = [
+    "CANDIDATE_FASTWAM_TAPS",
     "TapSpec",
     "ActivationTaps",
     "resolve_module",
@@ -71,6 +99,27 @@ class TapSpec:
             raise ValueError(
                 f"TapSpec.site must be 'output' or 'input', got {self.site!r}."
             )
+
+
+#: Hookable tap points for a real `FastWAM` root module.
+#:
+#: **Statically derived from the class definitions at `ac7d376`; never executed
+#: against a live model.** Attribute existence is pinned by
+#: `test_candidate_fastwam_taps_resolve_on_a_structural_stub`, but firing order,
+#: shapes and the right `feature_dim` are all unverified. The VAE latent is
+#: deliberately absent: `WAMModeAdapter` is not an `nn.Module`, so that locus is
+#: obtained by calling `encode_world_state()` and passing the returned
+#: `first_frame_latents` straight to `probe_taps`, which accepts plain arrays.
+CANDIDATE_FASTWAM_TAPS: tuple[TapSpec, ...] = (
+    # `model.vae` is an nn.Module, so this is the hookable route to locus (a).
+    # feature_dim=1 assumes a [B, C, T, H, W] latent -- confirm before use.
+    TapSpec("vae_latent", "vae", feature_dim=1),
+    # `video_expert.blocks` is an nn.ModuleList; index it for locus (b).
+    TapSpec("video_block_0", "video_expert.blocks.0", feature_dim=-1),
+    # Locus (c): the *input* to the action head is the readout state that
+    # `post_dit` would have consumed.
+    TapSpec("action_readout", "action_expert.head", site="input", feature_dim=-1),
+)
 
 
 def resolve_module(root: nn.Module, module_path: str) -> nn.Module:

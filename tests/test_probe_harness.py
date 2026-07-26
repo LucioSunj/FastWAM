@@ -22,6 +22,7 @@ torch = pytest.importorskip("torch")
 from torch import nn  # noqa: E402
 
 from fastwam.diagnostics import (  # noqa: E402
+    CANDIDATE_FASTWAM_TAPS,
     ActivationTaps,
     TapSpec,
     cross_fitted_probe,
@@ -210,6 +211,76 @@ def test_duplicate_tap_names_are_rejected():
     model = _FakeStack().eval()
     with pytest.raises(ValueError, match="duplicate tap names"):
         ActivationTaps(model, [TapSpec("a", "vae"), TapSpec("a", "readout")])
+
+
+def test_candidate_fastwam_taps_resolve_on_a_structural_stub():
+    """Pin the real tap paths against a stub with FastWAM's attribute names.
+
+    This is a *structural* check, not a functional one. It catches a typo or a
+    rename in `CANDIDATE_FASTWAM_TAPS`; it cannot tell you the taps fire, what
+    shapes they produce, or whether `feature_dim` is right, because instantiating
+    the real model needs transformers and Wan weights. Two of these three paths
+    were wrong on first writing -- `pre_dit` and `post_dit` are methods, not
+    submodules, and carry no hooks -- which is exactly the class of mistake this
+    locks down.
+    """
+    class _StubActionDiT(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([nn.Linear(4, 4)])
+            self.head = nn.Linear(4, 2)          # action_dit.py:98
+
+        def forward(self, x):
+            return self.head(self.blocks[0](x))
+
+    class _StubVideoDiT(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList([nn.Linear(4, 4)])  # wan_video_dit.py:381
+            self.head = nn.Linear(4, 4)
+
+        def forward(self, x):
+            return self.head(self.blocks[0](x))
+
+    class _StubFastWAM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vae = nn.Linear(4, 4)           # fastwam.py:56
+            self.video_expert = _StubVideoDiT()  # fastwam.py:50
+            self.action_expert = _StubActionDiT()  # fastwam.py:51
+
+        def forward(self, x):
+            return self.action_expert(self.video_expert(self.vae(x)))
+
+    stub = _StubFastWAM().eval()
+    for spec in CANDIDATE_FASTWAM_TAPS:
+        resolved = resolve_module(stub, spec.module_path)
+        assert isinstance(resolved, nn.Module), spec
+
+    with ActivationTaps(stub, CANDIDATE_FASTWAM_TAPS) as taps:
+        with torch.no_grad():
+            stub(torch.randn(3, 4))
+    assert all(count == 1 for count in taps.counts().values()), taps.counts()
+    assert tuple(taps.stack("action_readout").shape) == (3, 4), (
+        "the action head's *input* is the readout state, not its output"
+    )
+
+
+def test_methods_are_rejected_as_tap_points():
+    """`pre_dit` / `post_dit` are methods; the error must say so, not fail obscurely."""
+    class _WithMethod(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.head = nn.Linear(2, 2)
+
+        def post_dit(self, x):  # a method, exactly like ActionDiT.post_dit
+            return self.head(x)
+
+        def forward(self, x):
+            return self.post_dit(x)
+
+    with pytest.raises(TypeError, match="not an nn.Module"):
+        ActivationTaps(_WithMethod(), [TapSpec("bad", "post_dit")])
 
 
 def test_resolve_module_handles_root_and_indices():

@@ -20,10 +20,11 @@ from .probe import (
     probe_taps,
     roc_auc,
 )
-from .taps import ActivationTaps, TapSpec, resolve_module
+from .taps import CANDIDATE_FASTWAM_TAPS, ActivationTaps, TapSpec, resolve_module
 
 __all__ = [
     "ActivationTaps",
+    "CANDIDATE_FASTWAM_TAPS",
     "TapSpec",
     "resolve_module",
     "DEFAULT_POOL_DIM",
