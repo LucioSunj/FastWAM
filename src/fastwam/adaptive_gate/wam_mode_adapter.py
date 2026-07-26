@@ -489,7 +489,9 @@ class WAMModeAdapter:
             },
         }
         if return_init_noise:
-            result["init_noise"] = out.get("init_noise")
+            # Hard index: if the branch ever stops returning the key, replay
+            # bookkeeping must fail loudly rather than cache a silent None.
+            result["init_noise"] = out["init_noise"]
         return result
 
     @torch.no_grad()

@@ -22,13 +22,19 @@ logger = get_logger(__name__)
 
 
 #: Signature of `infer_action`'s per-step velocity hook (stage-2 W8):
-#: ``hook(x_t, timestep, step_index) -> delta_v | None``. ``x_t`` is the
-#: CURRENT action latent before this solver step, ``timestep`` is the exact
-#: element of ``build_inference_schedule``'s timestep grid (the scheduler
-#: parameterization ``t = sigma * num_train_timesteps``, NOT unit-interval
-#: sigma), and ``step_index`` counts from 0. Returning ``None`` skips the
-#: correction for this step.
-VelocityHook = Callable[[torch.Tensor, torch.Tensor, int], Optional[torch.Tensor]]
+#: ``hook(x_t, v, timestep, step_index) -> delta_v | None``. ``x_t`` is the
+#: CURRENT action latent before this solver step, ``v`` is the model's raw
+#: velocity prediction for this step (so x0_hat-space guidance can form
+#: ``predicted_clean_action(x_t, sigma, v)`` without re-running the model),
+#: ``timestep`` is the exact element of ``build_inference_schedule``'s
+#: timestep grid (the scheduler parameterization
+#: ``t = sigma * num_train_timesteps``, NOT unit-interval sigma — convert via
+#: ``fastwam.adaptive_gate.flow_objective.sigma_from_timestep``), and
+#: ``step_index`` counts from 0. Returning ``None`` skips the correction for
+#: this step. Hooks must not mutate ``x_t``/``v`` in place.
+VelocityHook = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, int], Optional[torch.Tensor]
+]
 
 
 def _validate_action_init_noise(
@@ -1130,12 +1136,14 @@ class FastWAM(torch.nn.Module):
           ``.to(device, torch_dtype)`` conversion, so injecting the noise a
           given ``seed`` would have produced yields a bit-identical action.
           Mutually exclusive with ``seed``.
-        * ``velocity_hook``: per-step correction ``hook(x_t, timestep,
+        * ``velocity_hook``: per-step correction ``hook(x_t, v, timestep,
           step_index) -> delta_v | None`` added to the predicted velocity
-          BEFORE the scheduler step (see :data:`VelocityHook`). This method
-          stays under ``@torch.no_grad()``; a hook needing gradients for its
-          own critic must open a local ``with torch.enable_grad():`` block —
-          the returned delta is detached either way.
+          BEFORE the scheduler step (see :data:`VelocityHook`); ``v`` is the
+          model's raw velocity prediction, enabling x0_hat-space guidance
+          without re-running the model. This method stays under
+          ``@torch.no_grad()``; a hook needing gradients for its own critic
+          must open a local ``with torch.enable_grad():`` block — the
+          returned delta is detached either way.
         * ``return_init_noise``: also return the float32 pre-conversion noise
           under ``"init_noise"`` (CPU), for (noise -> action) replay caches.
         """
@@ -1279,10 +1287,13 @@ class FastWAM(torch.nn.Module):
             pred_action = pred_action_posi
 
             if velocity_hook is not None:
-                # The hook sees the pre-step latent and the exact timestep-grid
-                # element; the correction lands BEFORE the scheduler step so the
-                # scheduler itself stays a pure, untouched function.
-                delta_v = velocity_hook(latents_action, step_t_action, step_index)
+                # The hook sees the pre-step latent, the model's raw velocity
+                # prediction, and the exact timestep-grid element; the
+                # correction lands BEFORE the scheduler step so the scheduler
+                # itself stays a pure, untouched function.
+                delta_v = velocity_hook(
+                    latents_action, pred_action_posi, step_t_action, step_index
+                )
                 if delta_v is not None:
                     pred_action = pred_action + _validate_velocity_delta(
                         delta_v, reference=pred_action

@@ -172,6 +172,15 @@ class TestInitNoise:
     def test_default_path_returns_no_noise_key(self, model):
         assert "init_noise" not in _run(model, seed=123)
 
+    def test_float64_noise_is_converted_before_solving(self, model):
+        # The conversion contract: injected noise follows the SAME
+        # .to(device, torch_dtype) as the internal draw. A float64 injection of
+        # the float32 seed noise must therefore replay bitwise; a mutant that
+        # skips the conversion runs the solver in float64 and diverges.
+        ref = _run(model, seed=123, return_init_noise=True)
+        replay = _run(model, init_noise=ref["init_noise"].to(torch.float64))
+        assert torch.equal(replay["action"], ref["action"])
+
     @pytest.mark.parametrize(
         "bad, match",
         (
@@ -197,44 +206,110 @@ class TestInitNoise:
 class TestVelocityHook:
     def test_hook_sees_every_step_and_the_exact_timestep_grid(self, model):
         steps = 6
-        calls: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+        calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = []
 
-        def hook(x_t, timestep, step_index):
-            calls.append((x_t.detach().clone(), timestep.detach().clone(), step_index))
+        def hook(x_t, v, timestep, step_index):
+            calls.append(
+                (x_t.detach().clone(), v.detach().clone(), timestep.detach().clone(), step_index)
+            )
             return None
 
         out = _run(model, seed=123, steps=steps, velocity_hook=hook, return_init_noise=True)
         assert len(calls) == steps
-        assert [c[2] for c in calls] == list(range(steps))
+        assert [c[3] for c in calls] == list(range(steps))
         expected_t, _ = model.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=steps, device=torch.device("cpu"), dtype=torch.float32
         )
-        for (_, seen_t, idx) in calls:
+        for (_, _, seen_t, idx) in calls:
             assert torch.equal(seen_t, expected_t[idx]), idx
         # Step 0 sees the initial latent, i.e. the converted init noise.
         assert torch.equal(calls[0][0], out["init_noise"].to(torch.float32))
 
+    def test_hook_v_is_exactly_the_velocity_the_step_integrates(self, model):
+        # Pins BOTH that `v` is the model's raw prediction and that the solver
+        # update is x_{k+1} = x_k + v_k * delta_k applied BEFORE anything else:
+        # replaying the captured (x_k, v_k) through scheduler.step must
+        # reproduce the next captured latent (and the final action) bitwise.
+        steps = 5
+        calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        def hook(x_t, v, timestep, step_index):
+            calls.append((x_t.detach().clone(), v.detach().clone()))
+            return None
+
+        out = _run(model, seed=123, steps=steps, velocity_hook=hook)["action"]
+        _, deltas = model.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=steps, device=torch.device("cpu"), dtype=torch.float32
+        )
+        for k in range(steps - 1):
+            stepped = model.infer_action_scheduler.step(calls[k][1], deltas[k], calls[k][0])
+            assert torch.equal(stepped, calls[k + 1][0]), k
+        final = model.infer_action_scheduler.step(
+            calls[-1][1], deltas[-1], calls[-1][0]
+        )
+        assert torch.equal(final[0].to(torch.float32), out)
+
+    def test_hook_enables_x0_hat_guidance_without_rerunning_the_model(self, model):
+        # The documented B-guidance use: form x0_hat = x_t - sigma * v from the
+        # hook arguments alone (flow_objective pure functions, no model call).
+        flow = pytest.importorskip("fastwam.adaptive_gate.flow_objective")
+        n_train = model.infer_action_scheduler.num_train_timesteps
+        seen: list[torch.Tensor] = []
+
+        def hook(x_t, v, timestep, step_index):
+            sigma = flow.sigma_from_timestep(timestep.reshape(1), n_train)
+            x0_hat = flow.predicted_clean_action(x_t.float(), sigma, v.float())
+            assert x0_hat.shape == x_t.shape
+            assert torch.isfinite(x0_hat).all()
+            seen.append(x0_hat)
+            return None
+
+        _run(model, seed=123, steps=4, velocity_hook=hook)
+        assert len(seen) == 4
+
+    def test_constant_delta_single_step_shifts_exactly(self, model):
+        # With ONE solver step, v is computed from the same x0 in both runs, so
+        # out_hooked - out_ref == c * delta_0 exactly (up to one float fma
+        # association). This kills mutants that apply the correction after the
+        # scheduler step, drop the delta scaling, or flip its sign.
+        c = 0.75
+        ref = _run(model, seed=123, steps=1)["action"]
+        out = _run(
+            model,
+            seed=123,
+            steps=1,
+            velocity_hook=lambda x, v, t, i: torch.full((1, HORIZON, ACT_DIM), c),
+        )["action"]
+        _, deltas = model.infer_action_scheduler.build_inference_schedule(
+            num_inference_steps=1, device=torch.device("cpu"), dtype=torch.float32
+        )
+        expected = ref + c * deltas[0]
+        torch.testing.assert_close(out, expected, atol=1e-6, rtol=0.0)
+        assert not torch.equal(out, ref)
+
     def test_none_returning_hook_is_bitwise_transparent(self, model):
         ref = _run(model, seed=123)["action"]
-        out = _run(model, seed=123, velocity_hook=lambda x, t, i: None)["action"]
+        out = _run(model, seed=123, velocity_hook=lambda x, v, t, i: None)["action"]
         assert torch.equal(out, ref)
 
     def test_zero_delta_hook_is_value_transparent(self, model):
         ref = _run(model, seed=123)["action"]
-        out = _run(model, seed=123, velocity_hook=lambda x, t, i: torch.zeros(1, HORIZON, ACT_DIM))[
-            "action"
-        ]
+        out = _run(
+            model, seed=123, velocity_hook=lambda x, v, t, i: torch.zeros(1, HORIZON, ACT_DIM)
+        )["action"]
         assert torch.equal(out, ref)
 
     def test_nonzero_delta_changes_the_action(self, model):
         ref = _run(model, seed=123)["action"]
         out = _run(
-            model, seed=123, velocity_hook=lambda x, t, i: torch.full((1, HORIZON, ACT_DIM), 0.5)
+            model,
+            seed=123,
+            velocity_hook=lambda x, v, t, i: torch.full((1, HORIZON, ACT_DIM), 0.5),
         )["action"]
         assert not torch.equal(out, ref)
 
     def test_hook_grad_does_not_leak_into_the_sampler(self, model):
-        def hook(x_t, timestep, step_index):
+        def hook(x_t, v, timestep, step_index):
             with torch.enable_grad():
                 probe = x_t.detach().requires_grad_(True)
                 (energy,) = torch.autograd.grad(probe.square().sum(), probe)
@@ -253,7 +328,7 @@ class TestVelocityHook:
     )
     def test_bad_delta_fails_closed(self, model, delta, match):
         with pytest.raises((ValueError, TypeError), match=match):
-            _run(model, seed=123, velocity_hook=lambda x, t, i: delta)
+            _run(model, seed=123, velocity_hook=lambda x, v, t, i: delta)
 
 
 # --------------------------------------------------------------------------- #
@@ -295,6 +370,18 @@ class TestFlowObjective:
             predicted_clean_action(x, torch.rand(3), torch.randn(2, 3, 2))
         with pytest.raises(TypeError, match="torch.Tensor"):
             predicted_clean_action(x, 0.5, torch.randn(2, 3, 2))
+
+    def test_predicted_clean_action_rejects_out_of_range_sigma(self):
+        # The natural wrong input IS a raw scheduler timestep (t = sigma*1000):
+        # fail closed on it instead of returning silent garbage.
+        x = torch.randn(2, 3, 2)
+        v = torch.randn(2, 3, 2)
+        with pytest.raises(ValueError, match=r"sigma_from_timestep"):
+            predicted_clean_action(x, torch.tensor(800.0), v)
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            predicted_clean_action(x, torch.tensor([-0.01, 0.5]), v)
+        # Boundary values stay accepted.
+        predicted_clean_action(x, torch.tensor([0.0, 1.0]), v)
 
     @staticmethod
     def _reference_loss(pred, target, timestep, scheduler, action_is_pad):
@@ -442,3 +529,243 @@ class TestDispatchGuard:
 
         params = inspect.signature(FastWAM.infer_action).parameters
         assert {"init_noise", "velocity_hook", "return_init_noise"} <= set(params)
+
+
+# --------------------------------------------------------------------------- #
+# 6. WAMModeAdapter.act() sampler-kwarg plumbing (the RL entry point)
+# --------------------------------------------------------------------------- #
+class _AdapterStubVAE:
+    def __init__(self):
+        self.model = types.SimpleNamespace(z_dim=8)
+
+    def to(self, *args, **kwargs):
+        return self
+
+
+class _AdapterStubModel:
+    """Records exactly which kwargs act() forwards to infer_action."""
+
+    adaptive_regimes = ("uncond", "idm")
+    adaptive_backbone_kind = "idm"
+
+    def __init__(self):
+        self.vae = _AdapterStubVAE()
+        self.action_expert = types.SimpleNamespace(action_dim=7)
+        self.torch_dtype = torch.float32
+        self.device = torch.device("cpu")
+        self.proprio_dim = None
+        self.infer_video_scheduler = types.SimpleNamespace(shift=5.0, num_train_timesteps=1000)
+        self.infer_action_scheduler = types.SimpleNamespace(shift=5.0, num_train_timesteps=1000)
+        self.calls: list[dict] = []
+
+    def _encode_input_image_latents_tensor(self, image):
+        return torch.arange(8 * 4 * 4, dtype=torch.float32).reshape(1, 8, 1, 4, 4)
+
+    # force_branch / first_frame_latents are explicit because the adapter's
+    # __init__ validates their presence in the signature; **kwargs records
+    # whether the adapter forwarded the optional sampler keys at all.
+    def infer_action(self, *, force_branch=None, first_frame_latents=None, **kwargs):
+        call = {**kwargs, "force_branch": force_branch}
+        self.calls.append(call)
+        out = {
+            "action": torch.zeros(call["action_horizon"], 7),
+            "_routing": {"selected_branch": force_branch},
+        }
+        if call.get("return_init_noise"):
+            out["init_noise"] = torch.full((1, call["action_horizon"], 7), 0.25)
+        return out
+
+
+class TestAdapterSamplerKwargs:
+    @staticmethod
+    def _adapter():
+        adapter_module = pytest.importorskip("fastwam.adaptive_gate.wam_mode_adapter")
+        model = _AdapterStubModel()
+        adapter = adapter_module.WAMModeAdapter(
+            model,
+            backbone_kind="idm",
+            num_video_frames=9,
+            generation_horizon=32,
+            inference_steps=20,
+            context_len=8,
+            default_seed=77,
+            allow_unloaded_model=True,
+        )
+        return adapter, model
+
+    @staticmethod
+    def _image():
+        return torch.rand(1, 3, 64, 64)
+
+    @staticmethod
+    def _mode(name):
+        modes = pytest.importorskip("fastwam.adaptive_gate.modes")
+        return modes.WAMMode.UNCOND if name == "uncond" else modes.WAMMode.IDM
+
+    @pytest.mark.parametrize(
+        "extra",
+        (
+            {"init_noise": torch.randn(1, 32, 7)},
+            {"velocity_hook": lambda x, v, t, i: None},
+            {"return_init_noise": True},
+        ),
+    )
+    def test_idm_mode_refuses_sampler_kwargs_before_any_model_call(self, extra):
+        adapter, model = self._adapter()
+        with pytest.raises(ValueError, match="UNCOND-only"):
+            adapter.act(input_image=self._image(), mode=self._mode("idm"), **extra)
+        assert model.calls == []
+
+    def test_adapter_level_mutual_exclusion_fires_before_the_model(self):
+        adapter, model = self._adapter()
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            adapter.act(
+                input_image=self._image(),
+                mode=self._mode("uncond"),
+                seed=5,
+                init_noise=torch.randn(1, 32, 7),
+            )
+        assert model.calls == []
+
+    def test_default_path_forwards_default_seed_and_no_sampler_keys(self):
+        adapter, model = self._adapter()
+        adapter.act(input_image=self._image(), mode=self._mode("uncond"))
+        (call,) = model.calls
+        assert call["seed"] == 77
+        assert "init_noise" not in call
+        assert "velocity_hook" not in call
+        assert "return_init_noise" not in call
+
+    def test_injected_noise_suppresses_default_seed_and_passes_through(self):
+        adapter, model = self._adapter()
+        noise = torch.randn(1, 32, 7)
+        adapter.act(input_image=self._image(), mode=self._mode("uncond"), init_noise=noise)
+        (call,) = model.calls
+        assert call["seed"] is None
+        assert call["init_noise"] is noise
+        assert "velocity_hook" not in call
+
+    def test_velocity_hook_passes_through_by_identity(self):
+        adapter, model = self._adapter()
+
+        def hook(x_t, v, timestep, step_index):
+            return None
+
+        adapter.act(input_image=self._image(), mode=self._mode("uncond"), velocity_hook=hook)
+        (call,) = model.calls
+        assert call["velocity_hook"] is hook
+        assert call["seed"] == 77  # a hook alone must not disturb seeding
+
+    def test_return_init_noise_plumbs_the_branch_tensor_out(self):
+        adapter, model = self._adapter()
+        result = adapter.act(
+            input_image=self._image(), mode=self._mode("uncond"), return_init_noise=True
+        )
+        assert torch.equal(result["init_noise"], torch.full((1, 32, 7), 0.25))
+
+
+# --------------------------------------------------------------------------- #
+# 7. Fused dual-regime training_loss draws injection/exposure mechanics
+# --------------------------------------------------------------------------- #
+class TestFusedDrawsInjection:
+    @staticmethod
+    def _stub():
+        fused = pytest.importorskip("fastwam.models.wan22.fastwam_dual_regime_fused")
+        mixin = fused._FusedDualRegimeTrainingMixin
+
+        class FusedStub(mixin):
+            main_regime_name = "idm"
+
+            def __init__(self):
+                self.video_expert = types.SimpleNamespace(patch_size=(1, 2, 2))
+                self.train_video_scheduler = WanContinuousFlowMatchScheduler(1000, 5.0)
+                self.train_action_scheduler = WanContinuousFlowMatchScheduler(1000, 5.0)
+                self.device = torch.device("cpu")
+                self.loss_lambda_video = 1.0
+                self.loss_lambda_action = 1.0
+                self.action_regime_weight_uncond = 0.5
+                self.sample_calls = 0
+                self.forward_draws: list = []
+
+            def build_inputs(self, sample, tiled=False):
+                torch.manual_seed(31)
+                return {
+                    "input_latents": torch.randn(2, 2, 2, 2, 2),
+                    "first_frame_latents": torch.randn(2, 2, 1, 2, 2),
+                    "context": None,
+                    "context_mask": None,
+                    "action": torch.randn(2, HORIZON, ACT_DIM),
+                    "action_is_pad": None,
+                    "image_is_pad": None,
+                    "fuse_vae_embedding_in_latents": True,
+                }
+
+            def _sample_dual_regime_draws(self, inputs):
+                self.sample_calls += 1
+                return {"origin": "sampled", "token": object()}
+
+            def _fused_dual_regime_forward(self, inputs, draws):
+                self.forward_draws.append(draws)
+                torch.manual_seed(41)
+                batch = 2
+
+                def _draft(name):
+                    return {
+                        "name": name,
+                        "pred": torch.randn(batch, HORIZON, ACT_DIM),
+                        "target": torch.randn(batch, HORIZON, ACT_DIM),
+                        "timestep": torch.rand(batch) * 999.0,
+                    }
+
+                return {
+                    "pred_video": torch.randn(batch, 2, 2, 2, 2),
+                    "target_video": torch.randn(batch, 2, 2, 2, 2),
+                    "timestep_video": torch.rand(batch) * 999.0,
+                    "action_drafts": [_draft("idm"), _draft("base")],
+                }
+
+            def _compute_video_loss_per_sample(
+                self, pred_video, target_video, image_is_pad, include_initial_video_step
+            ):
+                return F.mse_loss(
+                    pred_video.float(), target_video.float(), reduction="none"
+                ).mean(dim=(1, 2, 3, 4))
+
+            def _action_loss_per_sample(self, pred_action, target_action, action_is_pad):
+                return F.mse_loss(
+                    pred_action.float(), target_action.float(), reduction="none"
+                ).mean(dim=(1, 2))
+
+        return FusedStub()
+
+    def test_default_path_samples_once_and_forwards_the_sampled_dict(self):
+        stub = self._stub()
+        loss, loss_dict = stub.training_loss(sample=None)
+        assert stub.sample_calls == 1
+        assert len(stub.forward_draws) == 1
+        assert stub.forward_draws[0]["origin"] == "sampled"
+        assert torch.isfinite(loss)
+        assert "loss_action_combined" in loss_dict
+
+    def test_injected_draws_bypass_sampling_and_are_used_verbatim(self):
+        stub = self._stub()
+        injected = {"origin": "injected", "token": object()}
+        stub.training_loss(sample=None, draws=injected)
+        # Verbatim use: no sampling call (so the diagnostic noise-coupling hook,
+        # which lives inside _sample_dual_regime_draws, cannot be re-applied),
+        # and the forward received the SAME dict object.
+        assert stub.sample_calls == 0
+        assert stub.forward_draws[0] is injected
+
+    def test_draws_out_receives_the_draws_actually_used(self):
+        stub = self._stub()
+        captured: dict = {}
+        stub.training_loss(sample=None, draws_out=captured)
+        assert captured["origin"] == "sampled"
+        assert captured["token"] is stub.forward_draws[0]["token"]
+
+        stub2 = self._stub()
+        captured2: dict = {}
+        injected = {"origin": "injected", "token": object()}
+        stub2.training_loss(sample=None, draws=injected, draws_out=captured2)
+        assert captured2["token"] is injected["token"]

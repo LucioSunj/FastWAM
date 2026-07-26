@@ -61,6 +61,14 @@ def predicted_clean_action(
         raise ValueError(
             f"`sigma` must have 1 or batch({x_sigma.shape[0]}) elements, got {sigma.numel()}"
         )
+    sigma_range = sigma.detach().to(torch.float32)
+    if bool((sigma_range < 0.0).any()) or bool((sigma_range > 1.0).any()):
+        raise ValueError(
+            "`sigma` must lie in [0, 1], got range "
+            f"[{float(sigma_range.min())}, {float(sigma_range.max())}]. Scheduler "
+            "timesteps are parameterized t = sigma * num_train_timesteps — convert "
+            "with sigma_from_timestep() before calling predicted_clean_action()."
+        )
     sigma = sigma.to(device=x_sigma.device, dtype=x_sigma.dtype)
     if sigma.numel() == 1:
         return x_sigma - sigma.reshape(()) * v
