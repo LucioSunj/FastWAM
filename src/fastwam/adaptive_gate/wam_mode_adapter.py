@@ -365,8 +365,23 @@ class WAMModeAdapter:
         num_video_frames: Optional[int] = None,
         encoded_state: Optional[EncodedWorldState] = None,
         seed: Optional[int] = None,
+        init_noise: Optional[torch.Tensor] = None,
+        velocity_hook: Optional[Any] = None,
+        return_init_noise: bool = False,
     ) -> dict[str, Any]:
         selected = coerce_mode(mode)
+        # Stage-2 W8 sampler interface: UNCOND-only by contract. The IDM branch
+        # dispatch filters unknown kwargs, so allowing these through for IDM
+        # would silently return an unguided rollout — fail closed here instead.
+        if selected is not WAMMode.UNCOND and (
+            init_noise is not None or velocity_hook is not None or return_init_noise
+        ):
+            raise ValueError(
+                "init_noise/velocity_hook/return_init_noise are UNCOND-only; got "
+                f"mode={selected.value!r}."
+            )
+        if init_noise is not None and seed is not None:
+            raise ValueError("`init_noise` and `seed` are mutually exclusive.")
         self._validate_cost_resolution(input_image)
         expected_proprio_dim = getattr(self.model, "proprio_dim", None)
         if expected_proprio_dim is not None:
@@ -428,6 +443,22 @@ class WAMModeAdapter:
             )
 
         branch, steps = mode_to_branch_steps(selected, inference_steps=self.inference_steps)
+        # An injected noise replaces the seed entirely; backfilling default_seed
+        # here would trip the base model's init_noise/seed exclusivity check.
+        effective_seed = (
+            None
+            if init_noise is not None
+            else (seed if seed is not None else self.default_seed)
+        )
+        # Forward sampler-interface kwargs only when engaged, so the default
+        # path keeps calling older model signatures unchanged.
+        sampler_kwargs: dict[str, Any] = {}
+        if init_noise is not None:
+            sampler_kwargs["init_noise"] = init_noise
+        if velocity_hook is not None:
+            sampler_kwargs["velocity_hook"] = velocity_hook
+        if return_init_noise:
+            sampler_kwargs["return_init_noise"] = True
         out = self.model.infer_action(
             prompt=prompt,
             input_image=input_image,
@@ -439,11 +470,12 @@ class WAMModeAdapter:
             context_mask=context_mask,
             num_inference_steps=steps,
             sigma_shift=self.sigma_shift,
-            seed=seed if seed is not None else self.default_seed,
+            seed=effective_seed,
             force_branch=branch,
             return_routing_info=True,
+            **sampler_kwargs,
         )
-        return {
+        result = {
             "action_chunk": out["action"],
             "world_feat": encoded_state.world_feat,
             "cost": float(self.cost_table[selected.value]),
@@ -456,6 +488,11 @@ class WAMModeAdapter:
                 "routing": out.get("_routing"),
             },
         }
+        if return_init_noise:
+            # Hard index: if the branch ever stops returning the key, replay
+            # bookkeeping must fail loudly rather than cache a silent None.
+            result["init_noise"] = out["init_noise"]
+        return result
 
     @torch.no_grad()
     def act_control(

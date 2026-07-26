@@ -347,7 +347,12 @@ class TestNoRegimeOutsideScope:
         probe(torch.randn(2, 4))
         assert records == [("direct", None)]
 
-    def test_kv_cache_paths_accept_and_forward_regime(self):
+    @pytest.mark.parametrize("regime", (REGIME_UNCOND, REGIME_IDM, None))
+    def test_kv_cache_paths_forward_the_given_regime(self, regime):
+        # Parametrized over BOTH known regimes and the no-regime default so a
+        # hardcoded regime inside the cache path (mutation M1) cannot pass: a
+        # single-value test cannot distinguish "forwards the argument" from
+        # "ignores it".
         model = _mot()
         model.eval()
         records: list = []
@@ -356,6 +361,7 @@ class TestNoRegimeOutsideScope:
         mask = payload["attention_mask"]
         video_mask = mask[:VIDEO_LEN, :VIDEO_LEN]
         joint_len = VIDEO_LEN + ACTION_LEN
+        regime_kwargs = {} if regime is None else {"regime": regime}
         with torch.no_grad():
             cache = model.prefill_video_cache(
                 video_tokens=payload["embeds_all"]["video"],
@@ -363,7 +369,7 @@ class TestNoRegimeOutsideScope:
                 video_t_mod=payload["t_mod_all"]["video"],
                 video_context_payload=payload["context_all"]["video"],
                 video_attention_mask=video_mask,
-                regime=REGIME_UNCOND,
+                **regime_kwargs,
             )
             model.forward_action_with_video_cache(
                 action_tokens=payload["embeds_all"]["action"][:, :ACTION_LEN],
@@ -376,10 +382,10 @@ class TestNoRegimeOutsideScope:
                 video_kv_cache=cache,
                 attention_mask=mask[:joint_len, :joint_len],
                 video_seq_len=VIDEO_LEN,
-                regime=REGIME_UNCOND,
+                **regime_kwargs,
             )
         assert records
-        assert {entry[1] for entry in records} == {REGIME_UNCOND}
+        assert {entry[1] for entry in records} == {regime}
 
 
 # --------------------------------------------------------------------------- #

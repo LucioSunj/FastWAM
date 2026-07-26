@@ -1,5 +1,5 @@
 import os
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Callable, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,75 @@ from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
+
+
+#: Signature of `infer_action`'s per-step velocity hook (stage-2 W8):
+#: ``hook(x_t, v, timestep, step_index) -> delta_v | None``. ``x_t`` is the
+#: CURRENT action latent before this solver step, ``v`` is the model's raw
+#: velocity prediction for this step (so x0_hat-space guidance can form
+#: ``predicted_clean_action(x_t, sigma, v)`` without re-running the model),
+#: ``timestep`` is the exact element of ``build_inference_schedule``'s
+#: timestep grid (the scheduler parameterization
+#: ``t = sigma * num_train_timesteps``, NOT unit-interval sigma — convert via
+#: ``fastwam.adaptive_gate.flow_objective.sigma_from_timestep``), and
+#: ``step_index`` counts from 0. Returning ``None`` skips the correction for
+#: this step. Hooks must not mutate ``x_t``/``v`` in place.
+VelocityHook = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, int], Optional[torch.Tensor]
+]
+
+
+def _validate_action_init_noise(
+    init_noise: torch.Tensor, *, expected_shape: tuple[int, int, int]
+) -> torch.Tensor:
+    """Validate an injected initial action noise and normalize it to [1, T, D].
+
+    The returned tensor plays exactly the role of the internal
+    ``torch.randn(..., dtype=float32)`` draw: the caller applies the SAME
+    ``.to(device, torch_dtype)`` conversion afterwards, so injecting the noise
+    a seed would have produced is bit-identical to passing that seed.
+    """
+    if not torch.is_tensor(init_noise):
+        raise TypeError(
+            f"`init_noise` must be a torch.Tensor, got {type(init_noise).__name__}"
+        )
+    if not torch.is_floating_point(init_noise):
+        raise ValueError(
+            f"`init_noise` must be a floating tensor, got dtype {init_noise.dtype}"
+        )
+    value = init_noise
+    if value.ndim == 2:
+        value = value.unsqueeze(0)
+    if value.ndim != 3 or tuple(value.shape) != expected_shape:
+        raise ValueError(
+            "`init_noise` must have shape "
+            f"[T={expected_shape[1]}, D={expected_shape[2]}] or {list(expected_shape)}, "
+            f"got {tuple(init_noise.shape)}"
+        )
+    return value.detach()
+
+
+def _validate_velocity_delta(delta_v: Any, *, reference: torch.Tensor) -> torch.Tensor:
+    """Fail closed on a velocity-hook output that does not match the prediction."""
+    if not torch.is_tensor(delta_v):
+        raise TypeError(
+            "`velocity_hook` must return a torch.Tensor or None, got "
+            f"{type(delta_v).__name__}"
+        )
+    if delta_v.shape != reference.shape:
+        raise ValueError(
+            f"`velocity_hook` delta shape {tuple(delta_v.shape)} does not match the "
+            f"velocity prediction {tuple(reference.shape)}"
+        )
+    if delta_v.dtype != reference.dtype or delta_v.device != reference.device:
+        raise ValueError(
+            "`velocity_hook` delta dtype/device "
+            f"({delta_v.dtype}, {delta_v.device}) must match the velocity prediction "
+            f"({reference.dtype}, {reference.device}); cast inside the hook."
+        )
+    # Guidance never differentiates through the sampler; detaching also keeps a
+    # hook's local `torch.enable_grad()` from leaking graph state outward.
+    return delta_v.detach()
 
 
 class FastWAM(torch.nn.Module):
@@ -536,7 +605,27 @@ class FastWAM(torch.nn.Module):
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
-    def training_loss(self, sample, tiled: bool = False):
+    def training_loss(
+        self,
+        sample,
+        tiled: bool = False,
+        action_noise: Optional[torch.Tensor] = None,
+        action_timestep: Optional[torch.Tensor] = None,
+        draws_out: Optional[dict] = None,
+    ):
+        """Flow-matching training loss.
+
+        Stage-2 W8 additions, all defaulting to the pre-W8 behaviour:
+        ``action_noise``/``action_timestep`` inject an external ``(eps, t)``
+        pair for the action loss (both or neither), and ``draws_out`` — a
+        caller-supplied dict — receives the actually used
+        ``{"action_noise", "action_timestep"}`` so the pair can be cached and
+        replayed through ``fastwam.adaptive_gate.flow_objective.cfm_loss``.
+        """
+        if (action_noise is None) != (action_timestep is None):
+            raise ValueError(
+                "`action_noise` and `action_timestep` must be provided together."
+            )
         inputs = self.build_inputs(sample, tiled=tiled)
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
@@ -558,12 +647,33 @@ class FastWAM(torch.nn.Module):
         if inputs["first_frame_latents"] is not None:
             latents[:, :, 0:1] = inputs["first_frame_latents"]
 
-        noise_action = torch.randn_like(action)
-        timestep_action = self.train_action_scheduler.sample_training_t(
-            batch_size=batch_size,
-            device=self.device,
-            dtype=action.dtype,
-        )
+        if action_noise is None:
+            noise_action = torch.randn_like(action)
+            timestep_action = self.train_action_scheduler.sample_training_t(
+                batch_size=batch_size,
+                device=self.device,
+                dtype=action.dtype,
+            )
+        else:
+            if not torch.is_tensor(action_noise) or action_noise.shape != action.shape:
+                raise ValueError(
+                    f"`action_noise` must match action shape {tuple(action.shape)}, got "
+                    f"{tuple(action_noise.shape) if torch.is_tensor(action_noise) else type(action_noise).__name__}"
+                )
+            if (
+                not torch.is_tensor(action_timestep)
+                or action_timestep.ndim != 1
+                or action_timestep.shape[0] != batch_size
+            ):
+                raise ValueError(
+                    f"`action_timestep` must be a 1D [B={batch_size}] tensor, got "
+                    f"{tuple(action_timestep.shape) if torch.is_tensor(action_timestep) else type(action_timestep).__name__}"
+                )
+            noise_action = action_noise.to(device=action.device, dtype=action.dtype)
+            timestep_action = action_timestep.to(device=self.device, dtype=action.dtype)
+        if draws_out is not None:
+            draws_out["action_noise"] = noise_action.detach()
+            draws_out["action_timestep"] = timestep_action.detach()
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
 
@@ -1011,11 +1121,41 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        init_noise: Optional[torch.Tensor] = None,
+        velocity_hook: Optional[VelocityHook] = None,
+        return_init_noise: bool = False,
     ) -> dict[str, Any]:
+        """Action-only inference (stage-2 W8 sampler interface).
+
+        New optional knobs — every default preserves the pre-W8 behaviour
+        bit-for-bit:
+
+        * ``init_noise``: externally supplied initial action noise ``[T, D]``
+          or ``[1, T, D]`` (float). It substitutes the internal float32
+          ``torch.randn`` draw and then follows the identical
+          ``.to(device, torch_dtype)`` conversion, so injecting the noise a
+          given ``seed`` would have produced yields a bit-identical action.
+          Mutually exclusive with ``seed``.
+        * ``velocity_hook``: per-step correction ``hook(x_t, v, timestep,
+          step_index) -> delta_v | None`` added to the predicted velocity
+          BEFORE the scheduler step (see :data:`VelocityHook`); ``v`` is the
+          model's raw velocity prediction, enabling x0_hat-space guidance
+          without re-running the model. This method stays under
+          ``@torch.no_grad()``; a hook needing gradients for its own critic
+          must open a local ``with torch.enable_grad():`` block — the
+          returned delta is detached either way.
+        * ``return_init_noise``: also return the float32 pre-conversion noise
+          under ``"init_noise"`` (CPU), for (noise -> action) replay caches.
+        """
         self.eval()
         validate_action_only_attention_mode(
             getattr(self.video_expert, "video_attention_mask_mode", "")
         )
+        if init_noise is not None and seed is not None:
+            raise ValueError(
+                "`init_noise` and `seed` are mutually exclusive: injecting a noise "
+                "makes the seed dead, which silently breaks replay bookkeeping."
+            )
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
@@ -1041,13 +1181,20 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
-        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
-            generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+        expected_noise_shape = (1, action_horizon, self.action_expert.action_dim)
+        if init_noise is None:
+            generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
+            init_noise_f32 = torch.randn(
+                expected_noise_shape,
+                generator=generator,
+                device=rand_device,
+                dtype=torch.float32,
+            )
+        else:
+            init_noise_f32 = _validate_action_init_noise(
+                init_noise, expected_shape=expected_noise_shape
+            )
+        latents_action = init_noise_f32.to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._prepare_first_frame_latents(
@@ -1123,7 +1270,9 @@ class FastWAM(torch.nn.Module):
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
-        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+        for step_index, (step_t_action, step_delta_action) in enumerate(
+            zip(infer_timesteps_action, infer_deltas_action)
+        ):
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
             pred_action_posi = self._predict_action_noise_with_cache(
@@ -1137,11 +1286,27 @@ class FastWAM(torch.nn.Module):
             )
             pred_action = pred_action_posi
 
+            if velocity_hook is not None:
+                # The hook sees the pre-step latent, the model's raw velocity
+                # prediction, and the exact timestep-grid element; the
+                # correction lands BEFORE the scheduler step so the scheduler
+                # itself stays a pure, untouched function.
+                delta_v = velocity_hook(
+                    latents_action, pred_action_posi, step_t_action, step_index
+                )
+                if delta_v is not None:
+                    pred_action = pred_action + _validate_velocity_delta(
+                        delta_v, reference=pred_action
+                    )
+
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
-        return {
+        result = {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+        if return_init_noise:
+            result["init_noise"] = init_noise_f32.detach().to(device="cpu", dtype=torch.float32)
+        return result
 
     @torch.no_grad()
     def infer(
