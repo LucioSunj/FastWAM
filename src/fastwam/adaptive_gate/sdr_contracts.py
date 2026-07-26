@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,52 @@ ORIGINAL_WAN_BASE_SCHEMA = "fastwam-original-wan-base-v1"
 PREFLIGHT_DECISION_SCHEMA = "fastwam-sdr-preflight-decision-v1"
 LEARNING_PROBE_DECISION_SCHEMA = "fastwam-sdr-learning-probe-decision-v1"
 FORMAL_TRAINING_DECISION_SCHEMA = "fastwam-sdr-formal-training-decision-v1"
+CANARY_DECISION_SCHEMA = "fastwam-sdr-canary-decision-v1"
+
+# E1-P1D-LC: the post-Canary single-variable low-cap diagnostic. These names are
+# additive. They never relax the E1-P1 learning-probe contract above, which keeps
+# owning the original w_cap in [0.2, 0.5] route and the archived FAIL-DIAGNOSED
+# Canary conclusion.
+LOW_CAP_CANARY_DECISION_SCHEMA = "fastwam-sdr-low-cap-canary-decision-v1"
+LOW_CAP_PREREGISTRATION_SCHEMA = "fastwam-sdr-low-cap-preregistration-v1"
+LOW_CAP_STAGE = "E1-P1D-LC"
+LOW_CAP_OLD_W_CAP = 0.5
+LOW_CAP_NEW_W_CAP = 0.09
+LOW_CAP_W0_MIN = 0.001
+LOW_CAP_W0_MAX = 0.05
+LOW_CAP_W0_RELATIVE_TOLERANCE = 0.05
+LOW_CAP_SCHEDULE_FRACTIONS = (0.0, 0.1, 0.3, 0.6, 1.0)
+LOW_CAP_LEARNING_RATE = 1e-5
+LOW_CAP_MAX_STEPS = 50
+LOW_CAP_TRAINING_SEED = 42
+LOW_CAP_DIAGNOSTIC_SEED = 20260721
+LOW_CAP_DELTA_STEPS = (10, 25, 50)
+LOW_CAP_FINAL_STEP = 50
+
+# Archived E1-P0.5 preflight value that the fresh preflight must reproduce within
+# 5%: docs/validation/e1/20260723T034745Z_sdr_canary_no_go/p0_5_preflight_decision.json.
+ARCHIVED_P0_5_W0 = 0.009558040980013546
+# docs/validation/e1/20260723T034745Z_sdr_canary_no_go/canary_decision.json.
+ARCHIVED_FAILED_CANARY_DECISION_SHA256 = (
+    "74ecd645c6f4252854cd30bd671fbb783694af730fd173f65091e01db4d6ff07"
+)
+FAILED_CANARY_REQUIRED_CONDITION = "common-noise IDM margin is not positive"
+FAILED_CANARY_REQUIRED_STATUS = "FAIL-DIAGNOSED"
+
+# Artifacts that the low-cap diagnostic must share byte-for-byte with the failed
+# Canary. ``code_commit`` and ``resolved_config`` are deliberately excluded: the
+# new run is a new commit with a new resolved config, which is the intended and
+# audited difference.
+LOW_CAP_INVARIANT_BINDING_NAMES = (
+    "base_model_manifest",
+    "e_i_checkpoint",
+    "e_i_config",
+    "dataset_stats",
+    "lineage_manifest",
+    "validation_manifest",
+    "solver_contract",
+    "warmstart_decision",
+)
 
 E_I_ARTIFACT_NAMES = (
     "base_model_manifest",
@@ -521,4 +568,229 @@ def validate_formal_training_contract(
         "base_learning_rate": 1e-5,
         "num_epochs": 10,
         "initializer_stage": "e_i_s0",
+    }
+
+
+def float32(value: float) -> float:
+    """Round ``value`` to the nearest float32, matching the training ledger."""
+    return struct.unpack("!f", struct.pack("!f", float(value)))[0]
+
+
+def low_cap_locked_schedule(w0: float) -> list[list[float]]:
+    """Return the immutable E1-P1D-LC schedule for a preflight-selected ``w0``."""
+    w0 = float(w0)
+    if not LOW_CAP_W0_MIN <= w0 <= LOW_CAP_W0_MAX:
+        raise ValueError(
+            "Low-cap w0 must satisfy "
+            f"{LOW_CAP_W0_MIN} <= w0 <= {LOW_CAP_W0_MAX}, got {w0}."
+        )
+    return [
+        [0.0, w0],
+        [0.1, w0],
+        [0.3, LOW_CAP_NEW_W_CAP],
+        [0.6, LOW_CAP_NEW_W_CAP],
+        [1.0, LOW_CAP_NEW_W_CAP],
+    ]
+
+
+def validate_low_cap_uncond_weight_schedule(
+    schedule: Sequence[Sequence[float]],
+) -> dict[str, Any]:
+    """Fail closed unless ``schedule`` is exactly the locked low-cap schedule."""
+    if not isinstance(schedule, Sequence) or isinstance(schedule, (str, bytes)):
+        raise ValueError("Low-cap schedule must be a sequence of points.")
+    if len(schedule) != len(LOW_CAP_SCHEDULE_FRACTIONS):
+        raise ValueError(
+            "Low-cap schedule must have exactly "
+            f"{len(LOW_CAP_SCHEDULE_FRACTIONS)} points, got {len(schedule)}."
+        )
+    points: list[tuple[float, float]] = []
+    for point in schedule:
+        if (
+            not isinstance(point, Sequence)
+            or isinstance(point, (str, bytes))
+            or len(point) != 2
+        ):
+            raise ValueError("Every low-cap schedule point must be [fraction, weight].")
+        points.append((float(point[0]), float(point[1])))
+    if tuple(fraction for fraction, _ in points) != LOW_CAP_SCHEDULE_FRACTIONS:
+        raise ValueError(
+            "Low-cap schedule fractions must be "
+            f"{list(LOW_CAP_SCHEDULE_FRACTIONS)}."
+        )
+    weights = [weight for _, weight in points]
+    # Any point above the float32 image of the cap is a contract failure. This is
+    # checked before the exact-cap comparison so an over-cap point is reported as
+    # an over-cap point rather than as a generic cap mismatch.
+    cap_float32 = float32(LOW_CAP_NEW_W_CAP)
+    above = [weight for weight in weights if float32(weight) > cap_float32]
+    if above:
+        raise ValueError(
+            f"Low-cap schedule weights exceed the float32 cap {cap_float32}: {above}."
+        )
+    cap = max(weights)
+    if cap != LOW_CAP_NEW_W_CAP:
+        raise ValueError(
+            f"Low-cap w_cap must be exactly {LOW_CAP_NEW_W_CAP}, got {cap}."
+        )
+    w0 = points[0][1]
+    if not LOW_CAP_W0_MIN <= w0 <= LOW_CAP_W0_MAX:
+        raise ValueError(
+            "Low-cap w0 must satisfy "
+            f"{LOW_CAP_W0_MIN} <= w0 <= {LOW_CAP_W0_MAX}, got {w0}."
+        )
+    if [list(point) for point in points] != low_cap_locked_schedule(w0):
+        raise ValueError("Low-cap schedule does not match the locked w0/w_cap shape.")
+    return {
+        "w0": w0,
+        "w_cap": LOW_CAP_NEW_W_CAP,
+        "w_cap_float32": cap_float32,
+        "schedule": [list(point) for point in points],
+    }
+
+
+def validate_failed_canary_trigger(
+    decision: Mapping[str, Any],
+    *,
+    observed_sha256: str | None = None,
+    expected_sha256: str | None = ARCHIVED_FAILED_CANARY_DECISION_SHA256,
+) -> dict[str, Any]:
+    """Bind the archived FAIL-DIAGNOSED Canary that authorizes this diagnostic."""
+    if decision.get("schema") != CANARY_DECISION_SCHEMA:
+        raise ValueError(
+            f"Trigger must be {CANARY_DECISION_SCHEMA!r}, got {decision.get('schema')!r}."
+        )
+    status = decision.get("status")
+    if status != FAILED_CANARY_REQUIRED_STATUS:
+        raise ValueError(
+            "Low-cap diagnostic requires the archived Canary to remain "
+            f"{FAILED_CANARY_REQUIRED_STATUS!r}, got {status!r}."
+        )
+    if decision.get("plus_full_used") is not False:
+        raise ValueError("Failed Canary decision must state plus_full_used=false.")
+    conditions = decision.get("failure_conditions")
+    if not isinstance(conditions, Sequence) or isinstance(conditions, (str, bytes)):
+        raise ValueError("Failed Canary decision has no failure_conditions list.")
+    conditions = [str(item) for item in conditions]
+    if FAILED_CANARY_REQUIRED_CONDITION not in conditions:
+        raise ValueError(
+            "Failed Canary failure_conditions must contain "
+            f"{FAILED_CANARY_REQUIRED_CONDITION!r}, got {conditions}."
+        )
+    if expected_sha256 is not None:
+        if observed_sha256 is None:
+            raise ValueError(
+                "Failed Canary decision SHA256 must be supplied to verify the trigger."
+            )
+        if observed_sha256 != expected_sha256:
+            raise ValueError(
+                "Failed Canary decision changed: "
+                f"expected={expected_sha256}, actual={observed_sha256}."
+            )
+    bindings = _artifact_sha_map(
+        decision.get("artifact_bindings"), source="failed Canary decision"
+    )
+    return {
+        "status": status,
+        "failure_conditions": conditions,
+        "required_condition": FAILED_CANARY_REQUIRED_CONDITION,
+        "sha256": observed_sha256,
+        "artifact_bindings": bindings,
+    }
+
+
+def validate_low_cap_invariant_bindings(
+    fresh_bindings: Mapping[str, str],
+    failed_canary_bindings: Mapping[str, str],
+) -> dict[str, str]:
+    """Require the E-I/data/solver artifacts to be identical to the failed Canary."""
+    missing = [
+        name
+        for name in LOW_CAP_INVARIANT_BINDING_NAMES
+        if name not in fresh_bindings or name not in failed_canary_bindings
+    ]
+    if missing:
+        raise ValueError(
+            "Low-cap diagnostic is missing invariant artifact bindings: "
+            f"{missing}."
+        )
+    mismatches = {
+        name: (fresh_bindings[name], failed_canary_bindings[name])
+        for name in LOW_CAP_INVARIANT_BINDING_NAMES
+        if fresh_bindings[name] != failed_canary_bindings[name]
+    }
+    if mismatches:
+        raise ValueError(
+            "Low-cap diagnostic must reuse the failed Canary artifacts "
+            f"(fresh, failed): {mismatches}."
+        )
+    return {name: fresh_bindings[name] for name in LOW_CAP_INVARIANT_BINDING_NAMES}
+
+
+def validate_low_cap_canary_contract(
+    preflight_decision: Mapping[str, Any],
+    *,
+    failed_canary_decision: Mapping[str, Any],
+    failed_canary_sha256: str | None = None,
+    expected_failed_canary_sha256: str | None = (
+        ARCHIVED_FAILED_CANARY_DECISION_SHA256
+    ),
+    archived_w0: float = ARCHIVED_P0_5_W0,
+    w0_relative_tolerance: float = LOW_CAP_W0_RELATIVE_TOLERANCE,
+    schedule: Sequence[Sequence[float]] | None = None,
+    expected_bindings: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Validate the single-variable E1-P1D-LC contract from a fresh P0.5 PASS."""
+    bindings = validate_stage_decision(
+        preflight_decision,
+        expected_schema=PREFLIGHT_DECISION_SCHEMA,
+        expected_bindings=expected_bindings,
+    )
+    trigger = validate_failed_canary_trigger(
+        failed_canary_decision,
+        observed_sha256=failed_canary_sha256,
+        expected_sha256=expected_failed_canary_sha256,
+    )
+    invariant = validate_low_cap_invariant_bindings(
+        bindings, trigger["artifact_bindings"]
+    )
+    raw_w0 = preflight_decision.get("w0")
+    if raw_w0 is None or isinstance(raw_w0, bool):
+        raise ValueError("Fresh preflight decision has no numeric w0.")
+    w0 = float(raw_w0)
+    if not LOW_CAP_W0_MIN <= w0 <= LOW_CAP_W0_MAX:
+        raise ValueError(
+            "Fresh preflight w0 is outside the low-cap range "
+            f"[{LOW_CAP_W0_MIN}, {LOW_CAP_W0_MAX}]: {w0}."
+        )
+    archived_w0 = float(archived_w0)
+    if archived_w0 <= 0.0:
+        raise ValueError("Archived w0 must be positive.")
+    drift = abs(w0 - archived_w0) / archived_w0
+    if drift > float(w0_relative_tolerance):
+        raise ValueError(
+            "Fresh preflight w0 drifted from the archived value by "
+            f"{drift:.6f} > {w0_relative_tolerance}: fresh={w0}, "
+            f"archived={archived_w0}."
+        )
+    locked = validate_low_cap_uncond_weight_schedule(
+        low_cap_locked_schedule(w0) if schedule is None else schedule
+    )
+    if locked["w0"] != w0:
+        raise ValueError(
+            "Low-cap schedule w0 does not match the fresh preflight: "
+            f"schedule={locked['w0']}, preflight={w0}."
+        )
+    return {
+        "stage": LOW_CAP_STAGE,
+        "artifact_bindings": bindings,
+        "invariant_artifact_bindings": invariant,
+        "trigger": trigger,
+        "w0": w0,
+        "archived_w0": archived_w0,
+        "w0_relative_drift": drift,
+        "old_w_cap": LOW_CAP_OLD_W_CAP,
+        "w_cap": LOW_CAP_NEW_W_CAP,
+        "w_cap_float32": locked["w_cap_float32"],
+        "schedule": locked["schedule"],
     }
