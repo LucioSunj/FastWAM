@@ -1,0 +1,60 @@
+{
+  "env": {
+    "ckpt_sha256": "b13e70a3cc9a7f63a47dca13f5f65eb294baf0d2aaa7b384854d6591a42474d1",
+    "cuda": "12.8",
+    "cudnn": 90701,
+    "cudnn_allow_tf32": true,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": false,
+    "cwd": "/root/When-will-inference-time-prediction-beneficial-/FastWAM",
+    "device_name": "NVIDIA A800 80GB PCIe",
+    "fastwam_file": "/root/When-will-inference-time-prediction-beneficial-/FastWAM/src/fastwam/__init__.py",
+    "float32_matmul_precision": "highest",
+    "git_head": "ff4d05608d85068db340215c35356084ff702f64",
+    "matmul_allow_tf32": false,
+    "platform": "Linux-4.19.90-2107.6.0.0192.8.oe1.bclinux.x86_64-x86_64-with-glibc2.35",
+    "python": "3.10.20",
+    "repo_root": "/root/When-will-inference-time-prediction-beneficial-/FastWAM",
+    "torch": "2.7.1+cu128"
+  },
+  "label": "main",
+  "mode": "gradparity",
+  "records": [
+    {
+      "dtype": "torch.float32",
+      "entry": "FastWAM.infer_action(explicit dispatch)",
+      "path": "/root/autodl-tmp/.tmp/phaseB2/tensors/main_gradparity_nograd_seed0.pt",
+      "seed": 0,
+      "sha256": "cc3bba19d80aac9cf87f347d2d5f1cca9c28bba00e483d5afb718d8830fedb9a",
+      "shape": [
+        32,
+        7
+      ],
+      "tag": "main_gradparity_nograd_seed0",
+      "wall_s": 1.27
+    },
+    {
+      "dtype": "torch.float32",
+      "entry": "FastWAM.infer_action_with_grad(explicit dispatch, normalized cpu/fp32)",
+      "graph_carrying_before_normalize": true,
+      "path": "/root/autodl-tmp/.tmp/phaseB2/tensors/main_gradparity_grad_seed0.pt",
+      "seed": 0,
+      "sha256": "cc3bba19d80aac9cf87f347d2d5f1cca9c28bba00e483d5afb718d8830fedb9a",
+      "shape": [
+        32,
+        7
+      ],
+      "tag": "main_gradparity_grad_seed0",
+      "wall_s": 1.68
+    },
+    {
+      "check": "gradparity",
+      "graph_carrying": true,
+      "max_abs": 0.0,
+      "seed": 0,
+      "torch_equal": true,
+      "wall_grad_s": 1.68,
+      "wall_nograd_s": 1.27
+    }
+  ]
+}

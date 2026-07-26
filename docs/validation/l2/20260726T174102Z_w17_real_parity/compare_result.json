@@ -1,0 +1,120 @@
+{
+  "all_pairs_bitwise_equal": true,
+  "criterion": "torch.equal True AND max_abs == 0 for all pairs (no tolerance)",
+  "pairs": [
+    {
+      "dtype_base": "torch.float32",
+      "dtype_main": "torch.float32",
+      "max_abs": 0.0,
+      "pair": "idm_seed0",
+      "path_kind": "public forced-IDM pipeline",
+      "seed": 0,
+      "sha256_base": "80764faae0e4fd06627ce1a6a6fdb56134cdbf040992ef1348265f3e919e7c6f",
+      "sha256_main": "80764faae0e4fd06627ce1a6a6fdb56134cdbf040992ef1348265f3e919e7c6f",
+      "shape_base": [
+        32,
+        7
+      ],
+      "shape_main": [
+        32,
+        7
+      ],
+      "torch_equal": true
+    },
+    {
+      "dtype_base": "torch.float32",
+      "dtype_main": "torch.float32",
+      "max_abs": 0.0,
+      "pair": "idm_seed1",
+      "path_kind": "public forced-IDM pipeline",
+      "seed": 1,
+      "sha256_base": "a410accfebd603afcdde8ac78e8438c2802570a2fc6907a3a34e62541325c096",
+      "sha256_main": "a410accfebd603afcdde8ac78e8438c2802570a2fc6907a3a34e62541325c096",
+      "shape_base": [
+        32,
+        7
+      ],
+      "shape_main": [
+        32,
+        7
+      ],
+      "torch_equal": true
+    },
+    {
+      "dtype_base": "torch.float32",
+      "dtype_main": "torch.float32",
+      "max_abs": 0.0,
+      "pair": "idm_seed2",
+      "path_kind": "public forced-IDM pipeline",
+      "seed": 2,
+      "sha256_base": "b09162a7fae1d765b02067075d7574f80fab944a24f43e1c515bb65da971a6dd",
+      "sha256_main": "b09162a7fae1d765b02067075d7574f80fab944a24f43e1c515bb65da971a6dd",
+      "shape_base": [
+        32,
+        7
+      ],
+      "shape_main": [
+        32,
+        7
+      ],
+      "torch_equal": true
+    },
+    {
+      "dtype_base": "torch.float32",
+      "dtype_main": "torch.float32",
+      "max_abs": 0.0,
+      "pair": "base_seed0",
+      "path_kind": "explicit-dispatch UNCOND solver",
+      "seed": 0,
+      "sha256_base": "cc3bba19d80aac9cf87f347d2d5f1cca9c28bba00e483d5afb718d8830fedb9a",
+      "sha256_main": "cc3bba19d80aac9cf87f347d2d5f1cca9c28bba00e483d5afb718d8830fedb9a",
+      "shape_base": [
+        32,
+        7
+      ],
+      "shape_main": [
+        32,
+        7
+      ],
+      "torch_equal": true
+    },
+    {
+      "dtype_base": "torch.float32",
+      "dtype_main": "torch.float32",
+      "max_abs": 0.0,
+      "pair": "base_seed1",
+      "path_kind": "explicit-dispatch UNCOND solver",
+      "seed": 1,
+      "sha256_base": "2ede4bc4048a1773977db6d029b7d813401e5a9c48d90d95349afbd602fedfae",
+      "sha256_main": "2ede4bc4048a1773977db6d029b7d813401e5a9c48d90d95349afbd602fedfae",
+      "shape_base": [
+        32,
+        7
+      ],
+      "shape_main": [
+        32,
+        7
+      ],
+      "torch_equal": true
+    },
+    {
+      "dtype_base": "torch.float32",
+      "dtype_main": "torch.float32",
+      "max_abs": 0.0,
+      "pair": "base_seed2",
+      "path_kind": "explicit-dispatch UNCOND solver",
+      "seed": 2,
+      "sha256_base": "6b45ae4b312478fbb25712e4a0909e3bbe5b57c184d63c3f1aeded52149e0a0a",
+      "sha256_main": "6b45ae4b312478fbb25712e4a0909e3bbe5b57c184d63c3f1aeded52149e0a0a",
+      "shape_base": [
+        32,
+        7
+      ],
+      "shape_main": [
+        32,
+        7
+      ],
+      "torch_equal": true
+    }
+  ]
+}

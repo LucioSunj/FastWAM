@@ -1,0 +1,86 @@
+{
+  "adapter_error": "TypeError: WAMModeAdapter requires a current dual-regime IDM model whose `infer_action` accepts ['first_frame_latents', 'force_branch']; missing=['force_branch'].",
+  "check": "w22_vae_latent_fallback_v1",
+  "ckpt": "/root/autodl-fs/fastwam/runs/libero_idm_2cam224_1e-4/torch_compile_speedup_full_wanrobot_4gpu_bs8_ga4_20260726_141000/checkpoints/weights/step_002000.pt",
+  "device": "cuda",
+  "dtype": "bf16",
+  "end_to_end_ok": true,
+  "first_frame_latents": {
+    "device": "cuda:0",
+    "dtype": "torch.bfloat16",
+    "finite": true,
+    "shape": [
+      1,
+      48,
+      1,
+      14,
+      28
+    ],
+    "vae_z_dim": 48
+  },
+  "image_hw": [
+    224,
+    448
+  ],
+  "model_config_digest": "db612608a3607759123fea342df4cf99b0fcc0977ef5c0883b19f45b2729ca16",
+  "n_samples": 20,
+  "pooled_feature_dim": 64,
+  "pooled_shape": [
+    20,
+    64
+  ],
+  "probe_labels_note": "labels are synthetic (alternating); the probe AUC is meaningless by construction. The acceptance criterion is only that the latent is accepted end-to-end by pool_activation + probe_taps.",
+  "probe_result": {
+    "auc": 0.65,
+    "ci_high": 0.8877976190476188,
+    "ci_low": 0.3918712121212121,
+    "l2": 1.0,
+    "mean_fold_auc": 0.65,
+    "n_groups": 20,
+    "n_positive": 10,
+    "n_samples": 20,
+    "n_splits": 5,
+    "oof_scores": [
+      -6.251836390286412,
+      -2.402248738704148,
+      3.8455705191491747,
+      2.0042680973992333,
+      -2.4929710062867194,
+      -0.5513796299164702,
+      -1.7340489527678518,
+      -2.842253865395331,
+      -1.6273610537905963,
+      2.5065493616257046,
+      2.7899209201815327,
+      -0.952269531300301,
+      -0.12093426513327024,
+      2.9021763572252675,
+      -1.1737585668658554,
+      2.451585355327189,
+      -1.0772014750562606,
+      -1.5878758075757895,
+      -3.057278556234731,
+      0.06210239284054772
+    ],
+    "per_fold_auc": [
+      0.5,
+      0.75,
+      0.75,
+      1.0,
+      0.25
+    ],
+    "seed": 0
+  },
+  "route": "model._encode_input_image_latents_tensor (the exact call encode_world_state performs internally)",
+  "seed": 0,
+  "stacked_activation_shape": [
+    20,
+    48,
+    1,
+    14,
+    28
+  ],
+  "task": "libero_idm_2cam224_1e-4",
+  "world_feat_dim": 240,
+  "world_feat_dim_expected": 240
+}

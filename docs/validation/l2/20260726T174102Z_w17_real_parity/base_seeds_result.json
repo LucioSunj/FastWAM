@@ -1,0 +1,171 @@
+{
+  "env": {
+    "ckpt_sha256": "b13e70a3cc9a7f63a47dca13f5f65eb294baf0d2aaa7b384854d6591a42474d1",
+    "cuda": "12.8",
+    "cudnn": 90701,
+    "cudnn_allow_tf32": true,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": false,
+    "cwd": "/root/autodl-tmp/.tmp/parity_base",
+    "device_name": "NVIDIA A800 80GB PCIe",
+    "fastwam_file": "/root/autodl-tmp/.tmp/parity_base/src/fastwam/__init__.py",
+    "float32_matmul_precision": "highest",
+    "git_head": "7428d722ad389b437f93582578d994d4b2984f59",
+    "matmul_allow_tf32": false,
+    "platform": "Linux-4.19.90-2107.6.0.0192.8.oe1.bclinux.x86_64-x86_64-with-glibc2.35",
+    "python": "3.10.20",
+    "repo_root": "/root/autodl-tmp/.tmp/parity_base",
+    "torch": "2.7.1+cu128"
+  },
+  "label": "base",
+  "mode": "seeds",
+  "records": [
+    {
+      "dtype": "torch.float32",
+      "entry": "FastWAMIDM.infer_action(public)",
+      "kwargs_used": [
+        "action_horizon",
+        "context",
+        "context_mask",
+        "input_image",
+        "num_inference_steps",
+        "num_video_frames",
+        "prompt",
+        "proprio",
+        "rand_device",
+        "seed"
+      ],
+      "path": "/root/autodl-tmp/.tmp/phaseB2/tensors/base_idm_seed0.pt",
+      "seed": 0,
+      "sha256": "80764faae0e4fd06627ce1a6a6fdb56134cdbf040992ef1348265f3e919e7c6f",
+      "shape": [
+        32,
+        7
+      ],
+      "tag": "base_idm_seed0",
+      "wall_s": 2.71
+    },
+    {
+      "dtype": "torch.float32",
+      "entry": "FastWAM.infer_action(explicit dispatch)",
+      "kwargs_used": [
+        "action_horizon",
+        "context",
+        "context_mask",
+        "input_image",
+        "num_inference_steps",
+        "prompt",
+        "proprio",
+        "rand_device",
+        "seed"
+      ],
+      "path": "/root/autodl-tmp/.tmp/phaseB2/tensors/base_base_seed0.pt",
+      "seed": 0,
+      "sha256": "cc3bba19d80aac9cf87f347d2d5f1cca9c28bba00e483d5afb718d8830fedb9a",
+      "shape": [
+        32,
+        7
+      ],
+      "tag": "base_base_seed0",
+      "wall_s": 0.92
+    },
+    {
+      "dtype": "torch.float32",
+      "entry": "FastWAMIDM.infer_action(public)",
+      "kwargs_used": [
+        "action_horizon",
+        "context",
+        "context_mask",
+        "input_image",
+        "num_inference_steps",
+        "num_video_frames",
+        "prompt",
+        "proprio",
+        "rand_device",
+        "seed"
+      ],
+      "path": "/root/autodl-tmp/.tmp/phaseB2/tensors/base_idm_seed1.pt",
+      "seed": 1,
+      "sha256": "a410accfebd603afcdde8ac78e8438c2802570a2fc6907a3a34e62541325c096",
+      "shape": [
+        32,
+        7
+      ],
+      "tag": "base_idm_seed1",
+      "wall_s": 2.36
+    },
+    {
+      "dtype": "torch.float32",
+      "entry": "FastWAM.infer_action(explicit dispatch)",
+      "kwargs_used": [
+        "action_horizon",
+        "context",
+        "context_mask",
+        "input_image",
+        "num_inference_steps",
+        "prompt",
+        "proprio",
+        "rand_device",
+        "seed"
+      ],
+      "path": "/root/autodl-tmp/.tmp/phaseB2/tensors/base_base_seed1.pt",
+      "seed": 1,
+      "sha256": "2ede4bc4048a1773977db6d029b7d813401e5a9c48d90d95349afbd602fedfae",
+      "shape": [
+        32,
+        7
+      ],
+      "tag": "base_base_seed1",
+      "wall_s": 0.94
+    },
+    {
+      "dtype": "torch.float32",
+      "entry": "FastWAMIDM.infer_action(public)",
+      "kwargs_used": [
+        "action_horizon",
+        "context",
+        "context_mask",
+        "input_image",
+        "num_inference_steps",
+        "num_video_frames",
+        "prompt",
+        "proprio",
+        "rand_device",
+        "seed"
+      ],
+      "path": "/root/autodl-tmp/.tmp/phaseB2/tensors/base_idm_seed2.pt",
+      "seed": 2,
+      "sha256": "b09162a7fae1d765b02067075d7574f80fab944a24f43e1c515bb65da971a6dd",
+      "shape": [
+        32,
+        7
+      ],
+      "tag": "base_idm_seed2",
+      "wall_s": 2.3
+    },
+    {
+      "dtype": "torch.float32",
+      "entry": "FastWAM.infer_action(explicit dispatch)",
+      "kwargs_used": [
+        "action_horizon",
+        "context",
+        "context_mask",
+        "input_image",
+        "num_inference_steps",
+        "prompt",
+        "proprio",
+        "rand_device",
+        "seed"
+      ],
+      "path": "/root/autodl-tmp/.tmp/phaseB2/tensors/base_base_seed2.pt",
+      "seed": 2,
+      "sha256": "6b45ae4b312478fbb25712e4a0909e3bbe5b57c184d63c3f1aeded52149e0a0a",
+      "shape": [
+        32,
+        7
+      ],
+      "tag": "base_base_seed2",
+      "wall_s": 0.93
+    }
+  ]
+}

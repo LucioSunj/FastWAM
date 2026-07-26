@@ -1,0 +1,51 @@
+{
+  "env": {
+    "ckpt_sha256": "b13e70a3cc9a7f63a47dca13f5f65eb294baf0d2aaa7b384854d6591a42474d1",
+    "cuda": "12.8",
+    "cudnn": 90701,
+    "cudnn_allow_tf32": true,
+    "cudnn_benchmark": false,
+    "cudnn_deterministic": false,
+    "cwd": "/root/When-will-inference-time-prediction-beneficial-/FastWAM",
+    "device_name": "NVIDIA A800 80GB PCIe",
+    "fastwam_file": "/root/When-will-inference-time-prediction-beneficial-/FastWAM/src/fastwam/__init__.py",
+    "float32_matmul_precision": "highest",
+    "git_head": "ff4d05608d85068db340215c35356084ff702f64",
+    "matmul_allow_tf32": false,
+    "platform": "Linux-4.19.90-2107.6.0.0192.8.oe1.bclinux.x86_64-x86_64-with-glibc2.35",
+    "python": "3.10.20",
+    "repo_root": "/root/When-will-inference-time-prediction-beneficial-/FastWAM",
+    "torch": "2.7.1+cu128"
+  },
+  "label": "main",
+  "mode": "mem",
+  "records": [
+    {
+      "check": "memory",
+      "entry": "FastWAM.infer_action_with_grad",
+      "model_footprint_MiB": 12843.0,
+      "num_inference_steps": 5,
+      "peak_cuda_MiB": 15082.0,
+      "seed": 0,
+      "wall_s": 0.74
+    },
+    {
+      "check": "memory",
+      "entry": "FastWAM.infer_action_with_grad",
+      "model_footprint_MiB": 12843.0,
+      "num_inference_steps": 10,
+      "peak_cuda_MiB": 16426.3,
+      "seed": 0,
+      "wall_s": 0.82
+    },
+    {
+      "check": "memory",
+      "entry": "FastWAM.infer_action_with_grad",
+      "model_footprint_MiB": 12843.0,
+      "num_inference_steps": 20,
+      "peak_cuda_MiB": 19115.5,
+      "seed": 0,
+      "wall_s": 1.55
+    }
+  ]
+}

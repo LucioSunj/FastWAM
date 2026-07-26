@@ -1,0 +1,42 @@
+{
+  "fired_counts": {
+    "action_readout": 2,
+    "vae_latent": 0,
+    "video_block_0": 2
+  },
+  "note": "extracted verbatim from verify_taps stderr; the harness fail-closes on the zero-fire vae_latent tap (rc=3) and deliberately writes no --out JSON that could be mistaken for a pass",
+  "taps_that_did_fire": {
+    "action_readout": {
+      "device": "cuda:0",
+      "dtype": "torch.bfloat16",
+      "feature_dim": -1,
+      "fired": 2,
+      "module_path": "action_expert.head",
+      "name": "action_readout",
+      "pooled_feature_dim": 64,
+      "shape": [
+        1,
+        32,
+        1024
+      ],
+      "shape_varies": false,
+      "site": "input"
+    },
+    "video_block_0": {
+      "device": "cuda:0",
+      "dtype": "torch.bfloat16",
+      "feature_dim": -1,
+      "fired": 2,
+      "module_path": "video_expert.blocks.0",
+      "name": "video_block_0",
+      "pooled_feature_dim": 64,
+      "shape": [
+        1,
+        882,
+        3072
+      ],
+      "shape_varies": false,
+      "site": "output"
+    }
+  }
+}
