@@ -164,6 +164,64 @@ class MetricAdaptiveFastWAM(FastWAMIDM):
         kwargs.pop("self")
         return self._route_inherited(method_name="infer_action", kwargs=kwargs)
 
+    def infer_action_with_grad(
+        self,
+        prompt: Optional[str],
+        input_image: torch.Tensor,
+        action_horizon: int,
+        num_video_frames: int | None = None,
+        first_frame_latents: Optional[torch.Tensor] = None,
+        proprio: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        context_mask: Optional[torch.Tensor] = None,
+        negative_prompt: Optional[str] = None,
+        text_cfg_scale: float = 1.0,
+        num_inference_steps: int = 20,
+        sigma_shift: Optional[float] = None,
+        seed: Optional[int] = None,
+        rand_device: str = "cpu",
+        tiled: bool = False,
+        routing_metric_value: float | None = None,
+        force_branch: str | None = None,
+        return_routing_info: bool = False,
+        init_noise: Optional[torch.Tensor] = None,
+        velocity_hook: Any = None,
+        return_init_noise: bool = False,
+    ) -> dict[str, Any]:
+        """Gradient-carrying forced-branch action dispatch (stage-2 W17).
+
+        Routes exactly like ``infer_action`` but through the UNDECORATED
+        gradient-carrying base entry (``FastWAM.infer_action_with_grad``), so
+        ``result["action"]`` keeps its autograd graph (``[T, D]`` on the model
+        device/dtype; see the base method for the full contract).
+
+        Fail-closed scope: ``force_branch="base"`` (the UNCOND regime) is
+        REQUIRED. The IDM branch is refused because ``FastWAMIDM`` defines no
+        grad-carrying override — plain ``getattr`` resolution would silently
+        inherit the BASE method and run the wrong conditioning regime, and the
+        IDM future-video rollout has no gradient path in W17 scope anyway.
+        Internal routing is likewise refused: a gradient rollout is a training
+        construct and must state its regime explicitly. The deliberately
+        narrow signature omits every IDM-only control kwarg
+        (``idm_control``/donor/video-step overrides), so passing one raises
+        ``TypeError`` instead of being silently dropped.
+        """
+        if force_branch is None:
+            raise ValueError(
+                "infer_action_with_grad requires an explicit force_branch='base': "
+                "the gradient-carrying rollout is a training construct and never "
+                "routes internally."
+            )
+        if str(force_branch) != "base":
+            raise ValueError(
+                "infer_action_with_grad supports only force_branch='base' (the "
+                f"UNCOND regime); got {force_branch!r}. The IDM branch has no "
+                "gradient-carrying implementation (W17 scope: action path only)."
+            )
+        kwargs = locals()
+        kwargs.pop("self")
+        return self._route_inherited(method_name="infer_action_with_grad", kwargs=kwargs)
+
     @torch.no_grad()
     def infer_joint(
         self,
