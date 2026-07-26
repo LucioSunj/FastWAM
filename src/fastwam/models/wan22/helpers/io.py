@@ -5,7 +5,28 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Union
 
 import torch
-from safetensors import safe_open
+
+
+def _require_safe_open():
+    """Import `safetensors.safe_open` on demand.
+
+    `helpers.__init__` re-exports this module, so a module-scope
+    `from safetensors import safe_open` made every importer of
+    `fastwam.models.wan22` — including `action_dit` and every model class —
+    depend on `safetensors`, even when the checkpoint being loaded is a plain
+    `.bin`/`.pt` file or when no checkpoint is loaded at all. This mirrors the
+    lazy `modelscope` / `huggingface_hub` imports already used in
+    `ModelConfig.download`.
+    """
+    try:
+        from safetensors import safe_open
+    except ImportError as exc:  # pragma: no cover - exercised via the stub test
+        raise ImportError(
+            "Reading .safetensors checkpoints requires the `safetensors` "
+            "package, which is not installed. Install it with "
+            "`pip install safetensors`, or point at a .bin/.pt checkpoint."
+        ) from exc
+    return safe_open
 
 
 @dataclass
@@ -126,6 +147,7 @@ def load_state_dict(file_path, torch_dtype=None, device="cpu"):
 
 
 def load_state_dict_from_safetensors(file_path, torch_dtype=None, device="cpu"):
+    safe_open = _require_safe_open()
     state_dict = {}
     with safe_open(file_path, framework="pt", device=str(device)) as f:
         for key in f.keys():
@@ -153,6 +175,7 @@ def load_state_dict_from_bin(file_path, torch_dtype=None, device="cpu"):
 
 
 def _load_keys_dict_from_safetensors(file_path):
+    safe_open = _require_safe_open()
     keys_dict = {}
     with safe_open(file_path, framework="pt", device="cpu") as f:
         for key in f.keys():
