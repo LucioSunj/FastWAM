@@ -6,6 +6,7 @@ from typing import Dict, Optional, Sequence
 import torch
 import torch.nn as nn
 
+from .regime import regime_call, validate_regime
 from .wan_video_dit import flash_attention, modulate, rope_apply
 from fastwam.utils.logging_config import get_logger
 
@@ -24,10 +25,18 @@ class MoTExpertSpan:
 
 @dataclass(frozen=True)
 class MoTAttentionGroup:
-    """Reference-shaped attention call executed inside one MoT forward."""
+    """Reference-shaped attention call executed inside one MoT forward.
+
+    ``regime`` optionally labels every span computation in this group with a
+    conditioning-regime identity (see ``fastwam.models.wan22.regime``). It is
+    metadata for regime-aware wrapped submodules only: with no such module
+    attached the label changes nothing, and ``None`` (the default, and the
+    value every pre-existing construction site gets) means "no regime".
+    """
 
     name: str
     spans: tuple[MoTExpertSpan, ...]
+    regime: Optional[str] = None
 
 
 class MoT(nn.Module):
@@ -125,8 +134,11 @@ class MoT(nn.Module):
         scale_mlp: torch.Tensor,
         gate_mlp: torch.Tensor,
         context_payload: Optional[dict],
+        regime: Optional[str] = None,
     ) -> torch.Tensor:
-        x = block.gate(residual_x, gate_msa, block.self_attn.o(mixed_attn_out))
+        x = block.gate(
+            residual_x, gate_msa, regime_call(block.self_attn.o, mixed_attn_out, regime=regime)
+        )
 
         if context_payload is not None:
             context = context_payload.get("context")
@@ -134,10 +146,16 @@ class MoT(nn.Module):
                 context_mask = context_payload.get("mask")
                 if context_mask is not None and context_mask.dim() == 3:
                     context_mask = context_mask.unsqueeze(1)
-                x = x + block.cross_attn(block.norm3(x), context, ctx_mask=context_mask)
+                x = x + regime_call(
+                    block.cross_attn,
+                    block.norm3(x),
+                    context,
+                    ctx_mask=context_mask,
+                    regime=regime,
+                )
 
         mlp_input = modulate(block.norm2(x), shift_mlp, scale_mlp)
-        x = block.gate(x, gate_mlp, block.ffn(mlp_input))
+        x = block.gate(x, gate_mlp, regime_call(block.ffn, mlp_input, regime=regime))
         return x
 
     def _build_expert_attention_io(
@@ -147,6 +165,7 @@ class MoT(nn.Module):
         x: torch.Tensor,
         freqs: torch.Tensor,
         t_mod: torch.Tensor,
+        regime: Optional[str] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -182,9 +201,9 @@ class MoT(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._split_modulation(block, t_mod)
         attn_input = modulate(block.norm1(x), shift_msa, scale_msa)
 
-        q = block.self_attn.norm_q(block.self_attn.q(attn_input))
-        k = block.self_attn.norm_k(block.self_attn.k(attn_input))
-        v = block.self_attn.v(attn_input)
+        q = block.self_attn.norm_q(regime_call(block.self_attn.q, attn_input, regime=regime))
+        k = block.self_attn.norm_k(regime_call(block.self_attn.k, attn_input, regime=regime))
+        v = regime_call(block.self_attn.v, attn_input, regime=regime)
 
         q = rope_apply(q, freqs, block.num_heads)
         k = rope_apply(k, freqs, block.num_heads)
@@ -213,6 +232,7 @@ class MoT(nn.Module):
         use_gradient_checkpointing: bool,
         mixed_slice: torch.Tensor,
         context_payload: Optional[dict],
+        regime: Optional[str] = None,
     ) -> torch.Tensor:
         """Apply post-attention computations, with optional checkpointing.
 
@@ -228,6 +248,9 @@ class MoT(nn.Module):
             context_payload: Optional dict for cross-attention.
                 - `context`: encoder states [B, L, D]
                 - `mask`: attention mask [B, S, L] or [B, 1, S, L]
+            regime: Optional regime label for regime-aware wrapped submodules.
+                Captured as a closure constant of the checkpointed function, so
+                backward-time recomputation observes the identical regime.
 
         Returns:
             Updated expert tokens after self-attn residual, optional cross-attn, and MLP.
@@ -241,6 +264,7 @@ class MoT(nn.Module):
             _gate_mlp: torch.Tensor,
             _block=block,
             _context_payload=context_payload,
+            _regime=regime,
         ) -> torch.Tensor:
             return self._apply_expert_post_block(
                 block=_block,
@@ -251,6 +275,7 @@ class MoT(nn.Module):
                 scale_mlp=_scale_mlp,
                 gate_mlp=_gate_mlp,
                 context_payload=_context_payload,
+                regime=_regime,
             )
 
         if use_gradient_checkpointing and self.training:
@@ -280,6 +305,7 @@ class MoT(nn.Module):
         video_t_mod: torch.Tensor,
         video_context_payload: Optional[dict],
         video_attention_mask: torch.Tensor,
+        regime: Optional[str] = None,
     ) -> list[dict[str, torch.Tensor]]:
         """Prefill video branch once and cache per-layer K/V for action denoising.
 
@@ -314,6 +340,7 @@ class MoT(nn.Module):
                 f"mask={video_attention_mask.shape[0]} vs tokens={video_tokens.shape[1]}"
             )
 
+        regime = validate_regime(regime, context="MoT.prefill_video_cache")
         expert = self.mixtures["video"]
         x = video_tokens
         kv_cache: list[dict[str, torch.Tensor]] = []
@@ -336,6 +363,7 @@ class MoT(nn.Module):
                 x=x,
                 freqs=video_freqs,
                 t_mod=video_t_mod,
+                regime=regime,
             )
             # Video prefill uses only video self-attention mask.
             mixed = self._mixed_attention(
@@ -355,6 +383,7 @@ class MoT(nn.Module):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 mixed_slice=mixed,
                 context_payload=video_context_payload,
+                regime=regime,
             )
             kv_cache.append({"k": k, "v": v})
         return kv_cache
@@ -368,6 +397,7 @@ class MoT(nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        regime: Optional[str] = None,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -406,6 +436,7 @@ class MoT(nn.Module):
         # Use the action query rows from the joint [video+action] mask.
         action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
 
+        regime = validate_regime(regime, context="MoT.forward_action_with_video_cache")
         expert = self.mixtures["action"]
         x = action_tokens
         for layer_idx in range(self.num_layers):
@@ -427,6 +458,7 @@ class MoT(nn.Module):
                 x=x,
                 freqs=action_freqs,
                 t_mod=action_t_mod,
+                regime=regime,
             )
             layer_cache = video_kv_cache[layer_idx]
             if "k" not in layer_cache or "v" not in layer_cache:
@@ -460,6 +492,7 @@ class MoT(nn.Module):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 mixed_slice=mixed,
                 context_payload=action_context_payload,
+                regime=regime,
             )
         return x
 
@@ -558,6 +591,7 @@ class MoT(nn.Module):
             if group.name in group_names:
                 raise ValueError(f"duplicate attention group name {group.name!r}")
             group_names.add(group.name)
+            validate_regime(group.regime, context=f"attention group {group.name!r}")
             if not group.spans:
                 raise ValueError(f"attention group {group.name!r} has no spans")
 
@@ -679,6 +713,7 @@ class MoT(nn.Module):
                         x=x,
                         freqs=freqs,
                         t_mod=t_mod,
+                        regime=group.regime,
                     )
                     q_chunks.append(q)
                     k_chunks.append(k)
@@ -727,6 +762,7 @@ class MoT(nn.Module):
                             use_gradient_checkpointing=cached["use_gradient_checkpointing"],
                             mixed_slice=mixed[:, mixed_start:mixed_end],
                             context_payload=cached["context_payload"],
+                            regime=group.regime,
                         )
                         writers[span.expert].append((span.start, span.end, updated))
                     mixed_start = mixed_end
@@ -749,7 +785,23 @@ class MoT(nn.Module):
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
         attention_groups: Optional[Sequence[MoTAttentionGroup]] = None,
+        active_regime: Optional[str] = None,
     ):
+        """Run the MoT layers.
+
+        Args:
+            active_regime: Optional regime label for a *whole-call* single-regime
+                forward (the non-fused forced-branch paths). Mutually exclusive
+                with ``attention_groups`` — grouped forwards carry per-group
+                regimes on ``MoTAttentionGroup.regime`` instead. Default ``None``
+                preserves the pre-protocol behaviour exactly.
+        """
+        active_regime = validate_regime(active_regime, context="MoT.forward")
+        if attention_groups is not None and active_regime is not None:
+            raise ValueError(
+                "MoT.forward received both `attention_groups` and `active_regime`; "
+                "grouped forwards must carry regimes on MoTAttentionGroup.regime."
+            )
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
             raise ValueError(f"Missing expert tokens for {missing}")
@@ -807,6 +859,7 @@ class MoT(nn.Module):
                     x=x,
                     freqs=freqs,
                     t_mod=t_mod,
+                    regime=active_regime,
                 )
 
                 q_chunks.append(q)
@@ -856,6 +909,7 @@ class MoT(nn.Module):
                     use_gradient_checkpointing=cached_expert["use_gradient_checkpointing"],
                     mixed_slice=mixed_slice,
                     context_payload=context_payload,
+                    regime=active_regime,
                 )
 
                 tokens_all[name] = updated_tokens

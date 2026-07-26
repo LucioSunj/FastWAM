@@ -60,6 +60,7 @@ from fastwam.adaptive_gate.training import normalized_dual_regime_action_loss
 
 from .dual_regime_masks import build_multi_regime_attention_mask, merge_action_draft_payloads
 from .mot import MoTAttentionGroup, MoTExpertSpan
+from .regime import REGIME_UNCOND
 from .fastwam_metric_adaptive import (
     MetricAdaptiveFastWAM,
     _maybe_instantiate,
@@ -214,6 +215,13 @@ class _FusedDualRegimeTrainingMixin:
                     MoTExpertSpan("video", 0, int(video_side["tokens"].shape[1])),
                     MoTExpertSpan("action", main_action_start, main_action_end),
                 ),
+                # Regime labels are consumed only by regime-aware wrapped
+                # submodules (stage-2 UNCOND-gated adapters); with none
+                # attached they change nothing. `main_regime_name` must be a
+                # registered regime — a variant with an unregistered name now
+                # fails closed in `MoT._validate_attention_groups` instead of
+                # silently running unlabeled.
+                regime=self.main_regime_name,
             ),
             MoTAttentionGroup(
                 name="base",
@@ -223,6 +231,7 @@ class _FusedDualRegimeTrainingMixin:
                     ),
                     MoTExpertSpan("action", base_action_start, base_action_end),
                 ),
+                regime=REGIME_UNCOND,
             ),
         )
 
