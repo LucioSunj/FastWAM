@@ -156,6 +156,9 @@ class MetricAdaptiveFastWAM(FastWAMIDM):
         idm_control: Any = "valid_idm",
         shuffled_future_donor: Any = None,
         expected_donor_metadata: Mapping[str, Any] | None = None,
+        init_noise: Optional[torch.Tensor] = None,
+        velocity_hook: Any = None,
+        return_init_noise: bool = False,
     ) -> dict[str, Any]:
         kwargs = locals()
         kwargs.pop("self")
@@ -279,6 +282,27 @@ class MetricAdaptiveFastWAM(FastWAMIDM):
             method = getattr(FastWAMIDM, method_name)
 
         branch_kwargs = self._filter_kwargs_for_method(method, kwargs)
+        # Stage-2 W8: the sampler interface (noise injection / velocity hook)
+        # is implemented on the base/UNCOND action path only. The signature
+        # filter above would silently DROP these kwargs for a branch method
+        # that lacks them — fail closed instead, because a caller who injected
+        # a noise or a guidance hook must never get an unguided rollout back.
+        # Identity checks only: a tensor value must never hit `in (None, False)`
+        # membership (tensor __eq__ would raise on multi-element truthiness).
+        dropped_sampler_kwargs = [
+            key
+            for key in ("init_noise", "velocity_hook", "return_init_noise")
+            if (value := kwargs.get(key)) is not None
+            and value is not False
+            and key not in branch_kwargs
+        ]
+        if dropped_sampler_kwargs:
+            raise ValueError(
+                f"Branch {branch_name!r} ({method.__qualname__}) does not implement "
+                f"sampler-interface kwargs {dropped_sampler_kwargs}; refusing to drop "
+                "them silently. init_noise/velocity_hook/return_init_noise are "
+                "base/UNCOND-only."
+            )
         logger.debug("Adaptive FastWAM call `%s` through inherited branch `%s`.", method_name, branch_name)
         return method(self, **branch_kwargs)
 

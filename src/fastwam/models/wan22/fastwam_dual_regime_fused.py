@@ -264,8 +264,22 @@ class _FusedDualRegimeTrainingMixin:
         }
 
     # ---- training loss -------------------------------------------------------
-    def training_loss(self, sample, tiled: bool = False):
-        """Single fused forward training BOTH action regimes; video loss once."""
+    def training_loss(
+        self,
+        sample,
+        tiled: bool = False,
+        draws: dict | None = None,
+        draws_out: dict | None = None,
+    ):
+        """Single fused forward training BOTH action regimes; video loss once.
+
+        Stage-2 W8 additions, defaulting to the pre-W8 behaviour: ``draws``
+        injects a complete externally supplied draw dict (the exact structure
+        produced by ``_sample_dual_regime_draws``; used VERBATIM — the
+        diagnostic noise-coupling hook is NOT re-applied to injected draws),
+        and ``draws_out`` — a caller-supplied dict — receives references to the
+        draws actually used, so ``(t, eps)`` pairs can be cached and replayed.
+        """
         self._require_temporal_patch_size(self.video_expert)
         inputs = self.build_inputs(sample, tiled=tiled)
         if inputs["first_frame_latents"] is None:
@@ -273,7 +287,10 @@ class _FusedDualRegimeTrainingMixin:
                 "Fused dual-regime training requires `fuse_vae_embedding_in_latents=true` "
                 "so that `first_frame_latents` is available (the adaptive configs set this)."
             )
-        draws = self._sample_dual_regime_draws(inputs)
+        if draws is None:
+            draws = self._sample_dual_regime_draws(inputs)
+        if draws_out is not None:
+            draws_out.update(draws)
         out = self._fused_dual_regime_forward(inputs, draws)
 
         # Video loss: identical reduction to the parents; first (clean/fused)
