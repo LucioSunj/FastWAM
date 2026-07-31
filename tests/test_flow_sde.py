@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from fastwam.models.wan22.flow_sde import (
@@ -106,6 +107,19 @@ def test_first_flow_sde_step_uses_next_time_for_finite_sigma():
     assert torch.all(std > 0)
 
 
+def test_tiny_schedule_roundoff_below_zero_is_clamped():
+    sample = torch.zeros(1, 2, 3)
+    mean, std = flow_sde_mean_std(
+        sample,
+        sample,
+        time=torch.tensor([0.1]),
+        next_time=torch.tensor([-1e-8]),
+        noise_level=0.5,
+    )
+    assert torch.isfinite(mean).all()
+    assert torch.isfinite(std).all()
+
+
 def test_gaussian_log_prob_matches_torch_distribution():
     sample = torch.randn(2, 3, 4)
     mean = torch.randn_like(sample)
@@ -139,3 +153,40 @@ def test_invalid_non_decreasing_schedule_is_rejected():
         assert "strictly decreasing" in str(exc)
     else:
         raise AssertionError("Expected a ValueError")
+
+
+@pytest.mark.parametrize(
+    "bad_time", [float("nan"), float("inf"), float("-inf")]
+)
+def test_nonfinite_flow_times_are_rejected(bad_time):
+    with pytest.raises(ValueError, match="finite"):
+        reverse_step_size(torch.tensor([bad_time]), torch.tensor([0.5]))
+
+
+@pytest.mark.parametrize(
+    "noise_level", [float("nan"), float("inf"), float("-inf")]
+)
+def test_nonfinite_noise_level_is_rejected(noise_level):
+    sample = torch.zeros(1, 2, 3)
+    with pytest.raises(ValueError, match="noise_level.*finite"):
+        flow_sde_mean_std(
+            sample,
+            sample,
+            time=torch.tensor([0.8]),
+            next_time=torch.tensor([0.6]),
+            noise_level=noise_level,
+        )
+
+
+@pytest.mark.parametrize("eps", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_eps_is_rejected(eps):
+    sample = torch.zeros(1, 2, 3)
+    with pytest.raises(ValueError, match="eps.*positive"):
+        flow_sde_mean_std(
+            sample,
+            sample,
+            time=torch.tensor([0.8]),
+            next_time=torch.tensor([0.6]),
+            noise_level=0.5,
+            eps=eps,
+        )

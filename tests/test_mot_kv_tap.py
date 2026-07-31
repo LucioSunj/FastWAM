@@ -72,9 +72,12 @@ def _joint_inputs() -> dict:
             ],
         ]
     )
+    attention_mask = torch.ones(7, 7, dtype=torch.bool)
+    attention_mask[:4, 4:] = False
+    attention_mask[:2, 2:4] = False
     return {
         "embeds_all": {"video": video, "action": action},
-        "attention_mask": torch.ones(7, 7, dtype=torch.bool),
+        "attention_mask": attention_mask,
         "freqs_all": {"video": _freqs(4), "action": _freqs(3)},
         "context_all": {
             "video": {
@@ -158,7 +161,13 @@ def test_cached_action_forward_tap_excludes_generated_future_video() -> None:
         value = torch.randn(2, 6, 8, generator=generator)
         key[:, 2:] = 10_000
         value[:, 2:] = -10_000
-        video_cache.append({"k": key, "v": value})
+        video_cache.append(
+            {
+                "k": key,
+                "v": value,
+                "_gate_current_frame_video_tokens": 2,
+            }
+        )
 
     kwargs = {
         "action_tokens": action_tokens,
@@ -172,6 +181,7 @@ def test_cached_action_forward_tap_excludes_generated_future_video() -> None:
         "attention_mask": torch.ones(9, 9, dtype=torch.bool),
         "video_seq_len": 6,
     }
+    kwargs["attention_mask"][:2, 2:6] = False
     baseline = mot.forward_action_with_video_cache(**kwargs)
     tap = GateKVTapRequest(
         current_mode="idm",
@@ -192,6 +202,118 @@ def test_cached_action_forward_tap_excludes_generated_future_video() -> None:
             video_cache[layer_index]["v"][:, :2],
         )
         assert layer.current_frame_video.sequence_length == 2
+
+
+def test_tap_rejects_direct_future_video_leak_after_layer_zero() -> None:
+    mot = _mot()
+    inputs = _joint_inputs()
+    inputs["attention_mask"][:2, 2:4] = True
+    tap = GateKVTapRequest(
+        current_mode="idm",
+        denoise_timestep=0.1,
+        current_frame_video_tokens=2,
+        layer_indices=(1,),
+    )
+
+    with pytest.raises(ValueError, match="causal video mask"):
+        mot(**inputs, kv_tap=tap)
+
+
+def test_cached_tap_rejects_noncausal_or_unprovenanced_prefill(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _message: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    mot = _mot()
+    generator = torch.Generator().manual_seed(29)
+    video_tokens = torch.randn(2, 6, 8, generator=generator)
+    video_mask = torch.ones(6, 6, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="causal video mask"):
+        mot.prefill_video_cache(
+            video_tokens=video_tokens,
+            video_freqs=_freqs(6),
+            video_t_mod=torch.zeros(2, 6, 8),
+            video_context_payload=None,
+            video_attention_mask=video_mask,
+            gate_current_frame_video_tokens=2,
+        )
+
+    unprovenanced_cache = mot.prefill_video_cache(
+        video_tokens=video_tokens,
+        video_freqs=_freqs(6),
+        video_t_mod=torch.zeros(2, 6, 8),
+        video_context_payload=None,
+        video_attention_mask=video_mask,
+    )
+    causal_joint_mask = torch.ones(9, 9, dtype=torch.bool)
+    causal_joint_mask[:2, 2:6] = False
+    tap = GateKVTapRequest(
+        current_mode="idm",
+        denoise_timestep=0.1,
+        current_frame_video_tokens=2,
+        layer_indices=(1,),
+    )
+
+    with pytest.raises(ValueError, match="cache provenance"):
+        mot.forward_action_with_video_cache(
+            action_tokens=torch.randn(2, 3, 8, generator=generator),
+            action_freqs=_freqs(3),
+            action_t_mod=torch.zeros(2, 6, 8),
+            action_context_payload={
+                "context": torch.randn(2, 5, 8, generator=generator),
+                "mask": torch.ones(2, 3, 5, dtype=torch.bool),
+            },
+            video_kv_cache=unprovenanced_cache,
+            attention_mask=causal_joint_mask,
+            video_seq_len=6,
+            kv_tap=tap,
+        )
+
+
+def test_layer_zero_tap_is_safe_before_video_tokens_mix() -> None:
+    mot = _mot()
+    inputs = _joint_inputs()
+    inputs["attention_mask"][:2, 2:4] = True
+    tap = GateKVTapRequest(
+        current_mode="idm",
+        denoise_timestep=0.1,
+        current_frame_video_tokens=2,
+        layer_indices=(0,),
+    )
+
+    mot(**inputs, kv_tap=tap)
+    assert tap.snapshot().layer_indices == (0,)
+
+
+def test_causal_mask_keeps_later_current_frame_kv_independent_of_future() -> None:
+    mot = _mot()
+    baseline_inputs = _joint_inputs()
+    perturbed_inputs = dict(baseline_inputs)
+    perturbed_video = baseline_inputs["embeds_all"]["video"].clone()
+    perturbed_video[:, 2:] += 10_000
+    perturbed_inputs["embeds_all"] = {
+        **baseline_inputs["embeds_all"],
+        "video": perturbed_video,
+    }
+    baseline_tap = GateKVTapRequest(
+        current_mode="idm",
+        denoise_timestep=0.1,
+        current_frame_video_tokens=2,
+        layer_indices=(1,),
+    )
+    perturbed_tap = GateKVTapRequest(
+        current_mode="idm",
+        denoise_timestep=0.1,
+        current_frame_video_tokens=2,
+        layer_indices=(1,),
+    )
+
+    mot(**baseline_inputs, kv_tap=baseline_tap)
+    mot(**perturbed_inputs, kv_tap=perturbed_tap)
+
+    baseline_bank = baseline_tap.snapshot().layers[0].current_frame_video
+    perturbed_bank = perturbed_tap.snapshot().layers[0].current_frame_video
+    assert torch.equal(baseline_bank.key, perturbed_bank.key)
+    assert torch.equal(baseline_bank.value, perturbed_bank.value)
 
 
 def test_tap_rejects_invalid_video_or_layer_extent_before_forward() -> None:

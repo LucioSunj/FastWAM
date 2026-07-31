@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from fastwam.models.wan22.adaptive_sampler import (
@@ -106,6 +107,71 @@ def test_gate_taps_keep_only_last_n_velocity_calls():
         stochastic=False,
     )
     assert rollout.gate_taps == tuple(seen[-2:])
+
+
+def test_eval_sampling_can_omit_replay_chain_and_log_probs():
+    initial = torch.zeros(2, 3, 4)
+    timesteps = torch.tensor([1000.0, 500.0])
+    deltas = torch.tensor([-0.5, -0.5])
+
+    rollout = sample_action_flow_sde(
+        initial,
+        velocity_fn=lambda x_t, _t: VelocityOutput(
+            torch.ones_like(x_t), gate_tap={"batch": x_t.shape[0]}
+        ),
+        timesteps=timesteps,
+        scheduler_deltas=deltas,
+        num_train_timesteps=1000,
+        noise_level=0.5,
+        stochastic=False,
+        gate_last_n=1,
+        collect_replay=False,
+    )
+
+    assert rollout.chains.shape == (2, 0, 3, 4)
+    assert rollout.old_log_probs.shape == (2, 0)
+    assert len(rollout.gate_taps) == 1
+
+
+def test_bfloat16_actions_use_fp32_default_schedule_through_final_sde_step():
+    scheduler, timesteps, deltas = _schedule(num_steps=20)
+    initial_noise = torch.zeros(1, 2, 3, dtype=torch.bfloat16)
+
+    rollout = sample_action_flow_sde(
+        initial_noise,
+        velocity_fn=lambda action, _timestep: torch.zeros_like(action),
+        timesteps=timesteps,
+        scheduler_deltas=deltas,
+        num_train_timesteps=scheduler.num_train_timesteps,
+        noise_level=0.5,
+        denoise_indices=torch.tensor([19]),
+    )
+
+    assert torch.isfinite(rollout.actions).all()
+    assert torch.isfinite(rollout.old_log_probs).all()
+
+
+def test_flow_sde_rejects_a_bfloat16_schedule_before_sampling():
+    scheduler = WanContinuousFlowMatchScheduler(
+        num_train_timesteps=1000,
+        shift=5.0,
+    )
+    timesteps, deltas = scheduler.build_inference_schedule(
+        num_inference_steps=20,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    with pytest.raises(TypeError, match="must remain in FP32 or FP64"):
+        sample_action_flow_sde(
+            torch.zeros(1, 2, 3, dtype=torch.bfloat16),
+            velocity_fn=lambda action, _timestep: torch.zeros_like(action),
+            timesteps=timesteps,
+            scheduler_deltas=deltas,
+            num_train_timesteps=1000,
+            noise_level=0.5,
+            denoise_indices=torch.tensor([19]),
+        )
 
 
 def test_uniform_index_sampler_respects_ignore_last():

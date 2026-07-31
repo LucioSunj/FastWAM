@@ -59,6 +59,18 @@ def _as_velocity_output(result: VelocityOutput | torch.Tensor) -> VelocityOutput
     return VelocityOutput(velocity=result)
 
 
+def _validate_schedule_precision(
+    timesteps: torch.Tensor,
+    scheduler_deltas: torch.Tensor,
+) -> None:
+    supported = {torch.float32, torch.float64}
+    if timesteps.dtype not in supported or scheduler_deltas.dtype not in supported:
+        raise TypeError(
+            "Flow-SDE timesteps and deltas must remain in FP32 or FP64; "
+            "cast only the timestep passed into the action model."
+        )
+
+
 def sample_denoise_indices(
     batch_size: int,
     num_steps: int,
@@ -98,6 +110,7 @@ def sample_action_flow_sde(
     generator: Optional[torch.Generator] = None,
     gate_last_n: int = 1,
     stochastic: bool = True,
+    collect_replay: bool = True,
 ) -> ActionFlowRollout:
     """Sample an action chain with one Flow-SDE transition per sample.
 
@@ -113,6 +126,8 @@ def sample_action_flow_sde(
         generator: Sampling generator.
         gate_last_n: Number of final velocity-call tap payloads to retain.
         stochastic: If false, run the deterministic ODE and return index ``-1``.
+        collect_replay: Retain the full action chain and selected log-probability.
+            Evaluation can disable this while still collecting final Gate taps.
     """
 
     if initial_noise.ndim < 2:
@@ -125,6 +140,7 @@ def sample_action_flow_sde(
         raise ValueError(
             f"Schedule shape mismatch: {timesteps.shape} vs {scheduler_deltas.shape}"
         )
+    _validate_schedule_precision(timesteps, scheduler_deltas)
     if gate_last_n < 1 or gate_last_n > timesteps.numel():
         raise ValueError(
             f"`gate_last_n` must be in [1, {timesteps.numel()}], got {gate_last_n}"
@@ -168,8 +184,10 @@ def sample_action_flow_sde(
         )
 
     x_t = initial_noise
-    chains = [x_t]
-    selected_log_prob = torch.zeros_like(x_t, dtype=torch.float32)
+    chains = [x_t] if collect_replay else None
+    selected_log_prob = (
+        torch.zeros_like(x_t, dtype=torch.float32) if collect_replay else None
+    )
     gate_taps: list[Any] = []
     gate_start = num_steps - gate_last_n
 
@@ -214,23 +232,33 @@ def sample_action_flow_sde(
                 batch_size, *([1] * (x_t.ndim - 1))
             )
             x_next = torch.where(selected_mask, sde_next, ode_next)
-            transition_log_prob = gaussian_log_prob(sde_next, mean, std)
-            selected_log_prob = torch.where(
-                selected_mask,
-                transition_log_prob,
-                selected_log_prob,
-            )
+            if selected_log_prob is not None:
+                transition_log_prob = gaussian_log_prob(sde_next, mean, std)
+                selected_log_prob = torch.where(
+                    selected_mask,
+                    transition_log_prob,
+                    selected_log_prob,
+                )
         else:
             x_next = ode_next
 
         x_t = x_next
-        chains.append(x_t)
+        if chains is not None:
+            chains.append(x_t)
 
     return ActionFlowRollout(
         actions=x_t,
-        chains=torch.stack(chains, dim=1),
+        chains=(
+            torch.stack(chains, dim=1)
+            if chains is not None
+            else initial_noise.new_empty((batch_size, 0, *initial_noise.shape[1:]))
+        ),
         denoise_indices=denoise_indices,
-        old_log_probs=selected_log_prob,
+        old_log_probs=(
+            selected_log_prob
+            if selected_log_prob is not None
+            else initial_noise.new_empty((batch_size, 0), dtype=torch.float32)
+        ),
         gate_taps=tuple(gate_taps),
         timesteps=timesteps,
     )
@@ -252,6 +280,7 @@ def replay_action_flow_sde_transition(
         raise ValueError(
             f"`chains` must have shape [B, S+1, ...], got {chains.shape}"
         )
+    _validate_schedule_precision(timesteps, scheduler_deltas)
     batch_size, chain_steps = chains.shape[:2]
     if chain_steps != timesteps.numel() + 1:
         raise ValueError(

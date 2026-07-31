@@ -8,10 +8,16 @@ that conversion explicit so callers cannot silently use the wrong sign.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
+
+def _require_finite(name: str, value: torch.Tensor) -> None:
+    if not bool(torch.isfinite(value).all().item()):
+        raise ValueError(f"`{name}` must contain only finite values.")
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,7 @@ def normalize_flow_time(
             f"`num_train_timesteps` must be positive, got {num_train_timesteps}"
         )
     time = timestep.to(dtype=torch.float32) / float(num_train_timesteps)
+    _require_finite("timestep", time)
     if bool(((time < 0) | (time > 1)).any()):
         raise ValueError("Normalized flow timesteps must lie in [0, 1].")
     return time
@@ -49,6 +56,8 @@ def reverse_step_size(time: torch.Tensor, next_time: torch.Tensor) -> torch.Tens
     time, next_time = torch.broadcast_tensors(
         time.to(dtype=torch.float32), next_time.to(dtype=torch.float32)
     )
+    _require_finite("time", time)
+    _require_finite("next_time", next_time)
     delta = time - next_time
     if bool((delta <= 0).any()):
         raise ValueError("Flow-SDE requires strictly decreasing timesteps.")
@@ -109,20 +118,33 @@ def flow_sde_mean_std(
         raise ValueError(
             f"`x_t` and `velocity` must match, got {x_t.shape} and {velocity.shape}"
         )
-    if eps <= 0:
+    if not math.isfinite(float(eps)) or eps <= 0:
         raise ValueError(f"`eps` must be positive, got {eps}")
 
     time, next_time = torch.broadcast_tensors(
         time.to(device=x_t.device, dtype=torch.float32),
         next_time.to(device=x_t.device, dtype=torch.float32),
     )
+    _require_finite("time", time)
+    _require_finite("next_time", next_time)
+    range_tolerance = 1e-6
+    if bool(((time <= 0) | (time > 1 + range_tolerance)).any().item()):
+        raise ValueError("Flow-SDE `time` must lie in (0, 1].")
+    if bool(
+        (
+            (next_time < -range_tolerance)
+            | (next_time > 1 + range_tolerance)
+        ).any().item()
+    ):
+        raise ValueError("Flow-SDE `next_time` must lie in [0, 1].")
+    time = time.clamp(max=1.0)
+    next_time = next_time.clamp(min=0.0, max=1.0)
     delta = reverse_step_size(time, next_time).to(device=x_t.device)
-    if bool((time <= 0).any()):
-        raise ValueError("Flow-SDE cannot be evaluated at t <= 0.")
 
     noise_level_tensor = torch.as_tensor(
         noise_level, device=x_t.device, dtype=torch.float32
     )
+    _require_finite("noise_level", noise_level_tensor)
     if bool((noise_level_tensor < 0).any()):
         raise ValueError("`noise_level` must be non-negative.")
 
@@ -165,6 +187,8 @@ def gaussian_log_prob(
         raise ValueError(
             f"`std` with shape {std.shape} is not broadcastable to {sample.shape}"
         ) from exc
+    if not bool(torch.isfinite(std).all().item()):
+        raise ValueError("Gaussian standard deviation must be finite.")
     if bool((std <= 0).any()):
         raise ValueError("Gaussian standard deviation must be strictly positive.")
 

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import ContextManager
+from typing import Any, ContextManager
 
 import torch
 import torch.nn as nn
 
-from fastwam.adapters import PolicyRegime, RegimeContext
+from fastwam.adapters import PolicyRegime, RegimeContext, RegimeLoRALinear
 
 from .adaptive_sampler import VelocityOutput
 from .kv_tap import GateKVSnapshot, GateKVTapRequest
@@ -21,7 +21,7 @@ class CachedActionCondition:
 
     context: torch.Tensor
     context_mask: torch.Tensor
-    video_kv_cache: list[dict[str, torch.Tensor]]
+    video_kv_cache: list[dict[str, Any]]
     attention_mask: torch.Tensor
     video_seq_len: int
     current_frame_video_tokens: int
@@ -65,6 +65,33 @@ class CachedActionVelocity:
         self.actor_version = int(actor_version)
         if self.actor_version < 0:
             raise ValueError("`actor_version` must be non-negative.")
+        if self.regime is PolicyRegime.UNCOND and self.regime_context is None:
+            raise ValueError(
+                "UNCOND action velocity requires the injected LoRA `regime_context`; "
+                "silently using IDM/base weights is forbidden."
+            )
+        if self.regime_context is not None and not isinstance(
+            self.regime_context, RegimeContext
+        ):
+            raise TypeError("`regime_context` must be a RegimeContext instance.")
+        if self.regime is PolicyRegime.UNCOND:
+            adapted_layers = tuple(
+                module
+                for module in self.action_expert.modules()
+                if isinstance(module, RegimeLoRALinear)
+            )
+            if not adapted_layers:
+                raise ValueError(
+                    "UNCOND action velocity requires at least one injected "
+                    "RegimeLoRALinear."
+                )
+            if any(
+                layer.regime_context is not self.regime_context
+                for layer in adapted_layers
+            ):
+                raise ValueError(
+                    "`regime_context` does not own every injected ActionDiT LoRA layer."
+                )
 
     def _regime_scope(self) -> ContextManager[PolicyRegime | None]:
         if self.regime_context is None:

@@ -11,13 +11,14 @@ from fastwam.utils.logging_config import get_logger
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
+from .runtime_placement import RuntimePlacementMixin
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .wan_video_dit import sinusoidal_embedding_1d
 
 logger = get_logger(__name__)
 
 
-class FastWAM(torch.nn.Module):
+class FastWAM(RuntimePlacementMixin, torch.nn.Module):
     """MoT world model with video/action experts."""
 
     def __init__(
@@ -707,7 +708,7 @@ class FastWAM(torch.nn.Module):
         timestep_action: torch.Tensor,
         context: torch.Tensor,
         context_mask: torch.Tensor,
-        video_kv_cache: list[dict[str, torch.Tensor]],
+        video_kv_cache: list[dict[str, Any]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
     ) -> torch.Tensor:

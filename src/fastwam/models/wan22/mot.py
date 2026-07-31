@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -17,6 +17,8 @@ from .kv_tap import (
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+_GATE_CURRENT_FRAME_PROVENANCE_KEY = "_gate_current_frame_video_tokens"
 
 
 class MoT(nn.Module):
@@ -103,6 +105,68 @@ class MoT(nn.Module):
                 use_reentrant=False,
             )
         return _forward(q_cat, k_cat, v_cat)
+
+    def _validate_gate_current_frame_causality(
+        self,
+        *,
+        kv_tap: GateKVTapRequest,
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+    ) -> None:
+        """Reject a tap whose current-frame K/V can contain direct future video."""
+
+        selected_layers = kv_tap.selected_layers(self.num_layers)
+        if not any(layer_index > 0 for layer_index in selected_layers):
+            return
+        self._validate_current_frame_video_mask(
+            attention_mask=attention_mask,
+            current_frame_video_tokens=kv_tap.current_frame_video_tokens,
+            video_seq_len=video_seq_len,
+        )
+
+    @staticmethod
+    def _validate_current_frame_video_mask(
+        *,
+        attention_mask: torch.Tensor,
+        current_frame_video_tokens: int,
+        video_seq_len: int,
+    ) -> None:
+        if attention_mask.dtype != torch.bool:
+            raise TypeError("Gate video-mask provenance requires a boolean mask.")
+        current_len = int(current_frame_video_tokens)
+        future_video_access = attention_mask[
+            :current_len,
+            current_len:video_seq_len,
+        ]
+        if future_video_access.numel() and bool(future_video_access.any().item()):
+            raise ValueError(
+                "Gate current-frame K/V capture after layer 0 requires a causal "
+                "video mask: current-frame video queries may not attend generated "
+                "future-video tokens. Action K/V may still carry indirect future "
+                "information."
+            )
+
+    def _validate_gate_cache_provenance(
+        self,
+        *,
+        kv_tap: GateKVTapRequest,
+        video_kv_cache: list[dict[str, Any]],
+    ) -> None:
+        if not any(
+            layer_index > 0
+            for layer_index in kv_tap.selected_layers(self.num_layers)
+        ):
+            return
+        expected = kv_tap.current_frame_video_tokens
+        provenance = [
+            layer_cache.get(_GATE_CURRENT_FRAME_PROVENANCE_KEY)
+            for layer_cache in video_kv_cache
+        ]
+        if any(value != expected for value in provenance):
+            raise ValueError(
+                "Gate capture after layer 0 requires video K/V cache provenance "
+                f"for exactly {expected} causal current-frame tokens."
+            )
 
     @staticmethod
     def _apply_expert_post_block(
@@ -269,7 +333,8 @@ class MoT(nn.Module):
         video_t_mod: torch.Tensor,
         video_context_payload: Optional[dict],
         video_attention_mask: torch.Tensor,
-    ) -> list[dict[str, torch.Tensor]]:
+        gate_current_frame_video_tokens: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
         """Prefill video branch once and cache per-layer K/V for action denoising.
 
         Args:
@@ -280,6 +345,8 @@ class MoT(nn.Module):
                 - `context`: encoder states [B, L, D]
                 - `mask`: attention mask [B, Sv, L] or [B, 1, Sv, L]
             video_attention_mask: Video self-attention mask, shape [Sv, Sv].
+            gate_current_frame_video_tokens: If provided, validate and record
+                the causal current-frame prefix required by later Gate taps.
 
         Returns:
             Layer-wise cache list with length `num_layers`.
@@ -302,10 +369,22 @@ class MoT(nn.Module):
                 "`video_attention_mask` seq length mismatch: "
                 f"mask={video_attention_mask.shape[0]} vs tokens={video_tokens.shape[1]}"
             )
+        if gate_current_frame_video_tokens is not None:
+            current_len = int(gate_current_frame_video_tokens)
+            if current_len < 1 or current_len > int(video_tokens.shape[1]):
+                raise ValueError(
+                    "`gate_current_frame_video_tokens` must lie in the video "
+                    f"sequence, got {current_len} for {video_tokens.shape[1]} tokens."
+                )
+            self._validate_current_frame_video_mask(
+                attention_mask=video_attention_mask,
+                current_frame_video_tokens=current_len,
+                video_seq_len=int(video_tokens.shape[1]),
+            )
 
         expert = self.mixtures["video"]
         x = video_tokens
-        kv_cache: list[dict[str, torch.Tensor]] = []
+        kv_cache: list[dict[str, Any]] = []
         for layer_idx in range(self.num_layers):
             nvtx.range_push(f"prefill_video_layer_{layer_idx}")
             block = expert.blocks[layer_idx]
@@ -346,7 +425,12 @@ class MoT(nn.Module):
                 mixed_slice=mixed,
                 context_payload=video_context_payload,
             )
-            kv_cache.append({"k": k, "v": v})
+            layer_cache: dict[str, Any] = {"k": k, "v": v}
+            if gate_current_frame_video_tokens is not None:
+                layer_cache[_GATE_CURRENT_FRAME_PROVENANCE_KEY] = int(
+                    gate_current_frame_video_tokens
+                )
+            kv_cache.append(layer_cache)
             nvtx.range_pop()  # prefill_video_layer_N
         return kv_cache
 
@@ -565,7 +649,7 @@ class MoT(nn.Module):
         action_freqs: torch.Tensor,
         action_t_mod: torch.Tensor,
         action_context_payload: Optional[dict],
-        video_kv_cache: list[dict[str, torch.Tensor]],
+        video_kv_cache: list[dict[str, Any]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
         kv_tap: Optional[GateKVTapRequest] = None,
@@ -624,6 +708,10 @@ class MoT(nn.Module):
                 video_seq_len=video_seq_len,
                 batch_size=int(action_tokens.shape[0]),
             )
+            self._validate_gate_cache_provenance(
+                kv_tap=kv_tap,
+                video_kv_cache=video_kv_cache,
+            )
 
         # Pre-slice mask outside compiled region
         action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
@@ -673,6 +761,11 @@ class MoT(nn.Module):
                 num_layers=self.num_layers,
                 video_seq_len=int(tokens_all["video"].shape[1]),
                 batch_size=int(tokens_all["action"].shape[0]),
+            )
+            self._validate_gate_current_frame_causality(
+                kv_tap=kv_tap,
+                attention_mask=attention_mask,
+                video_seq_len=int(tokens_all["video"].shape[1]),
             )
 
         for layer_idx in range(self.num_layers):

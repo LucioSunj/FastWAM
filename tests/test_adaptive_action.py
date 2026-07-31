@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -103,14 +104,21 @@ def _condition() -> CachedActionCondition:
 
 
 def test_cached_action_velocity_keeps_gradient_and_restores_regime():
-    action_expert = _ActionExpert()
-    context = RegimeContext()
+    action_expert = _LoRAActionExpert()
+    adapter = inject_action_dit_lora(
+        action_expert,
+        RegimeLoRAConfig(
+            rank=2,
+            alpha=2.0,
+            target_groups=(ActionLoRATargetGroup.SELF_ATTENTION_QKVO,),
+        ),
+    )
     velocity = CachedActionVelocity(
         action_expert=action_expert,
         mot=_MoT(),
         condition=_condition(),
         regime=PolicyRegime.UNCOND,
-        regime_context=context,
+        regime_context=adapter.regime_context,
     )
     action = torch.randn(2, 2, 3, requires_grad=True)
 
@@ -118,9 +126,53 @@ def test_cached_action_velocity_keeps_gradient_and_restores_regime():
     output.velocity.sum().backward()
 
     assert action.grad is not None
-    assert action_expert.projection.weight.grad is not None
-    assert context.current is PolicyRegime.IDM
+    assert any(parameter.grad is not None for parameter in adapter.lora_parameters())
+    assert adapter.regime_context.current is PolicyRegime.IDM
     assert output.gate_tap is None
+
+
+def test_uncond_velocity_requires_the_adapter_regime_context():
+    with pytest.raises(ValueError, match="requires the injected LoRA"):
+        CachedActionVelocity(
+            action_expert=_ActionExpert(),
+            mot=_MoT(),
+            condition=_condition(),
+            regime=PolicyRegime.UNCOND,
+        )
+
+
+def test_uncond_velocity_rejects_an_action_expert_without_lora():
+    with pytest.raises(ValueError, match="at least one injected"):
+        CachedActionVelocity(
+            action_expert=_ActionExpert(),
+            mot=_MoT(),
+            condition=_condition(),
+            regime=PolicyRegime.UNCOND,
+            regime_context=RegimeContext(),
+        )
+
+
+def test_velocity_rejects_a_different_adapter_regime_context():
+    action_expert = _LoRAActionExpert()
+    adapter = inject_action_dit_lora(
+        action_expert,
+        RegimeLoRAConfig(
+            rank=2,
+            alpha=2.0,
+            target_groups=(ActionLoRATargetGroup.SELF_ATTENTION_QKVO,),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not own every injected"):
+        CachedActionVelocity(
+            action_expert=action_expert,
+            mot=_MoT(),
+            condition=_condition(),
+            regime=PolicyRegime.UNCOND,
+            regime_context=RegimeContext(),
+        )
+
+    assert adapter.regime_context.current is PolicyRegime.IDM
 
 
 def test_cached_action_condition_rejects_future_only_current_frame_count():
