@@ -7,6 +7,13 @@ import torch.cuda.nvtx as nvtx
 import torch.nn as nn
 
 from .wan_video_dit import flash_attention, modulate, rope_apply
+from .kv_tap import (
+    GateKVTapRequest,
+    GateLayerKV,
+    KVSource,
+    KeyValueBank,
+    context_token_mask,
+)
 from fastwam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -404,6 +411,7 @@ class MoT(nn.Module):
         video_cache_k: list[torch.Tensor],
         video_cache_v: list[torch.Tensor],
         action_attention_mask: torch.Tensor,
+        kv_tap: Optional[GateKVTapRequest] = None,
     ) -> torch.Tensor:
         """Core loop of forward_action_with_video_cache without NVTX or validation.
 
@@ -450,6 +458,18 @@ class MoT(nn.Module):
             k_video = video_cache_k[layer_idx]
             v_video = video_cache_v[layer_idx]
 
+            if kv_tap is not None and kv_tap.should_capture(layer_idx, self.num_layers):
+                self._capture_gate_layer_kv(
+                    kv_tap=kv_tap,
+                    layer_idx=layer_idx,
+                    video_k=k_video,
+                    video_v=v_video,
+                    action_k=k_action,
+                    action_v=v_action,
+                    action_block=block,
+                    action_context_payload=action_context_payload,
+                )
+
             k_cat = torch.cat([k_video, k_action], dim=1)
             v_cat = torch.cat([v_video, v_action], dim=1)
             mixed = self._mixed_attention(
@@ -471,6 +491,74 @@ class MoT(nn.Module):
             )
         return x
 
+    def _capture_gate_layer_kv(
+        self,
+        *,
+        kv_tap: GateKVTapRequest,
+        layer_idx: int,
+        video_k: torch.Tensor,
+        video_v: torch.Tensor,
+        action_k: torch.Tensor,
+        action_v: torch.Tensor,
+        action_block,
+        action_context_payload: Optional[dict],
+    ) -> None:
+        """Capture detached current-frame/action/context K/V for the Gate sidecar."""
+
+        if action_context_payload is None or action_context_payload.get("context") is None:
+            raise ValueError("Gate K/V capture requires the action text/state context.")
+        context = action_context_payload["context"]
+        context_mask = context_token_mask(
+            action_context_payload.get("mask"),
+            context=context,
+        )
+        with torch.no_grad():
+            context_k = action_block.cross_attn.norm_k(action_block.cross_attn.k(context))
+            context_v = action_block.cross_attn.v(context)
+
+        batch_size = action_k.shape[0]
+        timestep = kv_tap.normalized_timestep(
+            batch_size,
+            device=action_k.device,
+            dtype=action_k.dtype,
+        )
+        current_video_len = kv_tap.current_frame_video_tokens
+        kv_tap.collector.append(
+            GateLayerKV(
+                layer_index=layer_idx,
+                denoise_timestep=timestep,
+                current_mode=kv_tap.normalized_modes(batch_size),
+                current_frame_video=KeyValueBank(
+                    source=KVSource.CURRENT_FRAME_VIDEO,
+                    key=video_k[:, :current_video_len],
+                    value=video_v[:, :current_video_len],
+                    valid_mask=torch.ones(
+                        (batch_size, current_video_len),
+                        dtype=torch.bool,
+                        device=video_k.device,
+                    ),
+                    contains_generated_future_video=False,
+                ),
+                action=KeyValueBank(
+                    source=KVSource.ACTION,
+                    key=action_k,
+                    value=action_v,
+                    valid_mask=torch.ones(
+                        action_k.shape[:2],
+                        dtype=torch.bool,
+                        device=action_k.device,
+                    ),
+                ),
+                context=KeyValueBank(
+                    source=KVSource.TEXT_STATE_CONTEXT,
+                    key=context_k,
+                    value=context_v,
+                    valid_mask=context_mask,
+                ),
+                actor_version=kv_tap.actor_version,
+            )
+        )
+
     def forward_action_with_video_cache(
         self,
         action_tokens: torch.Tensor,
@@ -480,6 +568,7 @@ class MoT(nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        kv_tap: Optional[GateKVTapRequest] = None,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -529,6 +618,13 @@ class MoT(nn.Module):
                     f"`video_kv_cache[{layer_idx}]` seq len mismatch, expected {video_seq_len}."
                 )
 
+        if kv_tap is not None:
+            kv_tap.validate(
+                num_layers=self.num_layers,
+                video_seq_len=video_seq_len,
+                batch_size=int(action_tokens.shape[0]),
+            )
+
         # Pre-slice mask outside compiled region
         action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
 
@@ -544,6 +640,7 @@ class MoT(nn.Module):
             video_cache_k=video_cache_k,
             video_cache_v=video_cache_v,
             action_attention_mask=action_attention_mask,
+            kv_tap=kv_tap,
         )
 
     def forward(
@@ -553,6 +650,7 @@ class MoT(nn.Module):
         freqs_all: Dict[str, torch.Tensor],
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
+        kv_tap: Optional[GateKVTapRequest] = None,
     ):
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
@@ -570,6 +668,12 @@ class MoT(nn.Module):
             raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
 
         tokens_all = {k: v for k, v in embeds_all.items()}
+        if kv_tap is not None:
+            kv_tap.validate(
+                num_layers=self.num_layers,
+                video_seq_len=int(tokens_all["video"].shape[1]),
+                batch_size=int(tokens_all["action"].shape[0]),
+            )
 
         for layer_idx in range(self.num_layers):
             q_chunks = []
@@ -577,6 +681,7 @@ class MoT(nn.Module):
             v_chunks = []
             cached = {}
             seq_lens = []
+            layer_kv = {}
 
             for name in self.expert_order:
                 expert = self.mixtures[name]
@@ -616,6 +721,21 @@ class MoT(nn.Module):
                     "gate_mlp": gate_mlp,
                     "use_gradient_checkpointing": use_gradient_checkpointing,
                 }
+                layer_kv[name] = (k, v, block)
+
+            if kv_tap is not None and kv_tap.should_capture(layer_idx, self.num_layers):
+                video_k, video_v, _video_block = layer_kv["video"]
+                action_k, action_v, action_block = layer_kv["action"]
+                self._capture_gate_layer_kv(
+                    kv_tap=kv_tap,
+                    layer_idx=layer_idx,
+                    video_k=video_k,
+                    video_v=video_v,
+                    action_k=action_k,
+                    action_v=action_v,
+                    action_block=action_block,
+                    action_context_payload=context_all.get("action"),
+                )
 
             # 3. concat all tokens for mixed attention
             q_cat = torch.cat(q_chunks, dim=1)
