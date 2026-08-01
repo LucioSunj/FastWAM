@@ -21,9 +21,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import nn
 
 REGIME_LORA_SIDECAR_SCHEMA = "fastwam-regime-lora-v1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -45,7 +44,9 @@ class PolicyRegime(str, Enum):
             return cls(str(value).lower())
         except ValueError as error:
             allowed = ", ".join(item.value for item in cls)
-            raise ValueError(f"Unknown policy regime {value!r}; expected one of: {allowed}") from error
+            raise ValueError(
+                f"Unknown policy regime {value!r}; expected one of: {allowed}"
+            ) from error
 
 
 class RegimeContext:
@@ -108,7 +109,9 @@ class ActionLoRATargetGroup(str, Enum):
             return cls(str(value))
         except ValueError as error:
             allowed = ", ".join(item.value for item in cls)
-            raise ValueError(f"Unknown ActionDiT LoRA target {value!r}; expected: {allowed}") from error
+            raise ValueError(
+                f"Unknown ActionDiT LoRA target {value!r}; expected: {allowed}"
+            ) from error
 
 
 DEFAULT_ACTION_DIT_LORA_TARGETS = (
@@ -130,7 +133,9 @@ class RegimeLoRAConfig:
     strict_target_discovery: bool = True
 
     def __post_init__(self) -> None:
-        groups = tuple(ActionLoRATargetGroup.parse(group) for group in self.target_groups)
+        groups = tuple(
+            ActionLoRATargetGroup.parse(group) for group in self.target_groups
+        )
         if self.rank <= 0:
             raise ValueError(f"`rank` must be positive, got {self.rank}")
         if self.alpha <= 0:
@@ -140,7 +145,9 @@ class RegimeLoRAConfig:
         if not groups:
             raise ValueError("At least one ActionDiT LoRA target group is required.")
         if len(set(groups)) != len(groups):
-            raise ValueError(f"Duplicate ActionDiT LoRA target groups are not allowed: {groups}")
+            raise ValueError(
+                f"Duplicate ActionDiT LoRA target groups are not allowed: {groups}"
+            )
         object.__setattr__(self, "rank", int(self.rank))
         object.__setattr__(self, "alpha", float(self.alpha))
         object.__setattr__(self, "dropout", float(self.dropout))
@@ -240,17 +247,21 @@ def _expected_target_names(
 ) -> set[str]:
     blocks = getattr(action_dit, "blocks", None)
     if not isinstance(blocks, nn.ModuleList):
-        raise TypeError("ActionDiT LoRA expects `action_dit.blocks` to be an nn.ModuleList.")
+        raise TypeError(
+            "ActionDiT LoRA expects `action_dit.blocks` to be an nn.ModuleList."
+        )
 
     expected: set[str] = set()
     for index in range(len(blocks)):
         if ActionLoRATargetGroup.SELF_ATTENTION_QKVO in groups:
             expected.update(
-                f"blocks.{index}.self_attn.{projection}" for projection in ("q", "k", "v", "o")
+                f"blocks.{index}.self_attn.{projection}"
+                for projection in ("q", "k", "v", "o")
             )
         if ActionLoRATargetGroup.CROSS_ATTENTION_QKVO in groups:
             expected.update(
-                f"blocks.{index}.cross_attn.{projection}" for projection in ("q", "k", "v", "o")
+                f"blocks.{index}.cross_attn.{projection}"
+                for projection in ("q", "k", "v", "o")
             )
         if ActionLoRATargetGroup.FFN in groups:
             expected.update((f"blocks.{index}.ffn.0", f"blocks.{index}.ffn.2"))
@@ -259,7 +270,9 @@ def _expected_target_names(
 
 def discover_action_dit_lora_targets(
     action_dit: nn.Module,
-    target_groups: Sequence[ActionLoRATargetGroup | str] = DEFAULT_ACTION_DIT_LORA_TARGETS,
+    target_groups: Sequence[
+        ActionLoRATargetGroup | str
+    ] = DEFAULT_ACTION_DIT_LORA_TARGETS,
     *,
     strict: bool = True,
 ) -> tuple[str, ...]:
@@ -305,7 +318,11 @@ class BaseFreezeAudit:
     def valid(self) -> bool:
         """Whether only adapter parameters are trainable."""
 
-        return not self.trainable_base and not self.frozen_lora and bool(self.trainable_lora)
+        return (
+            not self.trainable_base
+            and not self.frozen_lora
+            and bool(self.trainable_lora)
+        )
 
     def assert_valid(self) -> None:
         """Raise with the precise parameter names when the freeze contract fails."""
@@ -342,14 +359,33 @@ class ActionDiTLoRAAdapter:
 
         return self.regime_context.use(regime)
 
+    @staticmethod
+    def _unwrap_adapted_linear(module: nn.Module) -> RegimeLoRALinear:
+        """Find an adapted projection through transparent module wrappers."""
+
+        original_type = type(module).__name__
+        visited: set[int] = set()
+        while id(module) not in visited:
+            if isinstance(module, RegimeLoRALinear):
+                return module
+            visited.add(id(module))
+            wrapped = getattr(module, "_fsdp_wrapped_module", None)
+            if wrapped is None:
+                wrapped = getattr(module, "module", None)
+            if not isinstance(wrapped, nn.Module):
+                break
+            module = wrapped
+        raise RuntimeError(
+            "Expected an adapted linear through optional wrappers, found "
+            f"{original_type}."
+        )
+
     def iter_adapted_linears(self) -> Iterator[tuple[str, RegimeLoRALinear]]:
         """Yield every injected linear layer in deterministic name order."""
 
         for name in self.target_names:
             module = self.action_dit.get_submodule(name)
-            if not isinstance(module, RegimeLoRALinear):
-                raise RuntimeError(f"Expected adapted linear at {name}, found {type(module).__name__}.")
-            yield name, module
+            yield name, self._unwrap_adapted_linear(module)
 
     def named_lora_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
         """Yield adapter-only parameters, suitable for an optimizer group."""
@@ -458,7 +494,9 @@ class ActionDiTLoRAAdapter:
             for name in sorted(expected & provided):
                 value = state_dict[name]
                 if not isinstance(value, torch.Tensor):
-                    raise TypeError(f"LoRA state {name!r} must be a tensor, got {type(value)}")
+                    raise TypeError(
+                        f"LoRA state {name!r} must be a tensor, got {type(value)}"
+                    )
                 target = parameters[name]
                 if value.shape != target.shape:
                     raise ValueError(
@@ -532,7 +570,9 @@ class ActionDiTLoRAAdapter:
         metadata = payload.get("metadata")
         state_dict = payload.get("state_dict")
         if not isinstance(metadata, dict) or not isinstance(state_dict, dict):
-            raise ValueError("LoRA sidecar requires dict `metadata` and `state_dict` fields.")
+            raise ValueError(
+                "LoRA sidecar requires dict `metadata` and `state_dict` fields."
+            )
         if metadata.get("schema") != REGIME_LORA_SIDECAR_SCHEMA:
             raise ValueError(
                 f"Unsupported LoRA sidecar schema {metadata.get('schema')!r}; "
@@ -581,13 +621,18 @@ def inject_action_dit_lora(
     )
     if not target_names:
         raise ValueError("No ActionDiT LoRA targets were discovered.")
-    if any(isinstance(action_dit.get_submodule(name), RegimeLoRALinear) for name in target_names):
+    if any(
+        isinstance(action_dit.get_submodule(name), RegimeLoRALinear)
+        for name in target_names
+    ):
         raise ValueError("ActionDiT already contains regime-gated LoRA layers.")
 
     for name in target_names:
         base = action_dit.get_submodule(name)
         if not isinstance(base, nn.Linear):
-            raise TypeError(f"ActionDiT target {name} must be nn.Linear, got {type(base)}")
+            raise TypeError(
+                f"ActionDiT target {name} must be nn.Linear, got {type(base)}"
+            )
         adapted = RegimeLoRALinear(
             base,
             regime_context=context,

@@ -2,8 +2,6 @@ import copy
 
 import pytest
 import torch
-import torch.nn as nn
-
 from fastwam.adapters import (
     ActionLoRATargetGroup,
     PolicyRegime,
@@ -14,6 +12,7 @@ from fastwam.adapters import (
     inject_action_dit_lora,
     sha256_file,
 )
+from torch import nn
 
 
 class TinyAttention(nn.Module):
@@ -38,7 +37,9 @@ class TinyBlock(nn.Module):
 
 
 class TinyActionDiT(nn.Module):
-    def __init__(self, *, num_layers: int = 2, hidden_dim: int = 8, ffn_dim: int = 12) -> None:
+    def __init__(
+        self, *, num_layers: int = 2, hidden_dim: int = 8, ffn_dim: int = 12
+    ) -> None:
         super().__init__()
         self.action_encoder = nn.Linear(hidden_dim, hidden_dim)
         self.blocks = nn.ModuleList(
@@ -49,7 +50,9 @@ class TinyActionDiT(nn.Module):
     def forward(self, action: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         x = self.action_encoder(action)
         for block in self.blocks:
-            self_mix = block.self_attn.q(x) + block.self_attn.k(x) + block.self_attn.v(x)
+            self_mix = (
+                block.self_attn.q(x) + block.self_attn.k(x) + block.self_attn.v(x)
+            )
             x = x + block.self_attn.o(torch.tanh(self_mix))
             cross_mix = (
                 block.cross_attn.q(x)
@@ -59,6 +62,17 @@ class TinyActionDiT(nn.Module):
             x = x + block.cross_attn.o(torch.tanh(cross_mix))
             x = x + block.ffn(x)
         return self.head(x)
+
+
+class FSDPStyleWrapper(nn.Module):
+    """Minimal forwarding wrapper with classic FSDP's child attribute."""
+
+    def __init__(self, module: nn.Module) -> None:
+        super().__init__()
+        self._fsdp_wrapped_module = module
+
+    def forward(self, *args, **kwargs):
+        return self._fsdp_wrapped_module(*args, **kwargs)
 
 
 def test_regime_context_is_nested_instance_scoped_and_exception_safe() -> None:
@@ -185,6 +199,26 @@ def test_zero_delta_is_exact_and_idm_never_uses_nonzero_adapter() -> None:
     assert len(copied_contexts) == 1
 
 
+def test_adapter_state_is_stable_through_fsdp_style_projection_wrapper() -> None:
+    model = TinyActionDiT(num_layers=1)
+    adapter = inject_action_dit_lora(
+        model,
+        RegimeLoRAConfig(rank=2, alpha=2.0),
+    )
+    target = adapter.target_names[0]
+    parent_path, _, child_name = target.rpartition(".")
+    parent = model.get_submodule(parent_path)
+    adapted = model.get_submodule(target)
+    setattr(parent, child_name, FSDPStyleWrapper(adapted))
+
+    resolved = dict(adapter.iter_adapted_linears())
+    state = adapter.lora_state_dict()
+
+    assert resolved[target] is adapted
+    assert set(state) == {name for name, _ in adapter.named_lora_parameters()}
+    assert all(name.endswith((".lora_A", ".lora_B")) for name in state)
+
+
 def test_uncond_backward_updates_only_lora_and_idm_does_not_touch_it() -> None:
     torch.manual_seed(11)
     model = TinyActionDiT()
@@ -253,9 +287,7 @@ def test_sidecar_round_trip_contains_only_lora_and_checks_parent_hash(tmp_path) 
     assert payload["metadata"]["active_regime"] == PolicyRegime.UNCOND.value
     assert payload["metadata"]["extra"] == {"training_step": 17}
     assert payload["state_dict"]
-    assert all(
-        name.endswith((".lora_A", ".lora_B")) for name in payload["state_dict"]
-    )
+    assert all(name.endswith((".lora_A", ".lora_B")) for name in payload["state_dict"])
     assert not any(
         name.endswith((".weight", ".bias")) for name in payload["state_dict"]
     )
