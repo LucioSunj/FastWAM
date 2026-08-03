@@ -16,8 +16,8 @@ from fastwam.models.wan22.gate_transformer import (
 from fastwam.models.wan22.kv_tap import (
     GateKVSnapshot,
     GateLayerKV,
-    KVSource,
     KeyValueBank,
+    KVSource,
 )
 
 
@@ -98,6 +98,44 @@ def _config(
 )
 def test_layer_selector_modes(config: LayerTapConfig, expected: tuple[int, ...]) -> None:
     assert config.resolve(4) == expected
+
+
+def test_all_layer_independent_gate_state_round_trips_without_block_replication() -> None:
+    config = GateTransformerConfig(
+        num_mot_layers=30,
+        source_num_heads=2,
+        source_head_dim=2,
+        hidden_dim=8,
+        num_query_tokens=2,
+        ffn_multiplier=2,
+        denoise_last_n=1,
+        share_blocks=False,
+        layer_taps=LayerTapConfig(mode="all"),
+    )
+    source = GateTransformer(config)
+    with torch.no_grad():
+        for block_index, block in enumerate(source.blocks):
+            for parameter in block.parameters():
+                parameter.fill_(float(block_index + 1))
+
+    state = source.state_dict()
+    block_indices = {
+        int(key.split(".")[1])
+        for key in state
+        if key.startswith("blocks.")
+    }
+    assert block_indices == set(range(30))
+
+    restored = GateTransformer(config)
+    restored.load_state_dict(state, strict=True)
+    restored_state = restored.state_dict()
+    assert state.keys() == restored_state.keys()
+    assert all(torch.equal(state[key], restored_state[key]) for key in state)
+    first_parameters = [next(block.parameters()).detach() for block in restored.blocks]
+    assert all(
+        torch.all(parameter == float(block_index + 1))
+        for block_index, parameter in enumerate(first_parameters)
+    )
 
 
 @pytest.mark.parametrize(
