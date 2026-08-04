@@ -1,11 +1,11 @@
-import json
 import inspect
+import json
 import logging
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import hydra
 import numpy as np
@@ -25,6 +25,9 @@ project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from action_ensembler import ActionEnsembler
+from libero.libero import benchmark
+
 from experiments.libero.libero_utils import (
     LIBERO_ENV_RESOLUTION,
     get_libero_dummy_action,
@@ -36,17 +39,16 @@ from experiments.libero.libero_utils import (
     save_rollout_video,
 )
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
+from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
-from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
-from libero.libero import benchmark
-from action_ensembler import ActionEnsembler
 
 OmegaConf.register_new_resolver("eval", eval)
 OmegaConf.register_new_resolver("max", lambda x: max(x))
 OmegaConf.register_new_resolver("split", lambda s, idx: s.split("/")[int(idx)])
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+LOGGER = logging.getLogger(__name__)
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -116,17 +118,17 @@ def _resolve_dataset_stats_path(cfg: DictConfig) -> Path:
 
 def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     model.load_checkpoint(ckpt)
-    logging.info("Loaded checkpoint via model.load_checkpoint: %s", ckpt)
+    LOGGER.info("Loaded checkpoint via model.load_checkpoint: %s", ckpt)
     return
 
     # deprecated legacy checkpoint loading
     payload = torch.load(ckpt, map_location="cpu")
     if not isinstance(payload, dict):
-        raise ValueError(f"Legacy checkpoint payload must be dict, got: {type(payload)}")
+        raise TypeError(f"Legacy checkpoint payload must be dict, got: {type(payload)}")
 
     if "mot" in payload and hasattr(model, "mot"):
         missing, unexpected = model.mot.load_state_dict(payload["mot"], strict=False)
-        logging.warning(
+        LOGGER.warning(
             "Loaded fallback `mot` state_dict with strict=False. Missing=%d Unexpected=%d",
             len(missing),
             len(unexpected),
@@ -145,7 +147,7 @@ def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
         raise ValueError(f"Cannot parse legacy checkpoint keys from: {ckpt}")
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    logging.warning(
+    LOGGER.warning(
         "Loaded fallback model state_dict with strict=False. Missing=%d Unexpected=%d",
         len(missing),
         len(unexpected),
@@ -156,7 +158,9 @@ def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarra
     pil_image = Image.fromarray(image)
     src_w, src_h = pil_image.size
     scale = max(width / src_w, height / src_h)
-    resized = pil_image.resize((round(src_w * scale), round(src_h * scale)), resample=Image.BILINEAR)
+    resized = pil_image.resize(
+        (round(src_w * scale), round(src_h * scale)), resample=Image.BILINEAR
+    )
     rw, rh = resized.size
     left = max((rw - width) // 2, 0)
     top = max((rh - height) // 2, 0)
@@ -175,7 +179,9 @@ def _normalize_proprio(
         )
     state_key = state_meta[0]["key"]
 
-    state_batch = {"state": {state_key: torch.as_tensor(proprio, dtype=torch.float32).unsqueeze(0)}}
+    state_batch = {
+        "state": {state_key: torch.as_tensor(proprio, dtype=torch.float32).unsqueeze(0)}
+    }
     state_batch = processor.action_state_transform(state_batch)
     state_batch = processor.normalizer.forward(state_batch)
     return state_batch["state"][state_key]
@@ -201,7 +207,9 @@ def _obs_to_model_input(
     def _meta_to_hw(meta: dict, camera_idx: int) -> tuple[int, int]:
         shape = meta["shape"]
         if len(shape) != 3:
-            raise ValueError(f"shape_meta.images[{camera_idx}].shape must be [C,H,W], got {shape}")
+            raise ValueError(
+                f"shape_meta.images[{camera_idx}].shape must be [C,H,W], got {shape}"
+            )
         return int(shape[1]), int(shape[2])
 
     concatenation = cfg.data.train.get("concat_multi_camera", "horizontal")
@@ -221,7 +229,9 @@ def _obs_to_model_input(
         else:
             raise ValueError(f"Invalid concat_multi_camera: {concatenation}")
     else:
-        raise ValueError(f"LIBERO eval currently supports num_output_cameras in [1, 2], got {num_cameras}.")
+        raise ValueError(
+            f"LIBERO eval currently supports num_output_cameras in [1, 2], got {num_cameras}."
+        )
 
     actual_h, actual_w = int(rgb.shape[0]), int(rgb.shape[1])
     expected_h, expected_w = int(height), int(width)
@@ -256,7 +266,9 @@ def _extract_sim_state(obs: dict) -> np.ndarray:
     return state
 
 
-def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np.ndarray:
+def _denormalize_action(
+    action: torch.Tensor, processor: FastWAMProcessor
+) -> np.ndarray:
     if action.ndim == 2:
         action = action.unsqueeze(0)
     if action.ndim != 3:
@@ -276,7 +288,9 @@ def _denormalize_action(action: torch.Tensor, processor: FastWAMProcessor) -> np
 
 
 def _get_num_video_frames(cfg: DictConfig) -> int:
-    return (int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1
+    return (int(cfg.data.train.num_frames) - 1) // int(
+        cfg.data.train.action_video_freq_ratio
+    ) + 1
 
 
 def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
@@ -291,7 +305,9 @@ def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
         )
 
 
-def _select_predicted_future_frames(pred_video: list[Image.Image], cfg: DictConfig) -> list[Image.Image]:
+def _select_predicted_future_frames(
+    pred_video: list[Image.Image], cfg: DictConfig
+) -> list[Image.Image]:
     if len(pred_video) == 0:
         raise ValueError("`infer_joint` returned an empty predicted video.")
 
@@ -306,14 +322,20 @@ def _get_future_frame_capture_steps(cfg: DictConfig) -> list[int]:
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     action_video_freq_ratio = int(cfg.data.train.action_video_freq_ratio)
     num_future_frames = replan_steps // action_video_freq_ratio
-    return [step_idx * action_video_freq_ratio for step_idx in range(num_future_frames + 1)]
+    return [
+        step_idx * action_video_freq_ratio for step_idx in range(num_future_frames + 1)
+    ]
 
 
 def _frame_to_rgb_array(frame: Any) -> np.ndarray:
     if isinstance(frame, dict):
         images = []
         for value in frame.values():
-            value_array = np.array(value) if isinstance(value, Image.Image) else np.array(value, copy=True)
+            value_array = (
+                np.array(value)
+                if isinstance(value, Image.Image)
+                else np.array(value, copy=True)
+            )
             images.append(value_array)
         return np.concatenate(images, axis=1)
     if isinstance(frame, Image.Image):
@@ -325,7 +347,7 @@ def _compute_clip_mean_psnr(
     gt_frames: list[Any],
     pred_frames: list[Any],
     eps: float = 1e-8,
-) -> Optional[float]:
+) -> float | None:
     if len(gt_frames) == 0 or len(pred_frames) == 0:
         return None
     assert len(gt_frames) == len(pred_frames), (
@@ -342,7 +364,9 @@ def _compute_clip_mean_psnr(
         target_h, target_w = pred_image.shape[:2]
         if gt_image.shape[:2] != (target_h, target_w):
             gt_image = np.array(
-                Image.fromarray(gt_image).resize((target_w, target_h), resample=Image.BILINEAR)
+                Image.fromarray(gt_image).resize(
+                    (target_w, target_h), resample=Image.BILINEAR
+                )
             )
 
         gt_f32 = gt_image.astype(np.float32)
@@ -385,26 +409,29 @@ def _warmup_model(
         num_inference_steps = int(cfg.get("eval_num_inference_steps", 20))
     else:
         num_inference_steps = int(num_inference_steps_cfg)
+    infer_kwargs = {
+        "prompt": None,
+        "input_image": dummy_image,
+        "action_horizon": action_horizon,
+        "proprio": dummy_proprio,
+        "context": dummy_context,
+        "context_mask": dummy_context_mask,
+        "num_inference_steps": num_inference_steps,
+        "sigma_shift": (
+            None
+            if cfg.EVALUATION.get("sigma_shift") is None
+            else float(cfg.EVALUATION.get("sigma_shift"))
+        ),
+        "seed": 0,
+        "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
+        "tiled": bool(cfg.EVALUATION.get("tiled", False)),
+    }
+    if "num_video_frames" in inspect.signature(model.infer_action).parameters:
+        infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
     with torch.no_grad():
-        model.infer_action(
-            prompt=None,
-            input_image=dummy_image,
-            action_horizon=action_horizon,
-            proprio=dummy_proprio,
-            context=dummy_context,
-            context_mask=dummy_context_mask,
-            num_inference_steps=num_inference_steps,
-            sigma_shift=(
-                None
-                if cfg.EVALUATION.get("sigma_shift") is None
-                else float(cfg.EVALUATION.get("sigma_shift"))
-            ),
-            seed=0,
-            rand_device=str(cfg.EVALUATION.get("rand_device", "cpu")),
-            tiled=bool(cfg.EVALUATION.get("tiled", False)),
-        )
+        model.infer_action(**infer_kwargs)
     warmup_elapsed = time.perf_counter() - warmup_t0
-    logging.info("torch.compile warmup done in %.2f s", warmup_elapsed)
+    LOGGER.info("torch.compile warmup done in %.2f s", warmup_elapsed)
 
 
 def _predict_action_chunk(
@@ -418,9 +445,9 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
-    cached_context: Optional[torch.Tensor] = None,
-    cached_context_mask: Optional[torch.Tensor] = None,
-) -> tuple[np.ndarray, dict, Optional[list[Image.Image]], float]:
+    cached_context: torch.Tensor | None = None,
+    cached_context_mask: torch.Tensor | None = None,
+) -> tuple[np.ndarray, dict, list[Image.Image] | None, float]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
         num_inference_steps = int(cfg.get("eval_num_inference_steps", 20))
@@ -464,16 +491,19 @@ def _predict_action_chunk(
         infer_kwargs["prompt"] = prompt
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
-    if visualize_future_video:
-        infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
-    elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
+    if (
+        visualize_future_video
+        or "num_video_frames" in inspect.signature(model.infer_action).parameters
+    ):
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
 
     with torch.no_grad():
         infer_t0 = time.perf_counter()
         if visualize_future_video:
             pred = model.infer_joint(**infer_kwargs)
-            predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
+            predicted_future_frames = _select_predicted_future_frames(
+                pred["video"], cfg
+            )
         else:
             pred = model.infer_action(**infer_kwargs)
         infer_elapsed = time.perf_counter() - infer_t0
@@ -516,9 +546,9 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
-    cached_context: Optional[torch.Tensor] = None,
-    cached_context_mask: Optional[torch.Tensor] = None,
-) -> tuple[bool, list, list[dict[str, Any]], Optional[float], float]:
+    cached_context: torch.Tensor | None = None,
+    cached_context_mask: torch.Tensor | None = None,
+) -> tuple[bool, list, list[dict[str, Any]], float | None, float]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
@@ -536,7 +566,7 @@ def run_single_episode(
     predicted_future_video_clips: list[dict[str, Any]] = []
     episode_future_clip_psnr: list[float] = []
     pending_actions: list[list[float]] = []
-    current_predicted_future_clip: Optional[dict[str, Any]] = None
+    current_predicted_future_clip: dict[str, Any] | None = None
     current_replan_step = 0
     current_replan_idx = -1
     episode_infer_time = 0.0
@@ -552,18 +582,20 @@ def run_single_episode(
             continue
 
         if len(pending_actions) == 0:
-            action_chunk, imgs, predicted_future_frames, infer_elapsed = _predict_action_chunk(
-                obs=obs,
-                task_description=task_description,
-                model=model,
-                processor=processor,
-                cfg=cfg,
-                action_horizon=action_horizon,
-                input_w=input_w,
-                input_h=input_h,
-                model_device=model_device,
-                cached_context=cached_context,
-                cached_context_mask=cached_context_mask,
+            action_chunk, imgs, predicted_future_frames, infer_elapsed = (
+                _predict_action_chunk(
+                    obs=obs,
+                    task_description=task_description,
+                    model=model,
+                    processor=processor,
+                    cfg=cfg,
+                    action_horizon=action_horizon,
+                    input_w=input_w,
+                    input_h=input_h,
+                    model_device=model_device,
+                    cached_context=cached_context,
+                    cached_context_mask=cached_context_mask,
+                )
             )
             episode_infer_time += infer_elapsed
             if predicted_future_frames is not None:
@@ -578,7 +610,10 @@ def run_single_episode(
             current_replan_step = 0
             if use_action_ensembler:
                 ensembler.add_actions(action_chunk, t)
-                pending_actions = [ensembler.get_action(ts).tolist() for ts in range(t, t + replan_steps)]
+                pending_actions = [
+                    ensembler.get_action(ts).tolist()
+                    for ts in range(t, t + replan_steps)
+                ]
             else:
                 pending_actions = action_chunk[:replan_steps].tolist()
             replay_images.append(imgs.copy())
@@ -593,7 +628,9 @@ def run_single_episode(
                 current_predicted_future_clip["gt_frames"].append(get_libero_image(obs))
             if done or len(pending_actions) == 0:
                 expected_frame_count = 1 + sum(
-                    1 for capture_step in capture_steps if capture_step <= current_replan_step
+                    1
+                    for capture_step in capture_steps
+                    if capture_step <= current_replan_step
                 )
                 gt_len = len(current_predicted_future_clip["gt_frames"])
                 pred_len = len(current_predicted_future_clip["pred_frames"])
@@ -609,7 +646,7 @@ def run_single_episode(
                     f"episode={episode_idx} replan={current_predicted_future_clip['replan_idx']}."
                 )
                 if pred_len != expected_frame_count:
-                    logging.info(
+                    LOGGER.info(
                         "Align predicted clip length to executed steps: "
                         "episode=%s replan=%s done=%s expected=%s pred_full=%s",
                         episode_idx,
@@ -618,9 +655,9 @@ def run_single_episode(
                         expected_frame_count,
                         pred_len,
                     )
-                current_predicted_future_clip["pred_frames"] = current_predicted_future_clip["pred_frames"][
-                    :expected_frame_count
-                ]
+                current_predicted_future_clip["pred_frames"] = (
+                    current_predicted_future_clip["pred_frames"][:expected_frame_count]
+                )
                 assert len(current_predicted_future_clip["gt_frames"]) == len(
                     current_predicted_future_clip["pred_frames"]
                 ), (
@@ -643,9 +680,17 @@ def run_single_episode(
     pbar.close()
 
     episode_mean_psnr = (
-        float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
+        float(np.mean(episode_future_clip_psnr))
+        if len(episode_future_clip_psnr) > 0
+        else None
     )
-    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, episode_infer_time
+    return (
+        bool(done),
+        replay_images,
+        predicted_future_video_clips,
+        episode_mean_psnr,
+        episode_infer_time,
+    )
 
 
 def run_single_task(
@@ -670,7 +715,7 @@ def run_single_task(
     prompt = prompt_template.format(task=task_description)
     with torch.no_grad():
         cached_context, cached_context_mask = model.encode_prompt(prompt)
-    logging.info("Cached prompt encoding for task: %s", task_description)
+    LOGGER.info("Cached prompt encoding for task: %s", task_description)
 
     results = {
         "successes": 0,
@@ -684,7 +729,13 @@ def run_single_task(
         results["future_video_psnr_mean"] = None
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr, episode_infer_time = run_single_episode(
+        (
+            success,
+            replay_images,
+            predicted_future_video_clips,
+            episode_mean_psnr,
+            episode_infer_time,
+        ) = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
             task_description=task_description,
@@ -717,7 +768,7 @@ def run_single_task(
         )
         if visualize_future_video:
             if len(predicted_future_video_clips) == 0:
-                logging.warning(
+                LOGGER.warning(
                     "No predicted future frames collected for task %s trial %s.",
                     cfg.EVALUATION.task_id,
                     trial_idx,
@@ -748,7 +799,9 @@ def run_single_task(
                 )
 
     if visualize_future_video:
-        valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
+        valid_episode_psnr = [
+            x for x in results["episode_future_video_psnr"] if x is not None
+        ]
         if len(valid_episode_psnr) > 0:
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
 
@@ -757,7 +810,7 @@ def run_single_task(
     if infer_times:
         results["total_infer_time"] = float(sum(infer_times))
         results["mean_episode_infer_time"] = float(np.mean(infer_times))
-        logging.info(
+        LOGGER.info(
             "Inference timing: total=%.2fs, mean_per_episode=%.2fs",
             results["total_infer_time"],
             results["mean_episode_infer_time"],
@@ -765,7 +818,9 @@ def run_single_task(
     return results
 
 
-@hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml")
+@hydra.main(
+    version_base="1.3", config_path="../../configs", config_name="sim_libero.yaml"
+)
 def eval_single_process(cfg: DictConfig):
     start_time = time.time()
     partial_state = PartialState()
@@ -795,7 +850,7 @@ def eval_single_process(cfg: DictConfig):
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
     processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
     processor.set_normalizer_from_stats(dataset_stats)
-    logging.info("Using dataset stats: %s", dataset_stats_path)
+    LOGGER.info("Using dataset stats: %s", dataset_stats_path)
 
     action_horizon_cfg = cfg.EVALUATION.get("action_horizon", None)
     if action_horizon_cfg is None:
@@ -803,7 +858,9 @@ def eval_single_process(cfg: DictConfig):
     else:
         action_horizon = int(action_horizon_cfg)
     if action_horizon <= 0:
-        raise ValueError(f"EVALUATION.action_horizon must be positive, got {action_horizon}")
+        raise ValueError(
+            f"EVALUATION.action_horizon must be positive, got {action_horizon}"
+        )
 
     video_size = cfg.data.train.get("video_size", [224, 224])
     if len(video_size) != 2:
@@ -813,14 +870,14 @@ def eval_single_process(cfg: DictConfig):
 
     # Warmup: trigger torch.compile before real evaluation
     _warmup_model(model, action_horizon, input_h, input_w, cfg)
-    concat_multi_camera = cfg.data.train.get("concat_multi_camera", None)
-    shape_meta_images = [meta["shape"] for meta in processor.shape_meta["images"]]
 
     local_log_dir = Path(cfg.EVALUATION.output_dir)
     local_log_dir.mkdir(parents=True, exist_ok=True)
     video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "videos"
     video_dir.mkdir(parents=True, exist_ok=True)
-    predicted_video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "predicted_videos"
+    predicted_video_dir = (
+        local_log_dir / cfg.EVALUATION.task_suite_name / "predicted_videos"
+    )
     if bool(cfg.EVALUATION.get("visualize_future_video", False)):
         predicted_video_dir.mkdir(parents=True, exist_ok=True)
 
@@ -830,7 +887,9 @@ def eval_single_process(cfg: DictConfig):
     initial_states = task_suite.get_task_init_states(cfg.EVALUATION.task_id)
 
     while len(initial_states) < int(cfg.EVALUATION.num_trials):
-        initial_states.extend(initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))])
+        initial_states.extend(
+            initial_states[: (int(cfg.EVALUATION.num_trials) - len(initial_states))]
+        )
 
     results = {
         "task_suite": cfg.EVALUATION.task_suite_name,
@@ -845,7 +904,7 @@ def eval_single_process(cfg: DictConfig):
         "duration": 0,
     }
 
-    logging.info("Running LIBERO evaluation with env_num=1")
+    LOGGER.info("Running LIBERO evaluation with env_num=1")
     task_results = run_single_task(
         task=task,
         initial_states=initial_states,
@@ -864,7 +923,9 @@ def eval_single_process(cfg: DictConfig):
     results["duration"] = time.time() - start_time
     output_dir = Path(cfg.EVALUATION.output_dir) / cfg.EVALUATION.task_suite_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / f"gpu{cfg.gpu_id}_task{cfg.EVALUATION.task_id}_results.json"
+    output_file = (
+        output_dir / f"gpu{cfg.gpu_id}_task{cfg.EVALUATION.task_id}_results.json"
+    )
 
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=4, cls=NumpyEncoder)
@@ -874,10 +935,14 @@ def eval_single_process(cfg: DictConfig):
         f"{results['successes']}/{cfg.EVALUATION.num_trials} successes"
     )
     if results.get("future_video_psnr_mean") is not None:
-        print(f"Task {cfg.EVALUATION.task_id} future-video PSNR mean: {results['future_video_psnr_mean']:.4f}")
+        print(
+            f"Task {cfg.EVALUATION.task_id} future-video PSNR mean: {results['future_video_psnr_mean']:.4f}"
+        )
     print(f"Time taken: {results['duration']:.2f} seconds")
     if results.get("mean_episode_infer_time") is not None:
-        print(f"Mean inference time per episode: {results['mean_episode_infer_time']:.3f} s")
+        print(
+            f"Mean inference time per episode: {results['mean_episode_infer_time']:.3f} s"
+        )
         print(f"Total inference time: {results['total_infer_time']:.2f} s")
     return results
 
