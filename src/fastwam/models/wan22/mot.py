@@ -1,43 +1,54 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+from typing import Any
 
 import torch
-import torch.cuda.nvtx as nvtx
-import torch.nn as nn
+import torch.utils.checkpoint
+from torch import nn
+from torch.cuda import nvtx
 
-from .wan_video_dit import flash_attention, modulate, rope_apply
+from fastwam.utils.logging_config import get_logger
+
 from .kv_tap import (
     GateKVTapRequest,
     GateLayerKV,
-    KVSource,
     KeyValueBank,
+    KVSource,
     context_token_mask,
 )
-from fastwam.utils.logging_config import get_logger
+from .wan_video_dit import flash_attention, modulate, rope_apply
 
 logger = get_logger(__name__)
 
 _GATE_CURRENT_FRAME_PROVENANCE_KEY = "_gate_current_frame_video_tokens"
+CheckpointContextFn = Callable[
+    [], tuple[AbstractContextManager[Any], AbstractContextManager[Any]]
+]
 
 
 class MoT(nn.Module):
     def __init__(
         self,
-        mixtures: Dict[str, nn.Module],
+        mixtures: dict[str, nn.Module],
         mot_checkpoint_mixed_attn: bool = True,
     ):
         super().__init__()
         if not mixtures:
             raise ValueError("`mixtures` cannot be empty.")
         if "video" not in mixtures or "action" not in mixtures:
-            raise ValueError("`mixtures` must include both 'video' and 'action' experts.")
+            raise ValueError(
+                "`mixtures` must include both 'video' and 'action' experts."
+            )
 
         self.mixtures = nn.ModuleDict(mixtures)
         self.expert_order = list(self.mixtures.keys())
         self.mot_checkpoint_mixed_attn = mot_checkpoint_mixed_attn
         if mot_checkpoint_mixed_attn:
-            logger.info("Using gradient checkpointing for mixture attention. This will save memory but use more computation.")
+            logger.info(
+                "Using gradient checkpointing for mixture attention. This will save memory but use more computation."
+            )
 
         first_expert = self.mixtures[self.expert_order[0]]
         self.num_layers = len(first_expert.blocks)
@@ -59,11 +70,15 @@ class MoT(nn.Module):
                     "All experts must have same attn_head_dim; "
                     f"got {self.attn_head_dim} and {expert.attn_head_dim}"
                 )
-        
-        logger.info(f"Initialized MoT with experts: {self.expert_order}, num_layers={self.num_layers}")
+
+        logger.info(
+            f"Initialized MoT with experts: {self.expert_order}, num_layers={self.num_layers}"
+        )
         for name in self.expert_order:
             expert = self.mixtures[name]
-            logger.info(f"  Expert '{name}': num_params={sum(p.numel() for p in expert.parameters()) / 1e9:.2f} B")
+            logger.info(
+                f"  Expert '{name}': num_params={sum(p.numel() for p in expert.parameters()) / 1e9:.2f} B"
+            )
 
     @staticmethod
     def _split_modulation(block, t_mod: torch.Tensor):
@@ -71,7 +86,9 @@ class MoT(nn.Module):
         chunk_dim = 2 if has_seq else 1
 
         base_mod = block.modulation.to(dtype=t_mod.dtype, device=t_mod.device)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (base_mod + t_mod).chunk(6, dim=chunk_dim)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            base_mod + t_mod
+        ).chunk(6, dim=chunk_dim)
         if has_seq:
             # means t_mod has separate modulation for each token, otherwise same modulation for all tokens in the block
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -94,7 +111,9 @@ class MoT(nn.Module):
         attn_mask = attention_mask.to(device=q_cat.device)
 
         def _forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            return flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=attn_mask)
+            return flash_attention(
+                q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=attn_mask
+            )
 
         if self.mot_checkpoint_mixed_attn and self.training:
             return torch.utils.checkpoint.checkpoint(
@@ -153,8 +172,7 @@ class MoT(nn.Module):
         video_kv_cache: list[dict[str, Any]],
     ) -> None:
         if not any(
-            layer_index > 0
-            for layer_index in kv_tap.selected_layers(self.num_layers)
+            layer_index > 0 for layer_index in kv_tap.selected_layers(self.num_layers)
         ):
             return
         expected = kv_tap.current_frame_video_tokens
@@ -177,7 +195,7 @@ class MoT(nn.Module):
         shift_mlp: torch.Tensor,
         scale_mlp: torch.Tensor,
         gate_mlp: torch.Tensor,
-        context_payload: Optional[dict],
+        context_payload: dict | None,
     ) -> torch.Tensor:
         x = block.gate(residual_x, gate_msa, block.self_attn.o(mixed_attn_out))
 
@@ -232,7 +250,9 @@ class MoT(nn.Module):
             gate_mlp: Gating tensor for MLP residual branch.
             use_gradient_checkpointing: Whether this expert enables checkpointing.
         """
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._split_modulation(block, t_mod)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self._split_modulation(block, t_mod)
+        )
         attn_input = modulate(block.norm1(x), shift_msa, scale_msa)
 
         q = block.self_attn.norm_q(block.self_attn.q(attn_input))
@@ -242,7 +262,9 @@ class MoT(nn.Module):
         q = rope_apply(q, freqs, block.num_heads)
         k = rope_apply(k, freqs, block.num_heads)
 
-        use_gradient_checkpointing = bool(getattr(expert, "use_gradient_checkpointing", False))
+        use_gradient_checkpointing = bool(
+            getattr(expert, "use_gradient_checkpointing", False)
+        )
         return (
             q,
             k,
@@ -265,7 +287,8 @@ class MoT(nn.Module):
         gate_mlp: torch.Tensor,
         use_gradient_checkpointing: bool,
         mixed_slice: torch.Tensor,
-        context_payload: Optional[dict],
+        context_payload: dict | None,
+        checkpoint_context_fn: CheckpointContextFn | None = None,
     ) -> torch.Tensor:
         """Apply post-attention computations, with optional checkpointing.
 
@@ -281,10 +304,13 @@ class MoT(nn.Module):
             context_payload: Optional dict for cross-attention.
                 - `context`: encoder states [B, L, D]
                 - `mask`: attention mask [B, S, L] or [B, 1, S, L]
+            checkpoint_context_fn: Optional contexts for the original forward and
+                backward recomputation.
 
         Returns:
             Updated expert tokens after self-attn residual, optional cross-attn, and MLP.
         """
+
         def _post_fn(
             _mixed_slice: torch.Tensor,
             _x: torch.Tensor,
@@ -307,6 +333,9 @@ class MoT(nn.Module):
             )
 
         if use_gradient_checkpointing and self.training:
+            checkpoint_kwargs: dict[str, Any] = {}
+            if checkpoint_context_fn is not None:
+                checkpoint_kwargs["context_fn"] = checkpoint_context_fn
             return torch.utils.checkpoint.checkpoint(
                 _post_fn,
                 mixed_slice,
@@ -316,6 +345,7 @@ class MoT(nn.Module):
                 scale_mlp,
                 gate_mlp,
                 use_reentrant=False,
+                **checkpoint_kwargs,
             )
         return _post_fn(
             mixed_slice,
@@ -331,9 +361,9 @@ class MoT(nn.Module):
         video_tokens: torch.Tensor,
         video_freqs: torch.Tensor,
         video_t_mod: torch.Tensor,
-        video_context_payload: Optional[dict],
+        video_context_payload: dict | None,
         video_attention_mask: torch.Tensor,
-        gate_current_frame_video_tokens: Optional[int] = None,
+        gate_current_frame_video_tokens: int | None = None,
     ) -> list[dict[str, Any]]:
         """Prefill video branch once and cache per-layer K/V for action denoising.
 
@@ -439,7 +469,7 @@ class MoT(nn.Module):
         video_tokens: torch.Tensor,
         video_freqs: torch.Tensor,
         video_t_mod: torch.Tensor,
-        video_context_payload: Optional[dict],
+        video_context_payload: dict | None,
         video_attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
         """Core loop of prefill_video_cache without NVTX or validation.
@@ -460,16 +490,26 @@ class MoT(nn.Module):
         for layer_idx in range(self.num_layers):
             block = expert.blocks[layer_idx]
             (
-                q, k, v,
-                residual_x, gate_msa,
-                shift_mlp, scale_mlp, gate_mlp,
+                q,
+                k,
+                v,
+                residual_x,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
                 _use_ckpt,
             ) = self._build_expert_attention_io(
-                expert=expert, block=block, x=x,
-                freqs=video_freqs, t_mod=video_t_mod,
+                expert=expert,
+                block=block,
+                x=x,
+                freqs=video_freqs,
+                t_mod=video_t_mod,
             )
             mixed = self._mixed_attention(
-                q_cat=q, k_cat=k, v_cat=v,
+                q_cat=q,
+                k_cat=k,
+                v_cat=v,
                 attention_mask=video_attention_mask,
             )
             x = self._apply_expert_post_block(
@@ -491,19 +531,20 @@ class MoT(nn.Module):
         action_tokens: torch.Tensor,
         action_freqs: torch.Tensor,
         action_t_mod: torch.Tensor,
-        action_context_payload: Optional[dict],
+        action_context_payload: dict | None,
         video_cache_k: list[torch.Tensor],
         video_cache_v: list[torch.Tensor],
         action_attention_mask: torch.Tensor,
-        kv_tap: Optional[GateKVTapRequest] = None,
+        kv_tap: GateKVTapRequest | None = None,
+        checkpoint_context_fn: CheckpointContextFn | None = None,
     ) -> torch.Tensor:
         """Core loop of forward_action_with_video_cache without NVTX or validation.
 
         This method is designed to be torch.compile-friendly. All validation
         and mask slicing should be done by the caller.
 
-        NOTE: This method skips gradient checkpointing and is intended
-        for inference only. Do not call during training.
+        This method supports expert-requested gradient checkpointing while
+        retaining cached video K/V.
 
         Args:
             action_tokens: Action tokens before layer 0, shape [B, Sa, D].
@@ -514,6 +555,8 @@ class MoT(nn.Module):
             video_cache_v: Per-layer cached video values, length num_layers.
             action_attention_mask: Pre-sliced action rows of the joint mask,
                 shape [Sa, Sv+Sa].
+            checkpoint_context_fn: Optional contexts for checkpoint forward and
+                recomputation.
 
         Returns:
             Updated action tokens after all layers, shape [B, Sa, D].
@@ -572,6 +615,7 @@ class MoT(nn.Module):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 mixed_slice=mixed,
                 context_payload=action_context_payload,
+                checkpoint_context_fn=checkpoint_context_fn,
             )
         return x
 
@@ -585,11 +629,14 @@ class MoT(nn.Module):
         action_k: torch.Tensor,
         action_v: torch.Tensor,
         action_block,
-        action_context_payload: Optional[dict],
+        action_context_payload: dict | None,
     ) -> None:
         """Capture detached current-frame/action/context K/V for the Gate sidecar."""
 
-        if action_context_payload is None or action_context_payload.get("context") is None:
+        if (
+            action_context_payload is None
+            or action_context_payload.get("context") is None
+        ):
             raise ValueError("Gate K/V capture requires the action text/state context.")
         context = action_context_payload["context"]
         context_mask = context_token_mask(
@@ -597,7 +644,9 @@ class MoT(nn.Module):
             context=context,
         )
         with torch.no_grad():
-            context_k = action_block.cross_attn.norm_k(action_block.cross_attn.k(context))
+            context_k = action_block.cross_attn.norm_k(
+                action_block.cross_attn.k(context)
+            )
             context_v = action_block.cross_attn.v(context)
 
         batch_size = action_k.shape[0]
@@ -648,11 +697,12 @@ class MoT(nn.Module):
         action_tokens: torch.Tensor,
         action_freqs: torch.Tensor,
         action_t_mod: torch.Tensor,
-        action_context_payload: Optional[dict],
+        action_context_payload: dict | None,
         video_kv_cache: list[dict[str, Any]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
-        kv_tap: Optional[GateKVTapRequest] = None,
+        kv_tap: GateKVTapRequest | None = None,
+        checkpoint_context_fn: CheckpointContextFn | None = None,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -666,20 +716,28 @@ class MoT(nn.Module):
             video_kv_cache: Layer-wise cached video K/V from `prefill_video_cache`.
             attention_mask: Joint [video+action] mask, shape [Sv+Sa, Sv+Sa].
             video_seq_len: Video token count `Sv` in the joint sequence prefix.
+            checkpoint_context_fn: Optional contexts for checkpoint forward and
+                recomputation.
 
         Returns:
             Updated action tokens after all layers, shape [B, Sa, D].
         """
         if "action" not in self.mixtures:
-            raise ValueError("MoT requires `action` expert for `forward_action_with_video_cache`.")
+            raise ValueError(
+                "MoT requires `action` expert for `forward_action_with_video_cache`."
+            )
         if len(video_kv_cache) != self.num_layers:
             raise ValueError(
                 f"`video_kv_cache` must contain {self.num_layers} layers, got {len(video_kv_cache)}."
             )
         if attention_mask.ndim != 2:
-            raise ValueError(f"`attention_mask` must be 2D [S,S], got shape {tuple(attention_mask.shape)}")
+            raise ValueError(
+                f"`attention_mask` must be 2D [S,S], got shape {tuple(attention_mask.shape)}"
+            )
         if attention_mask.shape[0] != attention_mask.shape[1]:
-            raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
+            raise ValueError(
+                f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}"
+            )
 
         action_seq_len = int(action_tokens.shape[1])
         total_seq_len = int(video_seq_len) + action_seq_len
@@ -714,7 +772,9 @@ class MoT(nn.Module):
             )
 
         # Pre-slice mask outside compiled region
-        action_attention_mask = attention_mask[video_seq_len:total_seq_len, :total_seq_len]
+        action_attention_mask = attention_mask[
+            video_seq_len:total_seq_len, :total_seq_len
+        ]
 
         # Extract flat lists for compile-friendly inner method
         video_cache_k = [layer_cache["k"] for layer_cache in video_kv_cache]
@@ -729,16 +789,17 @@ class MoT(nn.Module):
             video_cache_v=video_cache_v,
             action_attention_mask=action_attention_mask,
             kv_tap=kv_tap,
+            checkpoint_context_fn=checkpoint_context_fn,
         )
 
     def forward(
         self,
-        embeds_all: Dict[str, torch.Tensor],
+        embeds_all: dict[str, torch.Tensor],
         attention_mask: torch.Tensor,
-        freqs_all: Dict[str, torch.Tensor],
-        context_all: Dict[str, Optional[dict]],
-        t_mod_all: Dict[str, torch.Tensor],
-        kv_tap: Optional[GateKVTapRequest] = None,
+        freqs_all: dict[str, torch.Tensor],
+        context_all: dict[str, dict | None],
+        t_mod_all: dict[str, torch.Tensor],
+        kv_tap: GateKVTapRequest | None = None,
     ):
         missing = [k for k in self.expert_order if k not in embeds_all]
         if missing:
@@ -751,9 +812,13 @@ class MoT(nn.Module):
             raise ValueError(f"Missing expert t_mod for {missing}")
 
         if attention_mask.ndim != 2:
-            raise ValueError(f"`attention_mask` must be 2D [S, S], got shape {tuple(attention_mask.shape)}")
+            raise ValueError(
+                f"`attention_mask` must be 2D [S, S], got shape {tuple(attention_mask.shape)}"
+            )
         if attention_mask.shape[0] != attention_mask.shape[1]:
-            raise ValueError(f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}")
+            raise ValueError(
+                f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}"
+            )
 
         tokens_all = {k: v for k, v in embeds_all.items()}
         if kv_tap is not None:
@@ -842,7 +907,9 @@ class MoT(nn.Module):
                     f"mask={attention_mask.shape[0]} vs tokens={total_seq}"
                 )
 
-            mixed = self._mixed_attention(q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask)
+            mixed = self._mixed_attention(
+                q_cat=q_cat, k_cat=k_cat, v_cat=v_cat, attention_mask=attention_mask
+            )
 
             start = 0
             for name, seq_len in zip(self.expert_order, seq_lens):
@@ -860,7 +927,9 @@ class MoT(nn.Module):
                     shift_mlp=cached_expert["shift_mlp"],
                     scale_mlp=cached_expert["scale_mlp"],
                     gate_mlp=cached_expert["gate_mlp"],
-                    use_gradient_checkpointing=cached_expert["use_gradient_checkpointing"],
+                    use_gradient_checkpointing=cached_expert[
+                        "use_gradient_checkpointing"
+                    ],
                     mixed_slice=mixed_slice,
                     context_payload=context_payload,
                 )

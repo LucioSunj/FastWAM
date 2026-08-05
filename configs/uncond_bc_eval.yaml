@@ -1,0 +1,51 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - task: libero_uncond_lora_bc
+
+precision: bf16
+compile: false
+seed: 42
+
+runner:
+  stage: offline_validation
+  policy: zero_lora
+  output_dir: ${oc.env:FASTWAM_BC_EVAL_OUTPUT_DIR,./runs/uncond_lora_action_bc_eval/${now:%Y-%m-%d}_${now:%H-%M-%S}}
+  sidecar: null
+  sidecar_sha256: null
+
+training:
+  microbatch_size: 8
+
+validation:
+  seed: 42
+
+lora:
+  rank: 16
+  alpha: 16.0
+  dropout: 0.0
+  target_groups:
+    - self_attention_qkvo
+    - cross_attention_qkvo
+    - ffn
+  freeze_base: true
+  strict_target_discovery: true
+
+bc_policy:
+  action_horizon: 32
+  action_dim: 7
+  proprio_dim: 8
+  expected_video_frames: 9
+  expected_video_height: 224
+  expected_video_width: 448
+  gripper_dimension: 6
+  timestep_bins: 10
+  tiled_vae: false
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

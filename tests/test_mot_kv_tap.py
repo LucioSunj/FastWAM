@@ -6,7 +6,7 @@ import types
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
 if importlib.util.find_spec("safetensors") is None:
     safetensors_stub = types.ModuleType("safetensors")
@@ -17,7 +17,16 @@ if importlib.util.find_spec("imageio") is None:
     imageio_stub.get_writer = None
     sys.modules["imageio"] = imageio_stub
 
-from fastwam.adapters import PolicyRegime
+from fastwam.adapters import (
+    ActionLoRATargetGroup,
+    PolicyRegime,
+    RegimeLoRAConfig,
+    inject_action_dit_lora,
+)
+from fastwam.models.wan22.adaptive_action import (
+    CachedActionCondition,
+    CachedActionVelocity,
+)
 from fastwam.models.wan22.kv_tap import GateKVTapRequest, KVSource
 from fastwam.models.wan22.mot import MoT
 from fastwam.models.wan22.wan_video_dit import DiTBlock
@@ -50,6 +59,63 @@ def _mot() -> MoT:
 
 def _freqs(sequence_length: int) -> torch.Tensor:
     return torch.ones(sequence_length, 1, 2, dtype=torch.complex128)
+
+
+class _TinyCachedActionExpert(_TinyExpert):
+    def __init__(self) -> None:
+        super().__init__(num_layers=1)
+        self.use_gradient_checkpointing = True
+
+    def pre_dit(self, *, action_tokens, timestep, context, context_mask):
+        del timestep
+        return {
+            "tokens": action_tokens,
+            "freqs": _freqs(action_tokens.shape[1]),
+            "t_mod": torch.zeros(action_tokens.shape[0], 6, 8),
+            "context": context,
+            "context_mask": context_mask[:, None, :].expand(
+                -1, action_tokens.shape[1], -1
+            ),
+        }
+
+    def post_dit(self, tokens, _pre):
+        return tokens
+
+
+def test_cached_uncond_checkpoint_recomputation_keeps_lora_regime() -> None:
+    action = _TinyCachedActionExpert()
+    adapter = inject_action_dit_lora(
+        action,
+        RegimeLoRAConfig(
+            rank=2,
+            alpha=2.0,
+            target_groups=(ActionLoRATargetGroup.FFN,),
+        ),
+    )
+    mot = MoT(
+        mixtures={"video": _TinyExpert(num_layers=1), "action": action},
+        mot_checkpoint_mixed_attn=True,
+    ).train()
+    condition = CachedActionCondition(
+        context=torch.randn(2, 5, 8),
+        context_mask=torch.ones(2, 5, dtype=torch.bool),
+        video_kv_cache=[{"k": torch.randn(2, 4, 8), "v": torch.randn(2, 4, 8)}],
+        attention_mask=torch.ones(7, 7, dtype=torch.bool),
+        video_seq_len=4,
+        current_frame_video_tokens=4,
+    )
+    velocity = CachedActionVelocity(
+        action_expert=action,
+        mot=mot,
+        condition=condition,
+        regime=PolicyRegime.UNCOND,
+        regime_context=adapter.regime_context,
+    )
+
+    velocity(torch.randn(2, 3, 8), torch.tensor([0.2, 0.8])).velocity.sum().backward()
+
+    assert adapter.regime_context.current is PolicyRegime.IDM
+    assert any(parameter.grad is not None for parameter in adapter.lora_parameters())
 
 
 def _joint_inputs() -> dict:

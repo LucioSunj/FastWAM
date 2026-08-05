@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import Any, ContextManager
+from typing import Any
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from fastwam.adapters import PolicyRegime, RegimeContext, RegimeLoRALinear
 
@@ -93,10 +93,20 @@ class CachedActionVelocity:
                     "`regime_context` does not own every injected ActionDiT LoRA layer."
                 )
 
-    def _regime_scope(self) -> ContextManager[PolicyRegime | None]:
+    def _regime_scope(self) -> AbstractContextManager[PolicyRegime | None]:
         if self.regime_context is None:
             return nullcontext()
         return self.regime_context.use(self.regime)
+
+    def _checkpoint_regime_contexts(
+        self,
+    ) -> tuple[
+        AbstractContextManager[PolicyRegime | None],
+        AbstractContextManager[PolicyRegime | None],
+    ]:
+        """Bind the same route to checkpoint forward and backward recomputation."""
+
+        return self._regime_scope(), self._regime_scope()
 
     def __call__(
         self,
@@ -146,6 +156,7 @@ class CachedActionVelocity:
                 attention_mask=self.condition.attention_mask,
                 video_seq_len=self.condition.video_seq_len,
                 kv_tap=tap_request,
+                checkpoint_context_fn=self._checkpoint_regime_contexts,
             )
             velocity = self.action_expert.post_dit(action_tokens, action_pre)
 
