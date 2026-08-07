@@ -1,0 +1,3 @@
+[submodule "src/fastwam/models/dinov3"]
+	path = src/fastwam/models/dinov3
+	url = https://github.com/facebookresearch/dinov3.git
