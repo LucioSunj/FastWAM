@@ -26,17 +26,10 @@ from fastwam.adapters import (
 from fastwam.models.wan22.adaptive_action import (
     CachedActionCondition,
     CachedActionVelocity,
-    VisualReadCondition,
 )
 from fastwam.models.wan22.kv_tap import GateKVTapRequest, KVSource
 from fastwam.models.wan22.mot import MoT
-from fastwam.models.wan22.visual_contracts import (
-    ActionLayerReadContext,
-    ActionVisualReader,
-    NativePatchMemory,
-    VisualResidual,
-)
-from fastwam.models.wan22.wan_video_dit import DiTBlock, modulate
+from fastwam.models.wan22.wan_video_dit import DiTBlock
 
 
 class _TinyExpert(nn.Module):
@@ -68,73 +61,16 @@ def _freqs(sequence_length: int) -> torch.Tensor:
     return torch.ones(sequence_length, 1, 2, dtype=torch.complex128)
 
 
-def _visual_memory(batch_size: int = 2) -> NativePatchMemory:
-    tokens = torch.randn(batch_size, 2, 196, 384)
-    camera_valid = torch.ones(batch_size, 2, dtype=torch.bool)
-    return NativePatchMemory(
-        tokens=tokens,
-        patch_valid_mask=camera_valid.unsqueeze(-1).expand(-1, -1, 196),
-        camera_valid_mask=camera_valid,
-        camera_ids=("main", "wrist"),
-        grid=(14, 14),
-        source_revision="revision",
-        weights_sha256="1" * 64,
-        input_contract_sha256="2" * 64,
-        preprocess_sha256="3" * 64,
-        output_contract_sha256="4" * 64,
-        memory_contract_sha256="5" * 64,
-    )
-
-
-class _RecordingReader(ActionVisualReader):
-    reader_kind = "recording-reader-v1"
-    reader_contract_sha256 = "6" * 64
-
-    def __init__(
-        self,
-        *,
-        layer_indices: tuple[int, ...],
-        scale: float,
-    ) -> None:
-        super().__init__()
-        self._layer_indices = layer_indices
-        self.scale = nn.Parameter(torch.tensor(float(scale)))
-        self.contexts: list[ActionLayerReadContext] = []
-
-    @property
-    def injection_layer_indices(self) -> tuple[int, ...]:
-        return self._layer_indices
-
-    def forward_layer(
-        self,
-        context: ActionLayerReadContext,
-        memory: NativePatchMemory,
-    ) -> VisualResidual:
-        del memory
-        self.contexts.append(context)
-        pattern = torch.arange(
-            1,
-            context.post_block_hidden.shape[-1] + 1,
-            dtype=context.post_block_hidden.dtype,
-            device=context.post_block_hidden.device,
-        ).view(1, 1, -1)
-        return VisualResidual(
-            tensor=pattern.expand_as(context.post_block_hidden) * self.scale,
-            layer_index=context.layer_index,
-            branch_kinds=("recording-branch",),
-        )
-
-
 class _TinyCachedActionExpert(_TinyExpert):
     def __init__(self) -> None:
         super().__init__(num_layers=1)
         self.use_gradient_checkpointing = True
 
     def pre_dit(self, *, action_tokens, timestep, context, context_mask):
+        del timestep
         return {
             "tokens": action_tokens,
             "freqs": _freqs(action_tokens.shape[1]),
-            "t": timestep[:, None].expand(-1, 8),
             "t_mod": torch.zeros(action_tokens.shape[0], 6, 8),
             "context": context,
             "context_mask": context_mask[:, None, :].expand(
@@ -182,80 +118,6 @@ def test_cached_uncond_checkpoint_recomputation_keeps_lora_regime() -> None:
     assert any(parameter.grad is not None for parameter in adapter.lora_parameters())
 
 
-def test_cached_visual_reader_stays_outside_base_checkpoint_recomputation() -> None:
-    action = _TinyCachedActionExpert()
-    adapter = inject_action_dit_lora(
-        action,
-        RegimeLoRAConfig(
-            rank=2,
-            alpha=2.0,
-            target_groups=(ActionLoRATargetGroup.FFN,),
-        ),
-    )
-    mot = MoT(
-        mixtures={"video": _TinyExpert(num_layers=1), "action": action},
-        mot_checkpoint_mixed_attn=True,
-    ).train()
-    visual = VisualReadCondition(
-        memory=_visual_memory(),
-        proprio=torch.randn(2, 3),
-        video_layout_metadata={"grid": (1, 2, 2)},
-    )
-    condition = CachedActionCondition(
-        context=torch.randn(2, 5, 8),
-        context_mask=torch.ones(2, 5, dtype=torch.bool),
-        video_kv_cache=[{"k": torch.randn(2, 4, 8), "v": torch.randn(2, 4, 8)}],
-        attention_mask=torch.ones(7, 7, dtype=torch.bool),
-        video_seq_len=4,
-        current_frame_video_tokens=4,
-        visual=visual,
-    )
-    reader = _RecordingReader(layer_indices=(0,), scale=0.1)
-    velocity = CachedActionVelocity(
-        action_expert=action,
-        mot=mot,
-        condition=condition,
-        regime=PolicyRegime.UNCOND,
-        regime_context=adapter.regime_context,
-        visual_reader=reader,
-    )
-
-    velocity(torch.randn(2, 3, 8), torch.tensor([0.2, 0.8])).velocity.sum().backward()
-
-    assert len(reader.contexts) == 1
-    assert reader.scale.grad is not None
-    assert torch.count_nonzero(reader.scale.grad) > 0
-    assert adapter.regime_context.current is PolicyRegime.IDM
-
-
-def test_idm_cached_velocity_rejects_visual_graph_construction() -> None:
-    action = _TinyCachedActionExpert()
-    condition = CachedActionCondition(
-        context=torch.randn(2, 5, 8),
-        context_mask=torch.ones(2, 5, dtype=torch.bool),
-        video_kv_cache=[{"k": torch.randn(2, 4, 8), "v": torch.randn(2, 4, 8)}],
-        attention_mask=torch.ones(7, 7, dtype=torch.bool),
-        video_seq_len=4,
-        current_frame_video_tokens=4,
-        visual=VisualReadCondition(
-            memory=_visual_memory(),
-            proprio=torch.randn(2, 3),
-        ),
-    )
-
-    with pytest.raises(ValueError, match="IDM action velocity must bypass"):
-        CachedActionVelocity(
-            action_expert=action,
-            mot=MoT(
-                mixtures={"video": _TinyExpert(num_layers=1), "action": action},
-                mot_checkpoint_mixed_attn=False,
-            ),
-            condition=condition,
-            regime=PolicyRegime.IDM,
-            visual_reader=_RecordingReader(layer_indices=(0,), scale=0.0),
-        )
-
-
 def _joint_inputs() -> dict:
     generator = torch.Generator().manual_seed(8)
     video = torch.randn(2, 4, 8, generator=generator)
@@ -297,30 +159,6 @@ def _joint_inputs() -> dict:
             "video": torch.zeros(2, 6, 8),
             "action": torch.zeros(2, 6, 8),
         },
-    }
-
-
-def _cached_action_inputs() -> dict:
-    generator = torch.Generator().manual_seed(37)
-    video_cache = [
-        {
-            "k": torch.randn(2, 4, 8, generator=generator),
-            "v": torch.randn(2, 4, 8, generator=generator),
-            "_gate_current_frame_video_tokens": 2,
-        }
-        for _ in range(2)
-    ]
-    return {
-        "action_tokens": torch.randn(2, 3, 8, generator=generator),
-        "action_freqs": _freqs(3),
-        "action_t_mod": torch.randn(2, 6, 8, generator=generator),
-        "action_context_payload": {
-            "context": torch.randn(2, 5, 8, generator=generator),
-            "mask": torch.ones(2, 3, 5, dtype=torch.bool),
-        },
-        "video_kv_cache": video_cache,
-        "attention_mask": torch.ones(7, 7, dtype=torch.bool),
-        "video_seq_len": 4,
     }
 
 
@@ -376,76 +214,6 @@ def test_joint_forward_captures_only_selected_layers() -> None:
     mot(**_joint_inputs(), kv_tap=tap)
 
     assert tap.snapshot().layer_indices == (1,)
-
-
-def test_cached_visual_hook_uses_exact_modulated_input_and_zero_delta() -> None:
-    mot = _mot()
-    inputs = _cached_action_inputs()
-    baseline = mot.forward_action_with_video_cache(**inputs)
-    reader = _RecordingReader(layer_indices=(0,), scale=0.0)
-    visual_memory = _visual_memory()
-
-    hooked = mot.forward_action_with_video_cache(
-        **inputs,
-        visual_reader=reader,
-        visual_memory=visual_memory,
-        visual_proprio=torch.randn(2, 3),
-        action_time_embedding=torch.randn(2, 8),
-        current_frame_video_tokens=2,
-        video_layout_metadata={"grid": (1, 2, 2)},
-    )
-
-    assert torch.equal(hooked, baseline)
-    assert len(reader.contexts) == 1
-    block = mot.mixtures["action"].blocks[0]
-    shift_msa, scale_msa, *_rest = mot._split_modulation(
-        block,
-        inputs["action_t_mod"],
-    )
-    expected = modulate(
-        block.norm1(inputs["action_tokens"]),
-        shift_msa,
-        scale_msa,
-    )
-    assert torch.equal(reader.contexts[0].modulated_attn_input, expected)
-    assert reader.contexts[0].video.layout_metadata == {"grid": (1, 2, 2)}
-
-
-def test_visual_residual_affects_only_later_gate_action_kv() -> None:
-    mot = _mot()
-    inputs = _cached_action_inputs()
-    baseline_tap = GateKVTapRequest(
-        current_mode="uncond",
-        denoise_timestep=torch.tensor([0.6, 0.4]),
-        current_frame_video_tokens=2,
-        layer_indices=(0, 1),
-    )
-    visual_tap = GateKVTapRequest(
-        current_mode="uncond",
-        denoise_timestep=torch.tensor([0.6, 0.4]),
-        current_frame_video_tokens=2,
-        layer_indices=(0, 1),
-    )
-    baseline = mot.forward_action_with_video_cache(**inputs, kv_tap=baseline_tap)
-    reader = _RecordingReader(layer_indices=(0,), scale=0.2)
-
-    adapted = mot.forward_action_with_video_cache(
-        **inputs,
-        kv_tap=visual_tap,
-        visual_reader=reader,
-        visual_memory=_visual_memory(),
-        visual_proprio=torch.randn(2, 3),
-        action_time_embedding=torch.randn(2, 8),
-        current_frame_video_tokens=2,
-    )
-
-    baseline_layers = baseline_tap.snapshot().layers
-    visual_layers = visual_tap.snapshot().layers
-    assert torch.equal(visual_layers[0].action.key, baseline_layers[0].action.key)
-    assert not torch.equal(visual_layers[1].action.key, baseline_layers[1].action.key)
-    assert not visual_layers[0].action.key.requires_grad
-    assert not visual_layers[1].action.key.requires_grad
-    assert not torch.equal(adapted, baseline)
 
 
 def test_cached_action_forward_tap_excludes_generated_future_video() -> None:

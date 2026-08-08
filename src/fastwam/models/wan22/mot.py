@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from contextlib import AbstractContextManager
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 import torch.utils.checkpoint
@@ -18,12 +18,6 @@ from .kv_tap import (
     KVSource,
     context_token_mask,
 )
-from .visual_contracts import (
-    ActionLayerReadContext,
-    ActionVisualReader,
-    LayerVideoKVView,
-    NativePatchMemory,
-)
 from .wan_video_dit import flash_attention, modulate, rope_apply
 
 logger = get_logger(__name__)
@@ -32,21 +26,6 @@ _GATE_CURRENT_FRAME_PROVENANCE_KEY = "_gate_current_frame_video_tokens"
 CheckpointContextFn = Callable[
     [], tuple[AbstractContextManager[Any], AbstractContextManager[Any]]
 ]
-
-
-class ExpertAttentionIO(NamedTuple):
-    """Compile-friendly expert attention inputs and post-block state."""
-
-    query: torch.Tensor
-    key: torch.Tensor
-    value: torch.Tensor
-    modulated_input: torch.Tensor
-    residual_input: torch.Tensor
-    gate_msa: torch.Tensor
-    shift_mlp: torch.Tensor
-    scale_mlp: torch.Tensor
-    gate_mlp: torch.Tensor
-    use_gradient_checkpointing: bool
 
 
 class MoT(nn.Module):
@@ -239,7 +218,17 @@ class MoT(nn.Module):
         x: torch.Tensor,
         freqs: torch.Tensor,
         t_mod: torch.Tensor,
-    ) -> ExpertAttentionIO:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        bool,
+    ]:
         """Build per-expert attention tensors and post-block states.
 
         Args:
@@ -251,8 +240,15 @@ class MoT(nn.Module):
             t_mod: Time modulation tensor for this expert/layer.
 
         Returns:
-            Named expert attention tensors, including the exact modulated input
-            shared by base Q/K/V and optional action visual readers.
+            q: Query after q-proj, RMSNorm, and RoPE, shape [B, S, H*Dh].
+            k: Key after k-proj, RMSNorm, and RoPE, shape [B, S, H*Dh].
+            v: Value after v-proj, shape [B, S, H*Dh].
+            residual_x: Original input `x` for residual path in post block.
+            gate_msa: Gating tensor for self-attention residual branch.
+            shift_mlp: Shift tensor for MLP modulation.
+            scale_mlp: Scale tensor for MLP modulation.
+            gate_mlp: Gating tensor for MLP residual branch.
+            use_gradient_checkpointing: Whether this expert enables checkpointing.
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self._split_modulation(block, t_mod)
@@ -269,17 +265,16 @@ class MoT(nn.Module):
         use_gradient_checkpointing = bool(
             getattr(expert, "use_gradient_checkpointing", False)
         )
-        return ExpertAttentionIO(
-            query=q,
-            key=k,
-            value=v,
-            modulated_input=attn_input,
-            residual_input=x,
-            gate_msa=gate_msa,
-            shift_mlp=shift_mlp,
-            scale_mlp=scale_mlp,
-            gate_mlp=gate_mlp,
-            use_gradient_checkpointing=use_gradient_checkpointing,
+        return (
+            q,
+            k,
+            v,
+            x,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+            use_gradient_checkpointing,
         )
 
     def _apply_post_with_optional_checkpoint(
@@ -424,7 +419,17 @@ class MoT(nn.Module):
             nvtx.range_push(f"prefill_video_layer_{layer_idx}")
             block = expert.blocks[layer_idx]
             # Build video Q/K/V from current layer input tokens.
-            attention_io = self._build_expert_attention_io(
+            (
+                q,
+                k,
+                v,
+                residual_x,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                use_gradient_checkpointing,
+            ) = self._build_expert_attention_io(
                 expert=expert,
                 block=block,
                 x=x,
@@ -433,27 +438,24 @@ class MoT(nn.Module):
             )
             # Video prefill uses only video self-attention mask.
             mixed = self._mixed_attention(
-                q_cat=attention_io.query,
-                k_cat=attention_io.key,
-                v_cat=attention_io.value,
+                q_cat=q,
+                k_cat=k,
+                v_cat=v,
                 attention_mask=video_attention_mask,
             )
             # Update video tokens for the next layer and persist current layer K/V.
             x = self._apply_post_with_optional_checkpoint(
                 block=block,
-                residual_x=attention_io.residual_input,
-                gate_msa=attention_io.gate_msa,
-                shift_mlp=attention_io.shift_mlp,
-                scale_mlp=attention_io.scale_mlp,
-                gate_mlp=attention_io.gate_mlp,
-                use_gradient_checkpointing=attention_io.use_gradient_checkpointing,
+                residual_x=residual_x,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                use_gradient_checkpointing=use_gradient_checkpointing,
                 mixed_slice=mixed,
                 context_payload=video_context_payload,
             )
-            layer_cache: dict[str, Any] = {
-                "k": attention_io.key,
-                "v": attention_io.value,
-            }
+            layer_cache: dict[str, Any] = {"k": k, "v": v}
             if gate_current_frame_video_tokens is not None:
                 layer_cache[_GATE_CURRENT_FRAME_PROVENANCE_KEY] = int(
                     gate_current_frame_video_tokens
@@ -487,7 +489,17 @@ class MoT(nn.Module):
         cache_v_list: list[torch.Tensor] = []
         for layer_idx in range(self.num_layers):
             block = expert.blocks[layer_idx]
-            attention_io = self._build_expert_attention_io(
+            (
+                q,
+                k,
+                v,
+                residual_x,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                _use_ckpt,
+            ) = self._build_expert_attention_io(
                 expert=expert,
                 block=block,
                 x=x,
@@ -495,23 +507,23 @@ class MoT(nn.Module):
                 t_mod=video_t_mod,
             )
             mixed = self._mixed_attention(
-                q_cat=attention_io.query,
-                k_cat=attention_io.key,
-                v_cat=attention_io.value,
+                q_cat=q,
+                k_cat=k,
+                v_cat=v,
                 attention_mask=video_attention_mask,
             )
             x = self._apply_expert_post_block(
                 block=block,
-                residual_x=attention_io.residual_input,
+                residual_x=residual_x,
                 mixed_attn_out=mixed,
-                gate_msa=attention_io.gate_msa,
-                shift_mlp=attention_io.shift_mlp,
-                scale_mlp=attention_io.scale_mlp,
-                gate_mlp=attention_io.gate_mlp,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
                 context_payload=video_context_payload,
             )
-            cache_k_list.append(attention_io.key)
-            cache_v_list.append(attention_io.value)
+            cache_k_list.append(k)
+            cache_v_list.append(v)
         return x, cache_k_list, cache_v_list
 
     def _forward_action_with_video_cache_inner(
@@ -525,12 +537,6 @@ class MoT(nn.Module):
         action_attention_mask: torch.Tensor,
         kv_tap: GateKVTapRequest | None = None,
         checkpoint_context_fn: CheckpointContextFn | None = None,
-        visual_reader: ActionVisualReader | None = None,
-        visual_memory: NativePatchMemory | None = None,
-        visual_proprio: torch.Tensor | None = None,
-        action_time_embedding: torch.Tensor | None = None,
-        current_frame_video_tokens: int | None = None,
-        video_layout_metadata: Mapping[str, Any] | None = None,
     ) -> torch.Tensor:
         """Core loop of forward_action_with_video_cache without NVTX or validation.
 
@@ -559,7 +565,17 @@ class MoT(nn.Module):
         x = action_tokens
         for layer_idx in range(self.num_layers):
             block = expert.blocks[layer_idx]
-            attention_io = self._build_expert_attention_io(
+            (
+                q_action,
+                k_action,
+                v_action,
+                residual_x,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                use_gradient_checkpointing,
+            ) = self._build_expert_attention_io(
                 expert=expert,
                 block=block,
                 x=x,
@@ -575,57 +591,32 @@ class MoT(nn.Module):
                     layer_idx=layer_idx,
                     video_k=k_video,
                     video_v=v_video,
-                    action_k=attention_io.key,
-                    action_v=attention_io.value,
+                    action_k=k_action,
+                    action_v=v_action,
                     action_block=block,
                     action_context_payload=action_context_payload,
                 )
 
-            k_cat = torch.cat([k_video, attention_io.key], dim=1)
-            v_cat = torch.cat([v_video, attention_io.value], dim=1)
+            k_cat = torch.cat([k_video, k_action], dim=1)
+            v_cat = torch.cat([v_video, v_action], dim=1)
             mixed = self._mixed_attention(
-                q_cat=attention_io.query,
+                q_cat=q_action,
                 k_cat=k_cat,
                 v_cat=v_cat,
                 attention_mask=action_attention_mask,
             )
             x = self._apply_post_with_optional_checkpoint(
                 block=block,
-                residual_x=attention_io.residual_input,
-                gate_msa=attention_io.gate_msa,
-                shift_mlp=attention_io.shift_mlp,
-                scale_mlp=attention_io.scale_mlp,
-                gate_mlp=attention_io.gate_mlp,
-                use_gradient_checkpointing=attention_io.use_gradient_checkpointing,
+                residual_x=residual_x,
+                gate_msa=gate_msa,
+                shift_mlp=shift_mlp,
+                scale_mlp=scale_mlp,
+                gate_mlp=gate_mlp,
+                use_gradient_checkpointing=use_gradient_checkpointing,
                 mixed_slice=mixed,
                 context_payload=action_context_payload,
                 checkpoint_context_fn=checkpoint_context_fn,
             )
-            if visual_reader is not None and visual_reader.should_inject(layer_idx):
-                assert visual_memory is not None
-                assert visual_proprio is not None
-                assert action_time_embedding is not None
-                assert current_frame_video_tokens is not None
-                visual_context = ActionLayerReadContext(
-                    layer_index=layer_idx,
-                    pre_block_hidden=attention_io.residual_input,
-                    modulated_attn_input=attention_io.modulated_input,
-                    post_block_hidden=x,
-                    base_gate_msa=attention_io.gate_msa,
-                    timestep_embedding=action_time_embedding,
-                    proprio=visual_proprio,
-                    video=LayerVideoKVView(
-                        key=k_video,
-                        value=v_video,
-                        current_frame_tokens=current_frame_video_tokens,
-                        layout_metadata=video_layout_metadata,
-                    ),
-                )
-                visual_residual = visual_reader.forward_layer(
-                    visual_context,
-                    visual_memory,
-                )
-                x = x + visual_residual.tensor
         return x
 
     def _capture_gate_layer_kv(
@@ -712,12 +703,6 @@ class MoT(nn.Module):
         video_seq_len: int,
         kv_tap: GateKVTapRequest | None = None,
         checkpoint_context_fn: CheckpointContextFn | None = None,
-        visual_reader: ActionVisualReader | None = None,
-        visual_memory: NativePatchMemory | None = None,
-        visual_proprio: torch.Tensor | None = None,
-        action_time_embedding: torch.Tensor | None = None,
-        current_frame_video_tokens: int | None = None,
-        video_layout_metadata: Mapping[str, Any] | None = None,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -733,8 +718,6 @@ class MoT(nn.Module):
             video_seq_len: Video token count `Sv` in the joint sequence prefix.
             checkpoint_context_fn: Optional contexts for checkpoint forward and
                 recomputation.
-            visual_reader: Optional independently owned action visual reader.
-            visual_memory: Frozen native memory reused across denoising steps.
 
         Returns:
             Updated action tokens after all layers, shape [B, Sa, D].
@@ -755,41 +738,6 @@ class MoT(nn.Module):
             raise ValueError(
                 f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}"
             )
-
-        visual_values = (
-            visual_memory,
-            visual_proprio,
-            action_time_embedding,
-            current_frame_video_tokens,
-        )
-        if visual_reader is None:
-            if any(value is not None for value in visual_values) or (
-                video_layout_metadata is not None
-            ):
-                raise ValueError(
-                    "Visual inputs cannot be supplied without an action visual reader."
-                )
-        else:
-            if any(value is None for value in visual_values):
-                raise ValueError(
-                    "Visual readers require memory, proprio, time embedding, and "
-                    "current-frame video extent."
-                )
-            if any(
-                index < 0 or index >= self.num_layers
-                for index in visual_reader.injection_layer_indices
-            ):
-                raise ValueError("Visual reader injection layer lies outside MoT.")
-            assert visual_memory is not None
-            if visual_memory.tokens.shape[0] != action_tokens.shape[0]:
-                raise ValueError(
-                    "Visual memory batch size does not match action tokens."
-                )
-            assert current_frame_video_tokens is not None
-            if not 1 <= int(current_frame_video_tokens) <= int(video_seq_len):
-                raise ValueError(
-                    "Visual current-frame extent must lie inside video K/V."
-                )
 
         action_seq_len = int(action_tokens.shape[1])
         total_seq_len = int(video_seq_len) + action_seq_len
@@ -842,12 +790,6 @@ class MoT(nn.Module):
             action_attention_mask=action_attention_mask,
             kv_tap=kv_tap,
             checkpoint_context_fn=checkpoint_context_fn,
-            visual_reader=visual_reader,
-            visual_memory=visual_memory,
-            visual_proprio=visual_proprio,
-            action_time_embedding=action_time_embedding,
-            current_frame_video_tokens=current_frame_video_tokens,
-            video_layout_metadata=video_layout_metadata,
         )
 
     def forward(
@@ -906,7 +848,17 @@ class MoT(nn.Module):
                 freqs = freqs_all[name]
                 t_mod = t_mod_all[name]
 
-                attention_io = self._build_expert_attention_io(
+                (
+                    q,
+                    k,
+                    v,
+                    residual_x,
+                    gate_msa,
+                    shift_mlp,
+                    scale_mlp,
+                    gate_mlp,
+                    use_gradient_checkpointing,
+                ) = self._build_expert_attention_io(
                     expert=expert,
                     block=block,
                     x=x,
@@ -914,22 +866,20 @@ class MoT(nn.Module):
                     t_mod=t_mod,
                 )
 
-                q_chunks.append(attention_io.query)
-                k_chunks.append(attention_io.key)
-                v_chunks.append(attention_io.value)
+                q_chunks.append(q)
+                k_chunks.append(k)
+                v_chunks.append(v)
                 seq_lens.append(x.shape[1])
                 cached[name] = {
                     "block": block,
-                    "residual_x": attention_io.residual_input,
-                    "gate_msa": attention_io.gate_msa,
-                    "shift_mlp": attention_io.shift_mlp,
-                    "scale_mlp": attention_io.scale_mlp,
-                    "gate_mlp": attention_io.gate_mlp,
-                    "use_gradient_checkpointing": (
-                        attention_io.use_gradient_checkpointing
-                    ),
+                    "residual_x": residual_x,
+                    "gate_msa": gate_msa,
+                    "shift_mlp": shift_mlp,
+                    "scale_mlp": scale_mlp,
+                    "gate_mlp": gate_mlp,
+                    "use_gradient_checkpointing": use_gradient_checkpointing,
                 }
-                layer_kv[name] = (attention_io.key, attention_io.value, block)
+                layer_kv[name] = (k, v, block)
 
             if kv_tap is not None and kv_tap.should_capture(layer_idx, self.num_layers):
                 video_k, video_v, _video_block = layer_kv["video"]

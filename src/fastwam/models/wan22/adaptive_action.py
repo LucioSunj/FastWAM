@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -14,28 +13,6 @@ from fastwam.adapters import PolicyRegime, RegimeContext, RegimeLoRALinear
 
 from .adaptive_sampler import VelocityOutput
 from .kv_tap import GateKVSnapshot, GateKVTapRequest
-from .visual_contracts import ActionVisualReader, NativePatchMemory
-
-
-@dataclass(frozen=True)
-class VisualReadCondition:
-    """Frozen per-replan memory and non-visual inputs for an action reader."""
-
-    memory: NativePatchMemory
-    proprio: torch.Tensor
-    video_layout_metadata: Mapping[str, Any] | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.memory, NativePatchMemory):
-            raise TypeError("`memory` must be a NativePatchMemory instance.")
-        if self.proprio.ndim != 2:
-            raise ValueError("Visual-reader proprioception must have shape [B,D_p].")
-        if not self.proprio.is_floating_point():
-            raise TypeError("Visual-reader proprioception must use a floating dtype.")
-        if self.proprio.shape[0] != self.memory.tokens.shape[0]:
-            raise ValueError("Visual memory and proprioception batch sizes differ.")
-        if self.proprio.device != self.memory.tokens.device:
-            raise ValueError("Visual memory and proprioception must share a device.")
 
 
 @dataclass(frozen=True)
@@ -48,7 +25,6 @@ class CachedActionCondition:
     attention_mask: torch.Tensor
     video_seq_len: int
     current_frame_video_tokens: int
-    visual: VisualReadCondition | None = None
 
     def __post_init__(self) -> None:
         if self.video_seq_len < 1:
@@ -62,11 +38,6 @@ class CachedActionCondition:
             raise ValueError("`attention_mask` must be a two-dimensional joint mask.")
         if self.context_mask.dtype != torch.bool:
             raise TypeError("`context_mask` must use bool dtype.")
-        if self.visual is not None:
-            if not isinstance(self.visual, VisualReadCondition):
-                raise TypeError("`visual` must be a VisualReadCondition instance.")
-            if self.visual.memory.tokens.shape[0] != self.context.shape[0]:
-                raise ValueError("Visual and text/state context batch sizes differ.")
 
 
 class CachedActionVelocity:
@@ -83,7 +54,6 @@ class CachedActionVelocity:
         gate_layer_indices: tuple[int, ...] | None = None,
         capture_gate_kv: bool = False,
         actor_version: int = 0,
-        visual_reader: ActionVisualReader | None = None,
     ) -> None:
         self.action_expert = action_expert
         self.mot = mot
@@ -93,7 +63,6 @@ class CachedActionVelocity:
         self.gate_layer_indices = gate_layer_indices
         self.capture_gate_kv = bool(capture_gate_kv)
         self.actor_version = int(actor_version)
-        self.visual_reader = visual_reader
         if self.actor_version < 0:
             raise ValueError("`actor_version` must be non-negative.")
         if self.regime is PolicyRegime.UNCOND and self.regime_context is None:
@@ -105,16 +74,6 @@ class CachedActionVelocity:
             self.regime_context, RegimeContext
         ):
             raise TypeError("`regime_context` must be a RegimeContext instance.")
-        if (self.visual_reader is None) != (self.condition.visual is None):
-            raise ValueError(
-                "Visual reader and visual condition must be supplied together."
-            )
-        if self.regime is PolicyRegime.IDM and self.visual_reader is not None:
-            raise ValueError("IDM action velocity must bypass the visual sidecar.")
-        if self.visual_reader is not None and not isinstance(
-            self.visual_reader, ActionVisualReader
-        ):
-            raise TypeError("`visual_reader` must implement ActionVisualReader.")
         if self.regime is PolicyRegime.UNCOND:
             adapted_layers = tuple(
                 module
@@ -185,37 +144,20 @@ class CachedActionVelocity:
                 context=self.condition.context,
                 context_mask=self.condition.context_mask,
             )
-            visual = self.condition.visual
-            if visual is not None and "t" not in action_pre:
-                raise ValueError(
-                    "Visual readers require the frozen ActionDiT timestep embedding."
-                )
-            mot_kwargs: dict[str, Any] = {
-                "action_tokens": action_pre["tokens"],
-                "action_freqs": action_pre["freqs"],
-                "action_t_mod": action_pre["t_mod"],
-                "action_context_payload": {
+            action_tokens = self.mot.forward_action_with_video_cache(
+                action_tokens=action_pre["tokens"],
+                action_freqs=action_pre["freqs"],
+                action_t_mod=action_pre["t_mod"],
+                action_context_payload={
                     "context": action_pre["context"],
                     "mask": action_pre["context_mask"],
                 },
-                "video_kv_cache": self.condition.video_kv_cache,
-                "attention_mask": self.condition.attention_mask,
-                "video_seq_len": self.condition.video_seq_len,
-                "kv_tap": tap_request,
-                "checkpoint_context_fn": self._checkpoint_regime_contexts,
-            }
-            if visual is not None:
-                mot_kwargs.update(
-                    visual_reader=self.visual_reader,
-                    visual_memory=visual.memory,
-                    visual_proprio=visual.proprio,
-                    action_time_embedding=action_pre["t"],
-                    current_frame_video_tokens=(
-                        self.condition.current_frame_video_tokens
-                    ),
-                    video_layout_metadata=visual.video_layout_metadata,
-                )
-            action_tokens = self.mot.forward_action_with_video_cache(**mot_kwargs)
+                video_kv_cache=self.condition.video_kv_cache,
+                attention_mask=self.condition.attention_mask,
+                video_seq_len=self.condition.video_seq_len,
+                kv_tap=tap_request,
+                checkpoint_context_fn=self._checkpoint_regime_contexts,
+            )
             velocity = self.action_expert.post_dit(action_tokens, action_pre)
 
         snapshot: GateKVSnapshot | None = (
