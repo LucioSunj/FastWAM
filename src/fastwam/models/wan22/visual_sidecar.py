@@ -17,9 +17,12 @@ from .visual_contracts import (
     DINO_V3_NATIVE_DIM,
     ActionLayerReadContext,
     ActionVisualReader,
+    DinoWanSpatialTransport,
     NativePatchMemory,
     RoutingWeights,
+    VISUAL_READER_PARAMETER_FAMILY,
     VisualResidual,
+    WanValueSpatialMetadata,
     contract_sha256,
     validate_sha256,
 )
@@ -28,6 +31,9 @@ NATIVE_DINO_ROUTER_KIND = "native-dino-cosine-router-v1"
 DINO_SEMANTIC_BRANCH_KIND = "dino-native-semantic-value-v1"
 DINO_SEMANTIC_READER_KIND = "dinov3-native-semantic-reader-v1"
 QUERY_SOURCE_CONTRACT = "base-modulated-self-attention-input-v1"
+WAN_ROUTED_VALUE_BRANCH_KIND = "dino-routed-frozen-wan-value-v1"
+DINOV3_ROUTER_WAN_VALUE_READER_KIND = "dinov3-router-wan-value-reader-v1"
+P6_VISUAL_ROUTER_PARAMETER_FAMILY = "visual_router"
 
 
 class ProjectionKind(str, Enum):
@@ -190,6 +196,98 @@ class DinoSemanticReaderConfig:
             "query_projection": self.query_projection.contract_payload(),
             "output_projection": self.output_projection.contract_payload(),
             "memory_contract_sha256": self.memory_contract_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class DinoWanValueReaderConfig:
+    """Resolved P6 router-to-frozen-Wan-value reader configuration."""
+
+    action_hidden_dim: int
+    camera_ids: tuple[str, ...]
+    layer_indices: tuple[int, ...]
+    temperature: float
+    beta_max: float
+    query_projection: ProjectionSpec
+    memory_contract_sha256: str
+    spatial_metadata: WanValueSpatialMetadata
+    transport: DinoWanSpatialTransport
+    camera_mass: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.action_hidden_dim, bool) or int(self.action_hidden_dim) < 1:
+            raise ValueError("`action_hidden_dim` must be a positive integer.")
+        object.__setattr__(self, "action_hidden_dim", int(self.action_hidden_dim))
+        camera_ids = tuple(str(item) for item in self.camera_ids)
+        if not camera_ids or len(set(camera_ids)) != len(camera_ids):
+            raise ValueError("P6 camera IDs must be non-empty, unique, and ordered.")
+        if camera_ids != self.spatial_metadata.camera_order:
+            raise ValueError("P6 camera order differs from the Wan spatial contract.")
+        if camera_ids != self.transport.camera_ids:
+            raise ValueError("P6 camera order differs from the transport matrix.")
+        if (
+            self.transport.spatial_contract_sha256
+            != self.spatial_metadata.spatial_transport_contract_sha256
+        ):
+            raise ValueError("P6 transport and Wan spatial contract hashes differ.")
+        layer_indices = tuple(int(item) for item in self.layer_indices)
+        if not layer_indices or tuple(sorted(set(layer_indices))) != layer_indices:
+            raise ValueError(
+                "P6 injection layers must be non-empty, unique, and sorted."
+            )
+        if any(item < 0 for item in layer_indices):
+            raise ValueError("P6 injection layers cannot be negative.")
+        temperature = float(self.temperature)
+        beta_max = float(self.beta_max)
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("P6 router temperature must be finite and positive.")
+        if not math.isfinite(beta_max) or beta_max <= 0:
+            raise ValueError("P6 beta bound must be finite and positive.")
+        if not isinstance(self.query_projection, ProjectionSpec):
+            raise TypeError("P6 query projection must be a ProjectionSpec.")
+        camera_mass = tuple(float(value) for value in self.camera_mass)
+        if len(camera_mass) != len(camera_ids):
+            raise ValueError("P6 camera mass must contain one value per camera.")
+        if any(not math.isfinite(value) or value <= 0 for value in camera_mass):
+            raise ValueError("P6 base camera masses must be finite and positive.")
+        total_mass = sum(camera_mass)
+        camera_mass = tuple(value / total_mass for value in camera_mass)
+        object.__setattr__(self, "camera_ids", camera_ids)
+        object.__setattr__(self, "layer_indices", layer_indices)
+        object.__setattr__(self, "temperature", temperature)
+        object.__setattr__(self, "beta_max", beta_max)
+        object.__setattr__(self, "camera_mass", camera_mass)
+        object.__setattr__(
+            self,
+            "memory_contract_sha256",
+            validate_sha256(
+                self.memory_contract_sha256,
+                label="Native memory contract SHA256",
+            ),
+        )
+
+    def contract_payload(self) -> dict[str, Any]:
+        """Return a checkpoint-stable, tensor-free P6 configuration."""
+
+        return {
+            "schema": "fastwam-p6-reader-config-v1",
+            "action_hidden_dim": self.action_hidden_dim,
+            "camera_ids": list(self.camera_ids),
+            "layer_indices": list(self.layer_indices),
+            "temperature": self.temperature,
+            "beta_max": self.beta_max,
+            "query_projection": self.query_projection.contract_payload(),
+            "memory_contract_sha256": self.memory_contract_sha256,
+            "spatial_transport_contract_sha256": (
+                self.spatial_metadata.spatial_transport_contract_sha256
+            ),
+            "transport_sha256": self.transport.transport_sha256,
+            "camera_mass": list(self.camera_mass),
+            "wan_value_source": "video_cache_current_prefix",
+            "output_projection": "frozen_action_self_attn_o_weight_only",
+            "output_bias": False,
+            "reuse_base_gate_msa": True,
+            "beta_parameterization": "bounded_tanh_zero_init",
         }
 
 
@@ -444,6 +542,168 @@ class DinoSemanticValueBranch(VisualValueBranch):
         return self.residual_scale * gate * projected
 
 
+class DinoRoutedWanValueBranch(VisualValueBranch):
+    """Use DINO routing weights to retrieve frozen current-frame Wan values."""
+
+    branch_kind = WAN_ROUTED_VALUE_BRANCH_KIND
+
+    def __init__(
+        self,
+        *,
+        action_hidden_dim: int,
+        camera_ids: tuple[str, ...],
+        transport: DinoWanSpatialTransport,
+        spatial_metadata: WanValueSpatialMetadata,
+        camera_mass: tuple[float, ...],
+        beta_max: float,
+    ) -> None:
+        super().__init__()
+        self.action_hidden_dim = int(action_hidden_dim)
+        self.camera_ids = tuple(camera_ids)
+        self.transport = transport
+        self.spatial_metadata = spatial_metadata
+        self.beta_max = float(beta_max)
+        if self.action_hidden_dim < 1:
+            raise ValueError("P6 action hidden width must be positive.")
+        if self.camera_ids != transport.camera_ids:
+            raise ValueError("P6 branch and transport camera order differ.")
+        if self.camera_ids != spatial_metadata.camera_order:
+            raise ValueError("P6 branch and Wan metadata camera order differ.")
+        if transport.target_count != spatial_metadata.current_frame_video_tokens:
+            raise ValueError("P6 transport target count differs from Wan metadata.")
+        if spatial_metadata.video_value_width < 1:
+            raise ValueError("P6 Wan value width must be positive.")
+        if not math.isfinite(self.beta_max) or self.beta_max <= 0:
+            raise ValueError("P6 beta bound must be finite and positive.")
+        normalized_mass = torch.tensor(camera_mass, dtype=torch.float32)
+        if normalized_mass.shape != (len(self.camera_ids),):
+            raise ValueError("P6 camera mass shape differs from camera order.")
+        if not bool(torch.isfinite(normalized_mass).all().item()) or bool(
+            (normalized_mass <= 0).any().item()
+        ):
+            raise ValueError("P6 camera masses must be finite and positive.")
+        normalized_mass = normalized_mass / normalized_mass.sum()
+        self.register_buffer("transport_matrix", transport.matrix, persistent=False)
+        self.register_buffer(
+            "transport_target_valid_mask",
+            transport.target_valid_mask,
+            persistent=False,
+        )
+        self.register_buffer("base_camera_mass", normalized_mass, persistent=False)
+        self.raw_beta = nn.Parameter(torch.zeros(()))
+        self.branch_contract_sha256 = contract_sha256(
+            {
+                "kind": self.branch_kind,
+                "action_hidden_dim": self.action_hidden_dim,
+                "camera_ids": list(self.camera_ids),
+                "transport_sha256": transport.transport_sha256,
+                "spatial_transport_contract_sha256": (
+                    spatial_metadata.spatial_transport_contract_sha256
+                ),
+                "camera_mass": normalized_mass.tolist(),
+                "wan_value_source": "video_cache_current_prefix",
+                "output_projection": "frozen_action_self_attn_o_weight_only",
+                "output_bias": False,
+                "reuse_base_gate_msa": True,
+                "shared_spatial_weights_across_heads": True,
+                "beta_max": self.beta_max,
+                "beta_parameterization": "tanh",
+                "zero_init": "raw_beta",
+            }
+        )
+
+    @property
+    def beta(self) -> torch.Tensor:
+        """Return the bounded residual coefficient."""
+
+        return self.beta_max * torch.tanh(self.raw_beta)
+
+    def _transport_routing(
+        self,
+        memory: NativePatchMemory,
+        routing: RoutingWeights,
+    ) -> torch.Tensor:
+        camera_valid = memory.camera_valid_mask
+        prior = self.base_camera_mass.to(device=camera_valid.device)
+        active_mass = prior.unsqueeze(0) * camera_valid.to(dtype=prior.dtype)
+        denominator = active_mass.sum(dim=1, keepdim=True)
+        if bool((denominator <= 0).any().item()):
+            raise ValueError("P6 cannot route a sample with no active camera.")
+        active_mass = active_mass / denominator
+        matrix = self.transport_matrix.to(
+            device=routing.weights.device,
+            dtype=torch.float32,
+        )
+        transported = torch.einsum(
+            "bvan,vnw->bvaw",
+            routing.weights.float(),
+            matrix,
+        )
+        combined = torch.einsum("bv,bvaw->baw", active_mass.float(), transported)
+        if not bool(torch.isfinite(combined).all().item()) or bool(
+            (combined < -1e-7).any().item()
+        ):
+            raise ValueError("P6 transported routing is non-finite or negative.")
+        mass = combined.sum(dim=-1)
+        if not torch.allclose(mass, torch.ones_like(mass), atol=1e-5, rtol=0):
+            raise ValueError("P6 transported routing does not preserve unit mass.")
+        return combined
+
+    def forward_branch(
+        self,
+        context: ActionLayerReadContext,
+        memory: NativePatchMemory,
+        routing: RoutingWeights,
+    ) -> torch.Tensor:
+        if (
+            memory.camera_ids != self.camera_ids
+            or routing.camera_ids != self.camera_ids
+        ):
+            raise ValueError("P6 branch camera order mismatch.")
+        layout = context.video.layout_metadata
+        if not isinstance(layout, WanValueSpatialMetadata):
+            raise TypeError("P6 requires typed WanValueSpatialMetadata at runtime.")
+        if (
+            layout.spatial_transport_contract_sha256
+            != self.spatial_metadata.spatial_transport_contract_sha256
+        ):
+            raise ValueError("Runtime Wan spatial contract differs from P6 transport.")
+        if context.video.current_frame_tokens != layout.current_frame_video_tokens:
+            raise ValueError("Runtime current-frame prefix differs from P6 metadata.")
+        if context.video.value.shape[-1] != layout.video_value_width:
+            raise ValueError("Runtime Wan value width differs from P6 metadata.")
+        if context.base_action_output_weight is None:
+            raise ValueError("P6 requires the frozen action output weight.")
+        output_weight = context.base_action_output_weight
+        if output_weight.requires_grad:
+            raise ValueError("P6 action output weight must be frozen.")
+        expected_weight_shape = (self.action_hidden_dim, layout.video_value_width)
+        if tuple(output_weight.shape) != expected_weight_shape:
+            raise ValueError(
+                "Frozen action output weight shape mismatch: "
+                f"expected {expected_weight_shape}, got {tuple(output_weight.shape)}."
+            )
+        transported = self._transport_routing(memory, routing)
+        current_values = context.video.value[
+            :, : layout.current_frame_video_tokens
+        ].detach()
+        retrieved = torch.einsum(
+            "baw,bwd->bad",
+            transported.to(dtype=current_values.dtype),
+            current_values,
+        )
+        projected = F.linear(retrieved, output_weight.detach(), bias=None)
+        base_gate = context.base_gate_msa.detach().to(
+            device=projected.device,
+            dtype=projected.dtype,
+        )
+        if base_gate.ndim == 2:
+            base_gate = base_gate.unsqueeze(1)
+        if base_gate.shape != (projected.shape[0], 1, projected.shape[-1]):
+            raise ValueError("P6 base gate_msa shape does not match action residual.")
+        return self.beta.to(dtype=projected.dtype) * base_gate * projected
+
+
 class RoutedVisualReader(ActionVisualReader):
     """Run one router per layer and share its weights across value branches."""
 
@@ -454,6 +714,7 @@ class RoutedVisualReader(ActionVisualReader):
         branches: Mapping[int, Sequence[VisualValueBranch]],
         memory_contract_sha256: str,
         reader_kind: str,
+        parameter_family: str = VISUAL_READER_PARAMETER_FAMILY,
     ) -> None:
         super().__init__()
         layer_indices = tuple(sorted(int(index) for index in routers))
@@ -485,6 +746,9 @@ class RoutedVisualReader(ActionVisualReader):
         self.reader_kind = str(reader_kind)
         if not self.reader_kind:
             raise ValueError("Visual reader kind cannot be empty.")
+        self.parameter_family = str(parameter_family).strip()
+        if not self.parameter_family:
+            raise ValueError("Visual reader parameter family cannot be empty.")
         self.reader_contract_sha256 = contract_sha256(
             {
                 "schema": "fastwam-routed-visual-reader-v1",
@@ -568,3 +832,45 @@ def build_dino_semantic_reader(
         memory_contract_sha256=config.memory_contract_sha256,
         reader_kind=DINO_SEMANTIC_READER_KIND,
     )
+
+
+def build_dino_wan_value_reader(
+    config: DinoWanValueReaderConfig,
+) -> RoutedVisualReader:
+    """Build independent P6 routers with frozen-Wan value branches."""
+
+    routers: dict[int, NativeDinoRouter] = {}
+    branches: dict[int, tuple[VisualValueBranch, ...]] = {}
+    for layer_index in config.layer_indices:
+        routers[layer_index] = NativeDinoRouter(
+            action_hidden_dim=config.action_hidden_dim,
+            temperature=config.temperature,
+            projection=config.query_projection,
+            camera_ids=config.camera_ids,
+        )
+        branches[layer_index] = (
+            DinoRoutedWanValueBranch(
+                action_hidden_dim=config.action_hidden_dim,
+                camera_ids=config.camera_ids,
+                transport=config.transport,
+                spatial_metadata=config.spatial_metadata,
+                camera_mass=config.camera_mass,
+                beta_max=config.beta_max,
+            ),
+        )
+    reader = RoutedVisualReader(
+        routers=routers,
+        branches=branches,
+        memory_contract_sha256=config.memory_contract_sha256,
+        reader_kind=DINOV3_ROUTER_WAN_VALUE_READER_KIND,
+        parameter_family=P6_VISUAL_ROUTER_PARAMETER_FAMILY,
+    )
+    expected_hash = contract_sha256(
+        {
+            "reader": reader.reader_contract_sha256,
+            "config": config.contract_payload(),
+        }
+    )
+    # Bind the transport/camera-mass contract at the top-level reader too.
+    reader.reader_contract_sha256 = expected_hash
+    return reader

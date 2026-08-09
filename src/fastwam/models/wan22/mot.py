@@ -620,6 +620,10 @@ class MoT(nn.Module):
                         current_frame_tokens=current_frame_video_tokens,
                         layout_metadata=video_layout_metadata,
                     ),
+                    # Read the frozen base weight directly. Calling the wrapped
+                    # module would add its bias and the active UNCOND LoRA a
+                    # second time, which is not the P6 branch contract.
+                    base_action_output_weight=block.self_attn.o.weight,
                 )
                 visual_residual = visual_reader.forward_layer(
                     visual_context,
