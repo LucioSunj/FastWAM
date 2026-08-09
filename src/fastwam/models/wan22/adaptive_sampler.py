@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any
 
 import torch
 
@@ -76,7 +77,7 @@ def sample_denoise_indices(
     num_steps: int,
     *,
     device: torch.device,
-    generator: Optional[torch.Generator] = None,
+    generator: torch.Generator | None = None,
     ignore_last: bool = False,
 ) -> torch.Tensor:
     """Uniformly select one stochastic denoising transition per sample."""
@@ -106,9 +107,10 @@ def sample_action_flow_sde(
     scheduler_deltas: torch.Tensor,
     num_train_timesteps: int,
     noise_level: float,
-    denoise_indices: Optional[torch.Tensor] = None,
-    generator: Optional[torch.Generator] = None,
+    denoise_indices: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
     gate_last_n: int = 1,
+    ignore_last_transition: bool = False,
     stochastic: bool = True,
     collect_replay: bool = True,
 ) -> ActionFlowRollout:
@@ -125,6 +127,9 @@ def sample_action_flow_sde(
         denoise_indices: Optional selected step per batch item.
         generator: Sampling generator.
         gate_last_n: Number of final velocity-call tap payloads to retain.
+        ignore_last_transition: Exclude the final denoising transition from
+            stochastic-index selection. This preserves a final deterministic
+            ODE step after the single Flow-SDE transition.
         stochastic: If false, run the deterministic ODE and return index ``-1``.
         collect_replay: Retain the full action chain and selected log-probability.
             Evaluation can disable this while still collecting final Gate taps.
@@ -153,9 +158,8 @@ def sample_action_flow_sde(
         timesteps,
         num_train_timesteps=num_train_timesteps,
     ).to(device=device)
-    next_times = (
-        normalized_times
-        + scheduler_deltas.to(device=device, dtype=torch.float32)
+    next_times = normalized_times + scheduler_deltas.to(
+        device=device, dtype=torch.float32
     )
 
     if stochastic:
@@ -165,6 +169,7 @@ def sample_action_flow_sde(
                 num_steps,
                 device=device,
                 generator=generator,
+                ignore_last=ignore_last_transition,
             )
         else:
             denoise_indices = denoise_indices.to(device=device, dtype=torch.long)
@@ -173,7 +178,8 @@ def sample_action_flow_sde(
                 "`denoise_indices` must have shape "
                 f"({batch_size},), got {tuple(denoise_indices.shape)}"
             )
-        if bool(((denoise_indices < 0) | (denoise_indices >= num_steps)).any()):
+        upper = num_steps - int(ignore_last_transition)
+        if bool(((denoise_indices < 0) | (denoise_indices >= upper)).any()):
             raise ValueError("`denoise_indices` contains an out-of-range step.")
     else:
         denoise_indices = torch.full(
@@ -194,9 +200,9 @@ def sample_action_flow_sde(
     for step_idx in range(num_steps):
         time = normalized_times[step_idx].expand(batch_size)
         next_time = next_times[step_idx].expand(batch_size)
-        model_timestep = timesteps[step_idx].to(
-            device=device, dtype=x_t.dtype
-        ).expand(batch_size)
+        model_timestep = (
+            timesteps[step_idx].to(device=device, dtype=x_t.dtype).expand(batch_size)
+        )
         output = _as_velocity_output(velocity_fn(x_t, model_timestep))
         if output.velocity.shape != x_t.shape:
             raise ValueError(
@@ -228,9 +234,7 @@ def sample_action_flow_sde(
                 dtype=x_t.dtype,
             )
             sde_next = mean + noise * std
-            selected_mask = selected.view(
-                batch_size, *([1] * (x_t.ndim - 1))
-            )
+            selected_mask = selected.view(batch_size, *([1] * (x_t.ndim - 1)))
             x_next = torch.where(selected_mask, sde_next, ode_next)
             if selected_log_prob is not None:
                 transition_log_prob = gaussian_log_prob(sde_next, mean, std)
@@ -277,18 +281,14 @@ def replay_action_flow_sde_transition(
     """Reconstruct the selected Gaussian transition under current parameters."""
 
     if chains.ndim < 3:
-        raise ValueError(
-            f"`chains` must have shape [B, S+1, ...], got {chains.shape}"
-        )
+        raise ValueError(f"`chains` must have shape [B, S+1, ...], got {chains.shape}")
     _validate_schedule_precision(timesteps, scheduler_deltas)
     batch_size, chain_steps = chains.shape[:2]
     if chain_steps != timesteps.numel() + 1:
         raise ValueError(
             f"Chain has {chain_steps} states for {timesteps.numel()} transitions."
         )
-    denoise_indices = denoise_indices.to(
-        device=chains.device, dtype=torch.long
-    )
+    denoise_indices = denoise_indices.to(device=chains.device, dtype=torch.long)
     if denoise_indices.shape != (batch_size,):
         raise ValueError(
             f"`denoise_indices` must have shape ({batch_size},), "
