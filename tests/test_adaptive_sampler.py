@@ -186,6 +186,37 @@ def test_uniform_index_sampler_respects_ignore_last():
     assert int(indices.max()) <= 2
 
 
+def test_flow_sde_sampler_excludes_final_transition_when_requested():
+    _, timesteps, deltas = _schedule(num_steps=4)
+    initial = torch.zeros(128, 2, 3)
+
+    rollout = sample_action_flow_sde(
+        initial,
+        velocity_fn=lambda action, _timestep: torch.zeros_like(action),
+        timesteps=timesteps,
+        scheduler_deltas=deltas,
+        num_train_timesteps=1000,
+        noise_level=0.5,
+        generator=torch.Generator().manual_seed(42),
+        ignore_last_transition=True,
+    )
+
+    assert int(rollout.denoise_indices.min()) >= 0
+    assert int(rollout.denoise_indices.max()) <= 2
+
+    with pytest.raises(ValueError, match="out-of-range"):
+        sample_action_flow_sde(
+            initial[:1],
+            velocity_fn=lambda action, _timestep: torch.zeros_like(action),
+            timesteps=timesteps,
+            scheduler_deltas=deltas,
+            num_train_timesteps=1000,
+            noise_level=0.5,
+            denoise_indices=torch.tensor([3]),
+            ignore_last_transition=True,
+        )
+
+
 def test_bad_chain_shape_is_rejected():
     _, timesteps, deltas = _schedule()
     chains = torch.zeros(2, 4, 3, 4)
