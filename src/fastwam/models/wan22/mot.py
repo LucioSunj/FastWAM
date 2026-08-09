@@ -24,6 +24,11 @@ from .visual_contracts import (
     LayerVideoKVView,
     NativePatchMemory,
 )
+from .wan_current_refiner import (
+    ActionVideoKVView,
+    WanCurrentLayerSource,
+    WanCurrentSourceCaptureRequest,
+)
 from .wan_video_dit import flash_attention, modulate, rope_apply
 
 logger = get_logger(__name__)
@@ -38,6 +43,7 @@ class ExpertAttentionIO(NamedTuple):
     """Compile-friendly expert attention inputs and post-block state."""
 
     query: torch.Tensor
+    key_pre_norm: torch.Tensor
     key: torch.Tensor
     value: torch.Tensor
     modulated_input: torch.Tensor
@@ -260,7 +266,8 @@ class MoT(nn.Module):
         attn_input = modulate(block.norm1(x), shift_msa, scale_msa)
 
         q = block.self_attn.norm_q(block.self_attn.q(attn_input))
-        k = block.self_attn.norm_k(block.self_attn.k(attn_input))
+        key_pre_norm = block.self_attn.k(attn_input)
+        k = block.self_attn.norm_k(key_pre_norm)
         v = block.self_attn.v(attn_input)
 
         q = rope_apply(q, freqs, block.num_heads)
@@ -271,6 +278,7 @@ class MoT(nn.Module):
         )
         return ExpertAttentionIO(
             query=q,
+            key_pre_norm=key_pre_norm,
             key=k,
             value=v,
             modulated_input=attn_input,
@@ -369,6 +377,7 @@ class MoT(nn.Module):
         video_context_payload: dict | None,
         video_attention_mask: torch.Tensor,
         gate_current_frame_video_tokens: int | None = None,
+        wan_current_source_capture: WanCurrentSourceCaptureRequest | None = None,
     ) -> list[dict[str, Any]]:
         """Prefill video branch once and cache per-layer K/V for action denoising.
 
@@ -382,6 +391,9 @@ class MoT(nn.Module):
             video_attention_mask: Video self-attention mask, shape [Sv, Sv].
             gate_current_frame_video_tokens: If provided, validate and record
                 the causal current-frame prefix required by later Gate taps.
+            wan_current_source_capture: Optional P8-A0 request. This is accepted
+                only for a current-only prefill and captures detached selected
+                layer sources without changing the frozen Wan trajectory.
 
         Returns:
             Layer-wise cache list with length `num_layers`.
@@ -416,6 +428,11 @@ class MoT(nn.Module):
                 current_frame_video_tokens=current_len,
                 video_seq_len=int(video_tokens.shape[1]),
             )
+        if wan_current_source_capture is not None:
+            wan_current_source_capture.validate(
+                num_layers=self.num_layers,
+                video_tokens=video_tokens,
+            )
 
         expert = self.mixtures["video"]
         x = video_tokens
@@ -431,6 +448,35 @@ class MoT(nn.Module):
                 freqs=video_freqs,
                 t_mod=video_t_mod,
             )
+            if (
+                wan_current_source_capture is not None
+                and wan_current_source_capture.should_capture(layer_idx)
+            ):
+                current = wan_current_source_capture.current_frame_video_tokens
+                wan_current_source_capture.collector.append(
+                    WanCurrentLayerSource(
+                        layer_index=layer_idx,
+                        hidden_current=attention_io.residual_input[
+                            :, :current
+                        ].detach(),
+                        attention_input_current=(
+                            attention_io.modulated_input[:, :current].detach()
+                        ),
+                        key_pre_norm_current=(
+                            attention_io.key_pre_norm[:, :current].detach()
+                        ),
+                        base_key_current=attention_io.key[:, :current].detach(),
+                        base_value_current=attention_io.value[:, :current].detach(),
+                        rope_freqs_current=video_freqs[:current].detach(),
+                        camera_index_current=(
+                            wan_current_source_capture.camera_index_current.detach()
+                        ),
+                        current_frame_video_tokens=current,
+                        source_contract_sha256=(
+                            wan_current_source_capture.source_contract_sha256
+                        ),
+                    )
+                )
             # Video prefill uses only video self-attention mask.
             mixed = self._mixed_attention(
                 q_cat=attention_io.query,
@@ -520,8 +566,10 @@ class MoT(nn.Module):
         action_freqs: torch.Tensor,
         action_t_mod: torch.Tensor,
         action_context_payload: dict | None,
-        video_cache_k: list[torch.Tensor],
-        video_cache_v: list[torch.Tensor],
+        base_video_cache_k: list[torch.Tensor],
+        base_video_cache_v: list[torch.Tensor],
+        action_video_cache_k: list[torch.Tensor],
+        action_video_cache_v: list[torch.Tensor],
         action_attention_mask: torch.Tensor,
         kv_tap: GateKVTapRequest | None = None,
         checkpoint_context_fn: CheckpointContextFn | None = None,
@@ -545,8 +593,10 @@ class MoT(nn.Module):
             action_freqs: Action RoPE frequencies, shape [Sa, 1, rope_dim].
             action_t_mod: Action time modulation tensor.
             action_context_payload: Optional dict for action cross-attention.
-            video_cache_k: Per-layer cached video keys, length num_layers.
-            video_cache_v: Per-layer cached video values, length num_layers.
+            base_video_cache_k: Immutable per-layer base keys used by Gate taps.
+            base_video_cache_v: Immutable per-layer base values used by Gate taps.
+            action_video_cache_k: Per-layer action-facing keys, optionally shadowed.
+            action_video_cache_v: Per-layer action-facing values, optionally shadowed.
             action_attention_mask: Pre-sliced action rows of the joint mask,
                 shape [Sa, Sv+Sa].
             checkpoint_context_fn: Optional contexts for checkpoint forward and
@@ -566,23 +616,25 @@ class MoT(nn.Module):
                 freqs=action_freqs,
                 t_mod=action_t_mod,
             )
-            k_video = video_cache_k[layer_idx]
-            v_video = video_cache_v[layer_idx]
+            base_k_video = base_video_cache_k[layer_idx]
+            base_v_video = base_video_cache_v[layer_idx]
+            action_k_video = action_video_cache_k[layer_idx]
+            action_v_video = action_video_cache_v[layer_idx]
 
             if kv_tap is not None and kv_tap.should_capture(layer_idx, self.num_layers):
                 self._capture_gate_layer_kv(
                     kv_tap=kv_tap,
                     layer_idx=layer_idx,
-                    video_k=k_video,
-                    video_v=v_video,
+                    video_k=base_k_video,
+                    video_v=base_v_video,
                     action_k=attention_io.key,
                     action_v=attention_io.value,
                     action_block=block,
                     action_context_payload=action_context_payload,
                 )
 
-            k_cat = torch.cat([k_video, attention_io.key], dim=1)
-            v_cat = torch.cat([v_video, attention_io.value], dim=1)
+            k_cat = torch.cat([action_k_video, attention_io.key], dim=1)
+            v_cat = torch.cat([action_v_video, attention_io.value], dim=1)
             mixed = self._mixed_attention(
                 q_cat=attention_io.query,
                 k_cat=k_cat,
@@ -615,8 +667,8 @@ class MoT(nn.Module):
                     timestep_embedding=action_time_embedding,
                     proprio=visual_proprio,
                     video=LayerVideoKVView(
-                        key=k_video,
-                        value=v_video,
+                        key=action_k_video,
+                        value=action_v_video,
                         current_frame_tokens=current_frame_video_tokens,
                         layout_metadata=video_layout_metadata,
                     ),
@@ -718,6 +770,7 @@ class MoT(nn.Module):
         action_time_embedding: torch.Tensor | None = None,
         current_frame_video_tokens: int | None = None,
         video_layout_metadata: Mapping[str, Any] | None = None,
+        action_video_kv_view: ActionVideoKVView | None = None,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -735,6 +788,8 @@ class MoT(nn.Module):
                 recomputation.
             visual_reader: Optional independently owned action visual reader.
             visual_memory: Frozen native memory reused across denoising steps.
+            action_video_kv_view: Optional P8 action-only shadow view. Gate
+                direct-video capture always continues to read `video_kv_cache`.
 
         Returns:
             Updated action tokens after all layers, shape [B, Sa, D].
@@ -747,6 +802,20 @@ class MoT(nn.Module):
             raise ValueError(
                 f"`video_kv_cache` must contain {self.num_layers} layers, got {len(video_kv_cache)}."
             )
+        if action_video_kv_view is not None:
+            if not isinstance(action_video_kv_view, ActionVideoKVView):
+                raise TypeError("`action_video_kv_view` must be an ActionVideoKVView.")
+            if action_video_kv_view.base_video_kv_cache is not video_kv_cache:
+                raise ValueError(
+                    "Action video view must reference this exact base cache object."
+                )
+            if (
+                kv_tap is not None
+                and action_video_kv_view.actor_version != kv_tap.actor_version
+            ):
+                raise ValueError(
+                    "Action video view and Gate tap actor versions differ."
+                )
         if attention_mask.ndim != 2:
             raise ValueError(
                 f"`attention_mask` must be 2D [S,S], got shape {tuple(attention_mask.shape)}"
@@ -829,16 +898,27 @@ class MoT(nn.Module):
         ]
 
         # Extract flat lists for compile-friendly inner method
-        video_cache_k = [layer_cache["k"] for layer_cache in video_kv_cache]
-        video_cache_v = [layer_cache["v"] for layer_cache in video_kv_cache]
+        base_video_cache_k = [layer_cache["k"] for layer_cache in video_kv_cache]
+        base_video_cache_v = [layer_cache["v"] for layer_cache in video_kv_cache]
+        if action_video_kv_view is None:
+            action_video_cache_k = base_video_cache_k
+            action_video_cache_v = base_video_cache_v
+        else:
+            action_layers = [
+                action_video_kv_view.layer(index) for index in range(self.num_layers)
+            ]
+            action_video_cache_k = [layer[0] for layer in action_layers]
+            action_video_cache_v = [layer[1] for layer in action_layers]
 
         return self._forward_action_with_video_cache_inner(
             action_tokens=action_tokens,
             action_freqs=action_freqs,
             action_t_mod=action_t_mod,
             action_context_payload=action_context_payload,
-            video_cache_k=video_cache_k,
-            video_cache_v=video_cache_v,
+            base_video_cache_k=base_video_cache_k,
+            base_video_cache_v=base_video_cache_v,
+            action_video_cache_k=action_video_cache_k,
+            action_video_cache_v=action_video_cache_v,
             action_attention_mask=action_attention_mask,
             kv_tap=kv_tap,
             checkpoint_context_fn=checkpoint_context_fn,

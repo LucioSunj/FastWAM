@@ -1,7 +1,9 @@
 import logging
 import os
-import inspect
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 from hydra.utils import instantiate
@@ -17,6 +19,142 @@ from .utils.video_io import save_mp4
 from .utils import misc
 
 logger = get_logger(__name__)
+
+WAN_CURRENT_REFINEMENT_SIDECAR_TYPE = "dinov3_guided_wan_current_refinement"
+
+
+@dataclass(frozen=True)
+class WanCurrentRefinementSidecarBuild:
+    """Resolved FastWAM-owned components for the P8-A0/KV sidecar."""
+
+    encoder: Any
+    refiner: Any
+    camera_ids: tuple[str, ...]
+    camera_input_contract_sha256: str
+    license_record_sha256: str
+
+
+def _p8_runtime_mapping(value: Any, *, name: str) -> dict[str, Any]:
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=False)
+    if not isinstance(value, Mapping):
+        raise TypeError(f"P8 `{name}` must resolve to a mapping.")
+    return dict(value)
+
+
+def validate_wan_current_refinement_config(config: Any) -> dict[str, Any]:
+    """Validate FastWAM's default-off P8 construction contract without I/O.
+
+    Disabled validation deliberately returns before resolving or accessing any
+    DINO asset placeholder and never constructs an encoder or refiner. Enabled
+    construction is eager-only and accepts no missing or unknown fields.
+    """
+
+    payload = _p8_runtime_mapping(config or {"enabled": False}, name="sidecar")
+    enabled = payload.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise TypeError("P8 `enabled` must be a boolean.")
+    sidecar_type = str(payload.get("type", WAN_CURRENT_REFINEMENT_SIDECAR_TYPE))
+    if sidecar_type != WAN_CURRENT_REFINEMENT_SIDECAR_TYPE:
+        raise ValueError(f"Unsupported P8 sidecar type {sidecar_type!r}.")
+    if not enabled:
+        return {"enabled": False, "type": sidecar_type}
+
+    required = {
+        "type",
+        "enabled",
+        "compile",
+        "enabled_regimes",
+        "dino",
+        "refiner",
+        "camera_ids",
+        "camera_input_contract_sha256",
+        "license_record_sha256",
+    }
+    if set(payload) != required:
+        raise ValueError(
+            "Invalid enabled FastWAM P8 sidecar fields; "
+            f"missing={sorted(required - set(payload))}, "
+            f"unknown={sorted(set(payload) - required)}."
+        )
+    if payload["compile"] is not False:
+        raise ValueError(
+            "P8-A0/KV compiled execution is not implemented; set `compile: false`."
+        )
+    regimes = tuple(str(item).lower() for item in payload["enabled_regimes"])
+    if regimes != ("uncond",):
+        raise ValueError("P8-A0/KV must be enabled only for the UNCOND route.")
+    camera_ids = tuple(str(item) for item in payload["camera_ids"])
+    if not camera_ids or len(set(camera_ids)) != len(camera_ids):
+        raise ValueError("P8 camera IDs must be non-empty and unique.")
+
+    # DINO asset parsing is intentionally below the disabled/compile fail-closed
+    # exits, so the existing preset never resolves, accesses, or loads assets.
+    from .models.wan22.dinov3_memory import DinoV3AssetSpec
+    from .models.wan22.visual_contracts import validate_sha256
+    from .models.wan22.wan_current_refiner import WanCurrentRefinerConfig
+
+    for name in ("camera_input_contract_sha256", "license_record_sha256"):
+        payload[name] = validate_sha256(payload[name], label=f"P8 {name}")
+    dino = _p8_runtime_mapping(payload["dino"], name="dino")
+    if "license_record_sha256" in dino:
+        raise ValueError("P8 DINO license hash belongs at sidecar scope only.")
+    DinoV3AssetSpec.from_mapping(dino)
+    refiner = _p8_runtime_mapping(payload["refiner"], name="refiner")
+    refiner["layer_indices"] = tuple(refiner.get("layer_indices", ()))
+    WanCurrentRefinerConfig.from_mapping(refiner)
+    payload["camera_ids"] = camera_ids
+    payload["enabled_regimes"] = regimes
+    payload["dino"] = dino
+    payload["refiner"] = refiner
+    return payload
+
+
+def create_wan_current_refinement_sidecar(
+    config: Any,
+    *,
+    actor: Any,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> WanCurrentRefinementSidecarBuild | None:
+    """Construct the hash-bound P8 encoder/refiner or return exact disabled None."""
+
+    payload = validate_wan_current_refinement_config(config)
+    if not payload["enabled"]:
+        return None
+
+    from .models.wan22.dinov3_memory import (
+        DinoV3AssetSpec,
+        FrozenDinoV3Encoder,
+        native_memory_contract_sha256,
+    )
+    from .models.wan22.wan_current_refiner import (
+        WanCurrentKVRefiner,
+        WanCurrentRefinerConfig,
+    )
+
+    asset = DinoV3AssetSpec.from_mapping(payload["dino"])
+    refiner_config = WanCurrentRefinerConfig.from_mapping(payload["refiner"])
+    if refiner_config.wan_hidden_dim != int(actor.video_expert.hidden_dim):
+        raise ValueError("P8 refiner Wan width differs from the constructed actor.")
+    if refiner_config.layer_indices[-1] >= int(actor.mot.num_layers):
+        raise ValueError("P8 selected layer lies outside the constructed actor.")
+    expected_memory_hash = native_memory_contract_sha256(
+        asset,
+        camera_ids=payload["camera_ids"],
+        input_contract_sha256=payload["camera_input_contract_sha256"],
+    )
+    if refiner_config.memory_contract_sha256 != expected_memory_hash:
+        raise ValueError("P8 refiner is not bound to its DINO/camera input contract.")
+    encoder = FrozenDinoV3Encoder.from_local_asset(asset, device=device)
+    refiner = WanCurrentKVRefiner(refiner_config).to(device=device, dtype=dtype)
+    return WanCurrentRefinementSidecarBuild(
+        encoder=encoder,
+        refiner=refiner,
+        camera_ids=payload["camera_ids"],
+        camera_input_contract_sha256=payload["camera_input_contract_sha256"],
+        license_record_sha256=payload["license_record_sha256"],
+    )
 
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
@@ -96,29 +234,41 @@ def create_fastwam(
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
     if not isinstance(video_dit_config, dict):
-        raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
+        raise ValueError(
+            f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}"
+        )
 
     if isinstance(action_dit_config, DictConfig):
         action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
     if action_dit_config is None:
         action_dit_config = {}
     if not isinstance(action_dit_config, dict):
-        raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+        raise ValueError(
+            f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}"
+        )
 
     if isinstance(video_scheduler, DictConfig):
         video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
     if video_scheduler is None:
         video_scheduler = {}
     if not isinstance(video_scheduler, dict):
-        raise ValueError(f"`video_scheduler` must be dict-like, got {type(video_scheduler)}")
+        raise ValueError(
+            f"`video_scheduler` must be dict-like, got {type(video_scheduler)}"
+        )
 
     if isinstance(action_scheduler, DictConfig):
         action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
     if action_scheduler is None:
         raise ValueError("`action_scheduler` is required for FastWAM.")
     if not isinstance(action_scheduler, dict):
-        raise ValueError(f"`action_scheduler` must be dict-like, got {type(action_scheduler)}")
-    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
+        raise ValueError(
+            f"`action_scheduler` must be dict-like, got {type(action_scheduler)}"
+        )
+    required_action_scheduler_keys = {
+        "train_shift",
+        "infer_shift",
+        "num_train_timesteps",
+    }
     missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
     if missing_keys:
         raise ValueError(
@@ -181,29 +331,41 @@ def create_fastwam_joint(
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
     if not isinstance(video_dit_config, dict):
-        raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
+        raise ValueError(
+            f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}"
+        )
 
     if isinstance(action_dit_config, DictConfig):
         action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
     if action_dit_config is None:
         action_dit_config = {}
     if not isinstance(action_dit_config, dict):
-        raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+        raise ValueError(
+            f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}"
+        )
 
     if isinstance(video_scheduler, DictConfig):
         video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
     if video_scheduler is None:
         video_scheduler = {}
     if not isinstance(video_scheduler, dict):
-        raise ValueError(f"`video_scheduler` must be dict-like, got {type(video_scheduler)}")
+        raise ValueError(
+            f"`video_scheduler` must be dict-like, got {type(video_scheduler)}"
+        )
 
     if isinstance(action_scheduler, DictConfig):
         action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
     if action_scheduler is None:
         raise ValueError("`action_scheduler` is required for FastWAM.")
     if not isinstance(action_scheduler, dict):
-        raise ValueError(f"`action_scheduler` must be dict-like, got {type(action_scheduler)}")
-    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
+        raise ValueError(
+            f"`action_scheduler` must be dict-like, got {type(action_scheduler)}"
+        )
+    required_action_scheduler_keys = {
+        "train_shift",
+        "infer_shift",
+        "num_train_timesteps",
+    }
     missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
     if missing_keys:
         raise ValueError(
@@ -268,29 +430,41 @@ def create_fastwam_idm(
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
     if not isinstance(video_dit_config, dict):
-        raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
+        raise ValueError(
+            f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}"
+        )
 
     if isinstance(action_dit_config, DictConfig):
         action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
     if action_dit_config is None:
         action_dit_config = {}
     if not isinstance(action_dit_config, dict):
-        raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+        raise ValueError(
+            f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}"
+        )
 
     if isinstance(video_scheduler, DictConfig):
         video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
     if video_scheduler is None:
         video_scheduler = {}
     if not isinstance(video_scheduler, dict):
-        raise ValueError(f"`video_scheduler` must be dict-like, got {type(video_scheduler)}")
+        raise ValueError(
+            f"`video_scheduler` must be dict-like, got {type(video_scheduler)}"
+        )
 
     if isinstance(action_scheduler, DictConfig):
         action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
     if action_scheduler is None:
         raise ValueError("`action_scheduler` is required for FastWAM.")
     if not isinstance(action_scheduler, dict):
-        raise ValueError(f"`action_scheduler` must be dict-like, got {type(action_scheduler)}")
-    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
+        raise ValueError(
+            f"`action_scheduler` must be dict-like, got {type(action_scheduler)}"
+        )
+    required_action_scheduler_keys = {
+        "train_shift",
+        "infer_shift",
+        "num_train_timesteps",
+    }
     missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
     if missing_keys:
         raise ValueError(
@@ -339,7 +513,9 @@ def build_datasets(data_cfg: DictConfig):
         default_stats_path = os.path.join(misc.get_work_dir(), "dataset_stats.json")
         val_stats_path = data_cfg.val.get("pretrained_norm_stats")
         pretrained_norm_stats = val_stats_path or train_stats_path or default_stats_path
-        logger.info("Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats)
+        logger.info(
+            "Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats
+        )
         val_ds = instantiate(data_cfg.val, pretrained_norm_stats=pretrained_norm_stats)
     return train_ds, val_ds
 
@@ -359,11 +535,15 @@ def _resolve_train_device() -> str:
 def run_training(cfg: DictConfig):
     setup_logging(
         log_level=logging.INFO,
-        is_main_process=torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True,
+        is_main_process=torch.distributed.get_rank() == 0
+        if torch.distributed.is_initialized()
+        else True,
     )
     if os.getenv("FASTWAM_CUDNN_BENCHMARK", "0").lower() in ("1", "true"):
         torch.backends.cudnn.benchmark = True
-        logger.info("FASTWAM_CUDNN_BENCHMARK=1 -> torch.backends.cudnn.benchmark=True (auto-tune cudnn algos per shape)")
+        logger.info(
+            "FASTWAM_CUDNN_BENCHMARK=1 -> torch.backends.cudnn.benchmark=True (auto-tune cudnn algos per shape)"
+        )
     misc.register_work_dir(cfg.output_dir)
     config_payload = OmegaConf.to_container(cfg, resolve=True)
     with open(Path(cfg.output_dir) / "config.yaml", "w") as f:
@@ -383,13 +563,16 @@ def run_training(cfg: DictConfig):
     )
     trainer.train()
 
+
 def run_inference(cfg: DictConfig):
     setup_logging(log_level=logging.INFO)
     inference_cfg = cfg.inference
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
 
-    model = instantiate(cfg.model, model_dtype=model_dtype, device=str(inference_cfg.device))
+    model = instantiate(
+        cfg.model, model_dtype=model_dtype, device=str(inference_cfg.device)
+    )
     checkpoint_path = inference_cfg.get("checkpoint_path")
     if checkpoint_path:
         ckpt = Path(checkpoint_path)
@@ -399,18 +582,22 @@ def run_inference(cfg: DictConfig):
         else:
             logger.warning("Checkpoint not found, skipping load: %s", checkpoint_path)
     model.eval()
-    
+
     def center_crop_resize(img: Image, width: int, height: int) -> Image.Image:
         src_w, src_h = img.size
         scale = max(width / src_w, height / src_h)
-        resized = img.resize((round(src_w * scale), round(src_h * scale)), resample=Image.BILINEAR)
+        resized = img.resize(
+            (round(src_w * scale), round(src_h * scale)), resample=Image.BILINEAR
+        )
         rw, rh = resized.size
         left = max((rw - width) // 2, 0)
         top = max((rh - height) // 2, 0)
         return resized.crop((left, top, left + width, top + height))
 
     input_image = Image.open(str(inference_cfg.input_image_path)).convert("RGB")
-    input_image = center_crop_resize(input_image, width=inference_cfg.width, height=inference_cfg.height)
+    input_image = center_crop_resize(
+        input_image, width=inference_cfg.width, height=inference_cfg.height
+    )
     arr = np.array(input_image, dtype=np.float32)
     x = torch.from_numpy(arr)
     x = x.to(device=model.device, dtype=model.torch_dtype)
@@ -426,7 +613,9 @@ def run_inference(cfg: DictConfig):
         "input_image": x,
         "num_frames": int(inference_cfg.num_frames),
         "num_inference_steps": int(inference_cfg.num_inference_steps),
-        "sigma_shift": None if inference_cfg.get("sigma_shift") is None else float(inference_cfg.sigma_shift),
+        "sigma_shift": None
+        if inference_cfg.get("sigma_shift") is None
+        else float(inference_cfg.sigma_shift),
         "seed": int(inference_cfg.seed),
         "rand_device": str(inference_cfg.rand_device),
         "tiled": bool(inference_cfg.tiled),

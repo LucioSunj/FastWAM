@@ -15,6 +15,7 @@ from fastwam.adapters import PolicyRegime, RegimeContext, RegimeLoRALinear
 from .adaptive_sampler import VelocityOutput
 from .kv_tap import GateKVSnapshot, GateKVTapRequest
 from .visual_contracts import ActionVisualReader, NativePatchMemory
+from .wan_current_refiner import ActionVideoKVView
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class CachedActionCondition:
     video_seq_len: int
     current_frame_video_tokens: int
     visual: VisualReadCondition | None = None
+    action_video_kv_view: ActionVideoKVView | None = None
 
     def __post_init__(self) -> None:
         if self.video_seq_len < 1:
@@ -67,6 +69,15 @@ class CachedActionCondition:
                 raise TypeError("`visual` must be a VisualReadCondition instance.")
             if self.visual.memory.tokens.shape[0] != self.context.shape[0]:
                 raise ValueError("Visual and text/state context batch sizes differ.")
+        if self.action_video_kv_view is not None:
+            if not isinstance(self.action_video_kv_view, ActionVideoKVView):
+                raise TypeError(
+                    "`action_video_kv_view` must be an ActionVideoKVView instance."
+                )
+            if self.action_video_kv_view.base_video_kv_cache is not self.video_kv_cache:
+                raise ValueError(
+                    "Action video view must reference the condition's exact base cache."
+                )
 
 
 class CachedActionVelocity:
@@ -111,6 +122,19 @@ class CachedActionVelocity:
             )
         if self.regime is PolicyRegime.IDM and self.visual_reader is not None:
             raise ValueError("IDM action velocity must bypass the visual sidecar.")
+        if (
+            self.regime is PolicyRegime.IDM
+            and self.condition.action_video_kv_view is not None
+            and self.condition.action_video_kv_view.shadows
+        ):
+            raise ValueError("IDM action velocity must reject P8 action shadows.")
+        if (
+            self.condition.action_video_kv_view is not None
+            and self.condition.action_video_kv_view.actor_version != self.actor_version
+        ):
+            raise ValueError(
+                "P8 action view and action velocity actor versions differ."
+            )
         if self.visual_reader is not None and not isinstance(
             self.visual_reader, ActionVisualReader
         ):
@@ -204,6 +228,8 @@ class CachedActionVelocity:
                 "kv_tap": tap_request,
                 "checkpoint_context_fn": self._checkpoint_regime_contexts,
             }
+            if self.condition.action_video_kv_view is not None:
+                mot_kwargs["action_video_kv_view"] = self.condition.action_video_kv_view
             if visual is not None:
                 mot_kwargs.update(
                     visual_reader=self.visual_reader,
