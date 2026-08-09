@@ -27,6 +27,7 @@ from fastwam.models.wan22.visual_contracts import (
     PreparedCameraBatch,
     RoutingWeights,
     contract_sha256,
+    native_patch_layout_contract,
 )
 from fastwam.models.wan22.visual_sidecar import (
     DINO_SEMANTIC_READER_KIND,
@@ -188,11 +189,49 @@ def test_frozen_encoder_routes_before_preprocess_and_scatter_valid_views() -> No
     assert torch.count_nonzero(memory.tokens[0, 1]) == 0
     assert memory.camera_ids == cameras.camera_ids
     assert not memory.tokens.requires_grad
+    assert not memory.tokens.is_inference()
     assert all(not parameter.requires_grad for parameter in encoder.parameters())
     assert memory.memory_contract_sha256 == native_memory_contract_sha256(
         encoder.asset,
         camera_ids=cameras.camera_ids,
         input_contract_sha256=cameras.input_contract_sha256,
+    )
+
+    probe = nn.Linear(DINO_V3_NATIVE_DIM, 1, bias=False)
+    probe(memory.tokens).sum().backward()
+    assert probe.weight.grad is not None
+    assert torch.count_nonzero(probe.weight.grad) > 0
+
+
+def test_native_memory_hash_binds_camera_layout_and_crop_orientation() -> None:
+    asset = _asset()
+    input_hash = _hash("camera-crop-orientation")
+    expected_layout = {
+        "patch_grid": [14, 14],
+        "flatten_order": "row_major",
+        "origin": "top_left",
+        "x_direction": "right",
+        "y_direction": "down",
+        "coordinate": "normalized_patch_center",
+        "camera_order": ["main", "wrist"],
+    }
+
+    assert native_patch_layout_contract(("main", "wrist")) == expected_layout
+    assert _memory().layout_contract == expected_layout
+    reference = native_memory_contract_sha256(
+        asset,
+        camera_ids=("main", "wrist"),
+        input_contract_sha256=input_hash,
+    )
+    assert reference != native_memory_contract_sha256(
+        asset,
+        camera_ids=("wrist", "main"),
+        input_contract_sha256=input_hash,
+    )
+    assert reference != native_memory_contract_sha256(
+        asset,
+        camera_ids=("main", "wrist"),
+        input_contract_sha256=_hash("different-crop-orientation"),
     )
 
 
@@ -414,3 +453,13 @@ def test_real_dinov3_native_output_contract() -> None:
     encoder = FrozenDinoV3Encoder.from_local_asset(asset, device="cpu")
     memory = encoder.encode(_camera_batch())
     assert memory.tokens.shape == (2, 2, 196, 384)
+    assert not memory.tokens.is_inference()
+    assert torch.isfinite(memory.tokens).all()
+    assert torch.count_nonzero(memory.tokens[memory.patch_valid_mask]) > 0
+    assert torch.count_nonzero(memory.tokens[~memory.patch_valid_mask]) == 0
+
+    probe = nn.Linear(DINO_V3_NATIVE_DIM, 1, bias=False)
+    probe(memory.tokens).sum().backward()
+    assert probe.weight.grad is not None
+    assert torch.isfinite(probe.weight.grad).all()
+    assert torch.count_nonzero(probe.weight.grad) > 0

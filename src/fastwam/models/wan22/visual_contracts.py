@@ -17,6 +17,11 @@ DINO_V3_INPUT_SIZE = 224
 DINO_V3_PATCH_GRID = (14, 14)
 DINO_V3_PATCH_COUNT = 196
 DINO_V3_NATIVE_DIM = 384
+DINO_V3_FLATTEN_ORDER = "row_major"
+DINO_V3_GRID_ORIGIN = "top_left"
+DINO_V3_X_DIRECTION = "right"
+DINO_V3_Y_DIRECTION = "down"
+DINO_V3_COORDINATE_CONTRACT = "normalized_patch_center"
 VISUAL_READER_STATE_SCHEMA = "fastwam-action-visual-reader-v1"
 VISUAL_READER_PARAMETER_FAMILY = "uncond_visual_reader"
 
@@ -42,6 +47,27 @@ def contract_sha256(payload: Mapping[str, Any]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def native_patch_layout_contract(
+    camera_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    """Return the immutable layout semantics for native DINOv3 patches."""
+
+    ordered_cameras = tuple(str(camera_id) for camera_id in camera_ids)
+    if not ordered_cameras or any(not camera_id for camera_id in ordered_cameras):
+        raise ValueError("Native patch layout requires non-empty camera IDs.")
+    if len(set(ordered_cameras)) != len(ordered_cameras):
+        raise ValueError("Native patch layout camera IDs must be unique and ordered.")
+    return {
+        "patch_grid": list(DINO_V3_PATCH_GRID),
+        "flatten_order": DINO_V3_FLATTEN_ORDER,
+        "origin": DINO_V3_GRID_ORIGIN,
+        "x_direction": DINO_V3_X_DIRECTION,
+        "y_direction": DINO_V3_Y_DIRECTION,
+        "coordinate": DINO_V3_COORDINATE_CONTRACT,
+        "camera_order": list(ordered_cameras),
+    }
 
 
 @dataclass(frozen=True)
@@ -141,6 +167,10 @@ class NativePatchMemory:
             raise ValueError("Every native-memory sample needs one valid camera.")
         if self.tokens.requires_grad:
             raise ValueError("Native DINOv3 memory must be detached from autograd.")
+        if self.tokens.is_inference():
+            raise ValueError(
+                "Native DINOv3 memory must be materialized as an ordinary tensor."
+            )
         valid_tokens = self.tokens[self.patch_valid_mask]
         if not bool(torch.isfinite(valid_tokens).all().item()):
             raise ValueError("Native DINOv3 memory contains non-finite values.")
@@ -167,6 +197,12 @@ class NativePatchMemory:
                 field_name,
                 validate_sha256(getattr(self, field_name), label=label),
             )
+
+    @property
+    def layout_contract(self) -> dict[str, Any]:
+        """Return the patch/camera layout bound into the memory hash."""
+
+        return native_patch_layout_contract(self.camera_ids)
 
 
 @dataclass(frozen=True)

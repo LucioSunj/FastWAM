@@ -23,7 +23,12 @@ from fastwam.models.wan22.dinov3_memory import (
     FrozenDinoV3Encoder,
     native_memory_contract_sha256,
 )
-from fastwam.models.wan22.visual_contracts import NativePatchMemory
+from fastwam.models.wan22.visual_contracts import (
+    DINO_V3_NATIVE_DIM,
+    DINO_V3_PATCH_COUNT,
+    NativePatchMemory,
+    PreparedCameraBatch,
+)
 from fastwam.models.wan22.wan_current_refiner import (
     ActionVideoKVView,
     WanCurrentKVRefiner,
@@ -73,6 +78,24 @@ class _TinyAction(_TinyExpert):
 
     def post_dit(self, tokens, _pre):
         return tokens
+
+
+class _TinyDino(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = nn.Parameter(torch.ones(()))
+
+    def forward_features(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        basis = torch.linspace(
+            0.25,
+            1.25,
+            DINO_V3_NATIVE_DIM,
+            dtype=images.dtype,
+            device=images.device,
+        )
+        signal = images.mean(dim=(1, 2, 3))[:, None, None]
+        tokens = basis[None, None].expand(images.shape[0], DINO_V3_PATCH_COUNT, -1)
+        return {"x_norm_patchtokens": tokens + signal}
 
 
 def _freqs(tokens: int) -> torch.Tensor:
@@ -316,6 +339,66 @@ def test_disabled_alias_and_active_zero_are_eager_exact_with_live_gradient() -> 
     assert all(gradient is not None for gradient in up_gradients)
     assert all(torch.count_nonzero(gradient) > 0 for gradient in up_gradients)
     assert all(parameter.grad is None for parameter in mot.parameters())
+
+
+def test_p8_encoder_memory_leaves_inference_mode_for_live_refiner_gradient() -> None:
+    camera_batch = PreparedCameraBatch(
+        pixels=torch.full((2, 2, 3, 224, 224), 127, dtype=torch.uint8),
+        camera_ids=("main", "wrist"),
+        camera_valid_mask=torch.ones(2, 2, dtype=torch.bool),
+        input_contract_sha256=_hash("camera-input"),
+    )
+    asset = DinoV3AssetSpec(
+        source_root="/unused/dinov3",
+        source_revision=PINNED_DINOV3_SOURCE_REVISION,
+        model_name=PINNED_DINOV3_MODEL_NAME,
+        weights_path="/unused/model.safetensors",
+        weights_sha256=_hash("weights"),
+        preprocess_sha256=DINO_V3_PREPROCESS_SHA256,
+        output_contract_sha256=DINO_V3_OUTPUT_CONTRACT_SHA256,
+        compute_dtype="float32",
+        license_id="DINOv3-test-license",
+    )
+    encoder = FrozenDinoV3Encoder._from_preloaded_model_for_tests(
+        model=_TinyDino(),
+        asset=asset,
+    )
+    memory = encoder.encode(camera_batch)
+    assert not memory.tokens.is_inference()
+    assert not memory.tokens.requires_grad
+
+    mot, _action, base, sources = _mot_and_sources()
+    refiner = WanCurrentKVRefiner(
+        WanCurrentRefinerConfig(
+            wan_hidden_dim=8,
+            native_dim=384,
+            layer_indices=(0, 1),
+            query_rank=4,
+            output_rank=4,
+            temperature=0.2,
+            alpha=0.5,
+            memory_contract_sha256=memory.memory_contract_sha256,
+            source_contract_sha256=_hash("wan-source"),
+        )
+    ).train()
+    shadow = refiner.build_action_view(
+        base_video_kv_cache=base,
+        sources=sources,
+        memory=memory,
+        video_blocks=mot.mixtures["video"].blocks,
+        actor_version=0,
+    )
+    output = mot.forward_action_with_video_cache(
+        **_action_kwargs(base),
+        action_video_kv_view=shadow,
+    )
+    output.sum().backward()
+
+    gradients = [module.output_up.weight.grad for module in refiner.layers.values()]
+    assert all(gradient is not None for gradient in gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert all(torch.count_nonzero(gradient) > 0 for gradient in gradients)
+    assert all(parameter.grad is None for parameter in encoder.parameters())
 
 
 def test_nonzero_shadow_changes_action_but_gate_direct_video_reads_base() -> None:
