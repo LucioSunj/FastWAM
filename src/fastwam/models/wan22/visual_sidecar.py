@@ -19,6 +19,7 @@ from .visual_contracts import (
     ActionVisualReader,
     NativePatchMemory,
     RoutingWeights,
+    VISUAL_READER_PARAMETER_FAMILY,
     VisualResidual,
     contract_sha256,
     validate_sha256,
@@ -454,6 +455,7 @@ class RoutedVisualReader(ActionVisualReader):
         branches: Mapping[int, Sequence[VisualValueBranch]],
         memory_contract_sha256: str,
         reader_kind: str,
+        parameter_family: str = VISUAL_READER_PARAMETER_FAMILY,
     ) -> None:
         super().__init__()
         layer_indices = tuple(sorted(int(index) for index in routers))
@@ -485,6 +487,9 @@ class RoutedVisualReader(ActionVisualReader):
         self.reader_kind = str(reader_kind)
         if not self.reader_kind:
             raise ValueError("Visual reader kind cannot be empty.")
+        self.parameter_family = str(parameter_family)
+        if not self.parameter_family:
+            raise ValueError("Visual reader parameter family cannot be empty.")
         self.reader_contract_sha256 = contract_sha256(
             {
                 "schema": "fastwam-routed-visual-reader-v1",

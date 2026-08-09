@@ -620,6 +620,7 @@ class MoT(nn.Module):
                         current_frame_tokens=current_frame_video_tokens,
                         layout_metadata=video_layout_metadata,
                     ),
+                    base_action_output_weight=block.self_attn.o.weight,
                 )
                 visual_residual = visual_reader.forward_layer(
                     visual_context,

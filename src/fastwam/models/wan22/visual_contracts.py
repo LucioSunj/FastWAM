@@ -7,8 +7,9 @@ import json
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 from torch import nn
@@ -239,6 +240,7 @@ class ActionLayerReadContext:
     timestep_embedding: torch.Tensor
     proprio: torch.Tensor
     video: LayerVideoKVView
+    base_action_output_weight: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         layer_index = int(self.layer_index)
@@ -263,6 +265,18 @@ class ActionLayerReadContext:
             raise ValueError("Proprioception must have shape [B,D_p].")
         if self.video.key.shape[0] != batch:
             raise ValueError("Video K/V batch size does not match action hidden.")
+        output_weight = self.base_action_output_weight
+        if output_weight is not None:
+            if output_weight.ndim != 2:
+                raise ValueError("Base action output weight must have shape [D_a,D_v].")
+            if output_weight.shape[0] != expected[-1]:
+                raise ValueError(
+                    "Base action output weight output width must match action hidden."
+                )
+            if output_weight.shape[1] != self.video.value.shape[-1]:
+                raise ValueError(
+                    "Base action output weight input width must match Wan value width."
+                )
         object.__setattr__(self, "layer_index", layer_index)
 
 
@@ -290,6 +304,7 @@ class ActionVisualReader(nn.Module, ABC):
 
     reader_kind: str
     reader_contract_sha256: str
+    parameter_family = VISUAL_READER_PARAMETER_FAMILY
 
     @property
     @abstractmethod
@@ -319,14 +334,19 @@ class ActionVisualReader(nn.Module, ABC):
         )
         if not names:
             raise ValueError("An action visual reader must own trainable parameters.")
-        return {VISUAL_READER_PARAMETER_FAMILY: names}
+        family = str(self.parameter_family)
+        if not family:
+            raise ValueError("Visual reader parameter family cannot be empty.")
+        return {family: names}
 
     def export_trainable_state(self) -> dict[str, Any]:
         """Export strict reader-only state without frozen visual weights."""
 
         parameters = dict(self.named_parameters())
         manifest = self.trainable_parameter_manifest()
-        names = manifest[VISUAL_READER_PARAMETER_FAMILY]
+        if tuple(manifest) != (self.parameter_family,):
+            raise ValueError("Visual reader must expose exactly one parameter family.")
+        names = manifest[self.parameter_family]
         return {
             "schema": VISUAL_READER_STATE_SCHEMA,
             "reader_kind": self.reader_kind,
@@ -353,7 +373,7 @@ class ActionVisualReader(nn.Module, ABC):
             raise ValueError("Visual reader kind does not match this module.")
         if payload["reader_contract_sha256"] != self.reader_contract_sha256:
             raise ValueError("Visual reader contract hash mismatch.")
-        manifest = self.trainable_parameter_manifest()[VISUAL_READER_PARAMETER_FAMILY]
+        manifest = self.trainable_parameter_manifest()[self.parameter_family]
         if tuple(payload["parameter_names"]) != manifest:
             raise ValueError("Visual reader parameter manifest mismatch.")
         state = payload["state"]
@@ -371,3 +391,31 @@ class ActionVisualReader(nn.Module, ABC):
                         f"Visual reader state tensor mismatch for {name!r}."
                     )
                 parameter.copy_(tensor.to(device=parameter.device))
+
+    def capture_replay_reference(self, *, actor_version: int) -> None:
+        """Snapshot behavior reader weights for no-grad Gate recomputation."""
+
+        if isinstance(actor_version, bool) or int(actor_version) < 0:
+            raise ValueError("Reader replay actor version must be non-negative.")
+        self._replay_reference = self.export_trainable_state()
+        self._replay_reference_actor_version = int(actor_version)
+
+    @contextmanager
+    def use_replay_reference(self, *, actor_version: int) -> Iterator[None]:
+        """Temporarily restore the hash-bound behavior reader state."""
+
+        reference = getattr(self, "_replay_reference", None)
+        reference_version = getattr(self, "_replay_reference_actor_version", None)
+        if reference is None:
+            raise RuntimeError("No behavior visual-reader reference was captured.")
+        if int(actor_version) != reference_version:
+            raise ValueError(
+                "Visual replay actor version mismatch: "
+                f"expected {reference_version}, got {actor_version}."
+            )
+        current = self.export_trainable_state()
+        try:
+            self.load_trainable_state(reference)
+            yield
+        finally:
+            self.load_trainable_state(current)
