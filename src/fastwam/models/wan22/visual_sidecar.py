@@ -649,6 +649,56 @@ class DinoRoutedWanValueBranch(VisualValueBranch):
             raise ValueError("P6 transported routing does not preserve unit mass.")
         return combined
 
+    def resolved_runtime_shape_contract(self, *, layer_index: int) -> dict[str, Any]:
+        """Return tensor-free resolved P6 shapes for one injection layer."""
+
+        views = len(self.camera_ids)
+        patch_count = (
+            self.spatial_metadata.dino_patch_grid[0]
+            * self.spatial_metadata.dino_patch_grid[1]
+        )
+        current_tokens = self.spatial_metadata.current_frame_video_tokens
+        value_width = self.spatial_metadata.video_value_width
+        return {
+            "layer_index": int(layer_index),
+            "dino_tokens_shape": ["batch", views, patch_count, DINO_V3_NATIVE_DIM],
+            "wan_current_value_shape": ["batch", current_tokens, value_width],
+            "transport_matrix_shape": [views, patch_count, current_tokens],
+            "action_query_shape": ["batch", "action_tokens", self.action_hidden_dim],
+            "routing_weights_shape": [
+                "batch",
+                views,
+                "action_tokens",
+                patch_count,
+            ],
+            "visual_residual_shape": [
+                "batch",
+                "action_tokens",
+                self.action_hidden_dim,
+            ],
+        }
+
+    def runtime_shape_audit(
+        self,
+        *,
+        context: ActionLayerReadContext,
+        memory: NativePatchMemory,
+        routing: RoutingWeights,
+        residual: torch.Tensor,
+    ) -> dict[str, Any]:
+        """Capture actual P6 forward shapes without retaining tensor objects."""
+
+        current_values = context.video.value[:, : context.video.current_frame_tokens]
+        return {
+            "layer_index": int(context.layer_index),
+            "dino_tokens_shape": list(memory.tokens.shape),
+            "wan_current_value_shape": list(current_values.shape),
+            "transport_matrix_shape": list(self.transport_matrix.shape),
+            "action_query_shape": list(context.modulated_attn_input.shape),
+            "routing_weights_shape": list(routing.weights.shape),
+            "visual_residual_shape": list(residual.shape),
+        }
+
     def forward_branch(
         self,
         context: ActionLayerReadContext,
@@ -766,6 +816,7 @@ class RoutedVisualReader(ActionVisualReader):
                 ],
             }
         )
+        self._runtime_shape_audits: dict[int, dict[str, Any]] = {}
 
     @property
     def injection_layer_indices(self) -> tuple[int, ...]:
@@ -788,6 +839,20 @@ class RoutedVisualReader(ActionVisualReader):
         residuals = [
             branch.forward_branch(context, memory, routing) for branch in branch_modules
         ]
+        shape_audits = [
+            branch.runtime_shape_audit(
+                context=context,
+                memory=memory,
+                routing=routing,
+                residual=residual,
+            )
+            for branch, residual in zip(branch_modules, residuals, strict=True)
+            if isinstance(branch, DinoRoutedWanValueBranch)
+        ]
+        if shape_audits:
+            if len(shape_audits) != 1:
+                raise ValueError("P6 requires exactly one Wan value branch per layer.")
+            self._runtime_shape_audits[context.layer_index] = shape_audits[0]
         total = residuals[0]
         for residual in residuals[1:]:
             total = total + residual
@@ -800,6 +865,45 @@ class RoutedVisualReader(ActionVisualReader):
             layer_index=context.layer_index,
             branch_kinds=tuple(branch.branch_kind for branch in branch_modules),
         )
+
+    def resolved_runtime_shape_contract(self) -> dict[str, Any] | None:
+        """Return resolved P6 shapes without materializing runtime tensors."""
+
+        layers: list[dict[str, Any]] = []
+        for layer_index in self.injection_layer_indices:
+            p6_branches = [
+                branch
+                for branch in self.branches[str(layer_index)]
+                if isinstance(branch, DinoRoutedWanValueBranch)
+            ]
+            if not p6_branches:
+                continue
+            if len(p6_branches) != 1:
+                raise ValueError("P6 requires exactly one Wan value branch per layer.")
+            layers.append(
+                p6_branches[0].resolved_runtime_shape_contract(layer_index=layer_index)
+            )
+        if not layers:
+            return None
+        return {
+            "schema": "fastwam-p6-resolved-runtime-shapes-v1",
+            "tensor_free": True,
+            "layers": layers,
+        }
+
+    def runtime_shape_audit(self) -> dict[str, Any] | None:
+        """Return actual shapes observed by P6 forwards, without any tensors."""
+
+        if not self._runtime_shape_audits:
+            return None
+        return {
+            "schema": "fastwam-p6-observed-runtime-shapes-v1",
+            "tensor_free": True,
+            "layers": [
+                dict(self._runtime_shape_audits[index])
+                for index in sorted(self._runtime_shape_audits)
+            ],
+        }
 
 
 def build_dino_semantic_reader(

@@ -16,6 +16,7 @@ from fastwam.models.wan22.visual_contracts import (
     ActionLayerReadContext,
     LayerVideoKVView,
     NativePatchMemory,
+    RoutingWeights,
     WanValueSpatialMetadata,
     build_area_overlap_dino_wan_transport,
 )
@@ -79,7 +80,11 @@ def _memory(*, wrist_valid: bool = True) -> NativePatchMemory:
     )
 
 
-def _reader(memory: NativePatchMemory):
+def _reader(
+    memory: NativePatchMemory,
+    *,
+    camera_mass: tuple[float, ...] = (1.0, 1.0),
+):
     metadata = _metadata()
     transport = build_area_overlap_dino_wan_transport(metadata)
     return build_dino_wan_value_reader(
@@ -93,7 +98,7 @@ def _reader(memory: NativePatchMemory):
             memory_contract_sha256=memory.memory_contract_sha256,
             spatial_metadata=metadata,
             transport=transport,
-            camera_mass=(1.0, 1.0),
+            camera_mass=camera_mass,
         )
     )
 
@@ -140,6 +145,104 @@ def test_area_overlap_transport_preserves_mass_and_camera_placement() -> None:
     assert torch.count_nonzero(first.matrix[1, :, [0, 1, 4, 5]]) == 0
     assert first.matrix[0, 0, 0] > 0
     assert first.matrix[1, 0, 2] > 0
+
+
+def test_area_overlap_transport_impulse_has_exact_local_target() -> None:
+    transport = build_area_overlap_dino_wan_transport(_metadata())
+    impulse = torch.zeros(196)
+    impulse[3 * 14 + 3] = 1
+
+    routed = impulse @ transport.matrix[0]
+    expected = torch.zeros(8)
+    expected[0] = 1
+
+    torch.testing.assert_close(routed, expected, atol=0, rtol=0)
+
+
+def test_area_overlap_transport_checkerboard_preserves_quadrant_geometry() -> None:
+    transport = build_area_overlap_dino_wan_transport(_metadata())
+    checkerboard = torch.tensor(
+        [(row + col) % 2 == 0 for row in range(14) for col in range(14)],
+        dtype=torch.float32,
+    )
+
+    routed = checkerboard @ transport.matrix[0]
+    expected = torch.zeros(8)
+    expected[[0, 1, 4, 5]] = torch.tensor([25.0, 24.0, 24.0, 25.0])
+
+    torch.testing.assert_close(routed, expected, atol=0, rtol=0)
+    assert routed.sum().item() == checkerboard.sum().item()
+
+
+def test_area_overlap_transport_never_crosses_horizontal_camera_seam() -> None:
+    transport = build_area_overlap_dino_wan_transport(_metadata())
+    main_right_edge = 3 * 14 + 13
+    wrist_left_edge = 3 * 14
+
+    main = transport.matrix[0, main_right_edge]
+    wrist = transport.matrix[1, wrist_left_edge]
+
+    assert torch.equal(main.nonzero().flatten(), torch.tensor([1]))
+    assert torch.equal(wrist.nonzero().flatten(), torch.tensor([2]))
+    assert main[1].item() == 1.0
+    assert wrist[2].item() == 1.0
+    assert torch.count_nonzero(transport.matrix[0, :, [2, 3, 6, 7]]) == 0
+    assert torch.count_nonzero(transport.matrix[1, :, [0, 1, 4, 5]]) == 0
+
+
+def test_area_overlap_transport_is_strictly_local_on_odd_boundaries() -> None:
+    metadata = WanValueSpatialMetadata(
+        **{
+            **_metadata().__dict__,
+            "wan_grid_h": 3,
+            "wan_grid_w": 3,
+            "current_frame_video_tokens": 9,
+            "camera_concat_mode": "main_only",
+            "camera_order": ("main",),
+            "per_camera_post_crop_hw": ((225, 227),),
+            "per_camera_combined_rgb_box": ((0, 0, 225, 227),),
+            "per_camera_wan_grid_support": ((0, 3, 0, 3),),
+            "spatial_transport_contract_sha256": None,
+        }
+    )
+    transport = build_area_overlap_dino_wan_transport(metadata)
+
+    for source_index in range(196):
+        targets = transport.matrix[0, source_index].nonzero().flatten()
+        rows = torch.div(targets, 3, rounding_mode="floor")
+        cols = targets % 3
+        assert 1 <= targets.numel() <= 4
+        assert int(rows.max() - rows.min()) <= 1
+        assert int(cols.max() - cols.min()) <= 1
+        torch.testing.assert_close(
+            transport.matrix[0, source_index].sum(),
+            torch.tensor(1.0),
+            atol=1e-6,
+            rtol=0,
+        )
+
+
+def test_transport_applies_exact_active_multi_camera_mass() -> None:
+    memory = _memory()
+    reader = _reader(memory, camera_mass=(1.0, 3.0))
+    branch = reader.branches["0"][0]
+    weights = torch.zeros(1, 2, 1, 196)
+    weights[0, 0, 0, 0] = 1
+    weights[0, 1, 0, 0] = 1
+    routing = RoutingWeights(
+        weights=weights,
+        patch_valid_mask=memory.patch_valid_mask,
+        camera_valid_mask=memory.camera_valid_mask,
+        camera_ids=memory.camera_ids,
+        router_contract_sha256=_hash("router"),
+    )
+
+    routed = branch._transport_routing(memory, routing)
+    expected = torch.zeros(1, 1, 8)
+    expected[0, 0, 0] = 0.25
+    expected[0, 0, 2] = 0.75
+
+    torch.testing.assert_close(routed, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -334,6 +437,60 @@ def test_p6_active_camera_mass_renormalizes_and_all_invalid_fails() -> None:
             camera_valid_mask=torch.zeros(1, 2, dtype=torch.bool),
             patch_valid_mask=torch.zeros(1, 2, 196, dtype=torch.bool),
         )
+
+
+def test_p6_runtime_shape_audit_reports_actual_tensor_free_shapes() -> None:
+    memory = _memory()
+    context = _context()
+    reader = _reader(memory)
+
+    resolved = reader.resolved_runtime_shape_contract()
+    assert resolved == {
+        "schema": "fastwam-p6-resolved-runtime-shapes-v1",
+        "tensor_free": True,
+        "layers": [
+            {
+                "layer_index": 0,
+                "dino_tokens_shape": ["batch", 2, 196, 384],
+                "wan_current_value_shape": ["batch", 8, 8],
+                "transport_matrix_shape": [2, 196, 8],
+                "action_query_shape": ["batch", "action_tokens", 6],
+                "routing_weights_shape": ["batch", 2, "action_tokens", 196],
+                "visual_residual_shape": ["batch", "action_tokens", 6],
+            }
+        ],
+    }
+    assert reader.runtime_shape_audit() is None
+
+    reader.forward_layer(context, memory)
+    observed = reader.runtime_shape_audit()
+    assert observed == {
+        "schema": "fastwam-p6-observed-runtime-shapes-v1",
+        "tensor_free": True,
+        "layers": [
+            {
+                "layer_index": 0,
+                "dino_tokens_shape": [1, 2, 196, 384],
+                "wan_current_value_shape": [1, 8, 8],
+                "transport_matrix_shape": [2, 196, 8],
+                "action_query_shape": [1, 3, 6],
+                "routing_weights_shape": [1, 2, 3, 196],
+                "visual_residual_shape": [1, 3, 6],
+            }
+        ],
+    }
+
+    def contains_tensor(value) -> bool:
+        if isinstance(value, torch.Tensor):
+            return True
+        if isinstance(value, dict):
+            return any(contains_tensor(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_tensor(item) for item in value)
+        return False
+
+    assert not contains_tensor(resolved)
+    assert not contains_tensor(observed)
 
 
 def test_visual_reader_behavior_snapshot_is_version_strict() -> None:
