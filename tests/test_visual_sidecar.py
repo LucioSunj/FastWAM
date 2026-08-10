@@ -188,12 +188,18 @@ def test_frozen_encoder_routes_before_preprocess_and_scatter_valid_views() -> No
     assert torch.count_nonzero(memory.tokens[0, 1]) == 0
     assert memory.camera_ids == cameras.camera_ids
     assert not memory.tokens.requires_grad
+    assert not memory.tokens.is_inference()
     assert all(not parameter.requires_grad for parameter in encoder.parameters())
     assert memory.memory_contract_sha256 == native_memory_contract_sha256(
         encoder.asset,
         camera_ids=cameras.camera_ids,
         input_contract_sha256=cameras.input_contract_sha256,
     )
+
+    probe = nn.Linear(DINO_V3_NATIVE_DIM, 1, bias=False)
+    probe(memory.tokens).sum().backward()
+    assert probe.weight.grad is not None
+    assert torch.count_nonzero(probe.weight.grad) > 0
 
 
 def test_frozen_encoder_rejects_wrong_native_output_contract() -> None:
@@ -414,3 +420,13 @@ def test_real_dinov3_native_output_contract() -> None:
     encoder = FrozenDinoV3Encoder.from_local_asset(asset, device="cpu")
     memory = encoder.encode(_camera_batch())
     assert memory.tokens.shape == (2, 2, 196, 384)
+    assert not memory.tokens.is_inference()
+    assert torch.isfinite(memory.tokens).all()
+    assert torch.count_nonzero(memory.tokens[memory.patch_valid_mask]) > 0
+    assert torch.count_nonzero(memory.tokens[~memory.patch_valid_mask]) == 0
+
+    probe = nn.Linear(DINO_V3_NATIVE_DIM, 1, bias=False)
+    probe(memory.tokens).sum().backward()
+    assert probe.weight.grad is not None
+    assert torch.isfinite(probe.weight.grad).all()
+    assert torch.count_nonzero(probe.weight.grad) > 0

@@ -147,6 +147,10 @@ class NativePatchMemory:
             raise ValueError("Every native-memory sample needs one valid camera.")
         if self.tokens.requires_grad:
             raise ValueError("Native DINOv3 memory must be detached from autograd.")
+        if self.tokens.is_inference():
+            raise ValueError(
+                "Native DINOv3 memory must be materialized as an ordinary tensor."
+            )
         valid_tokens = self.tokens[self.patch_valid_mask]
         if not bool(torch.isfinite(valid_tokens).all().item()):
             raise ValueError("Native DINOv3 memory contains non-finite values.")
