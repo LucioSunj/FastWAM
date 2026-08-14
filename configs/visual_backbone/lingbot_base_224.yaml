@@ -1,0 +1,14 @@
+# @package p1.visual_backbone
+family: lingbot_vision
+variant: base
+input_size: 224
+source_root: /home/amax/SJ/When-will-inference-time-prediction-beneficial--with-other-vit-experiments/FastWAM/src/fastwam/models/lingbot_vision
+source_revision: 151e46321bae4399f8568829f190c7bdec216b49
+weights_revision: f606f8c6c4002234ea68038f4d7c7cf57da96dfa
+weights_path: /home/amax/data0/Checkpoints/visual-backbones/lingbot-vision-base/model.pt
+weights_sha256: 783dfb59014c34e9f0013db60bf6f5cc3c6b0604eb9528fb5df65e80769c5825
+preprocess_sha256: f7e2507974e96b45f29cb076b35284f513d7574a387e2415945703b717bfc417
+output_contract_sha256: 1cf5a851617bd3b1e26904def8d65ec14832b9da23cd40a1c06d8a684850515b
+compute_dtype: bfloat16
+encode_microbatch_size: 8
+license_id: Apache-2.0

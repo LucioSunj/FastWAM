@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - p1_visual_bc_full
+  - _self_
+
+runner:
+  stage: canary
+  stop_after_steps: 2
+
+training:
+  max_steps: 2

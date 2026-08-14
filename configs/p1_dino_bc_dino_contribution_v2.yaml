@@ -1,0 +1,62 @@
+# @package _global_
+
+defaults:
+  - p1_dino_bc_full
+  - _self_
+
+# Independent lineage: this file does not inherit the contribution-v1 preset.
+lora:
+  rank: 32
+  alpha: 32.0
+
+p1:
+  reader:
+    semantic_gate_floor: 0.05
+    semantic_gate_temperature: 1.25
+
+training:
+  dino_contribution_profile: dino_contribution_v2
+  # DDP may choose a different reducer schedule on the first backward after a
+  # restart. Gather fixed chunks and sum ranks explicitly for bitwise resume.
+  gradient_sync: deterministic_rank_order
+  gradient_sync_chunk_mb: 16
+  reader_warmup:
+    min_steps: 256
+    max_steps: 1024
+    window_active_updates: 128
+    dependency_gap_min: 0.10
+    pass_rate_min: 0.70
+    consecutive_pass_windows: 2
+  lora_gradient_ramp_steps: 512
+  gripper_loss_multiplier: 1.0
+  memory_dependency:
+    enabled: true
+    weight: 0.25
+    relative_margin: 0.10
+    warmup_every_n_steps: 1
+    joint_every_n_steps: 2
+    negative_cycle: [task_paired, task_paired, task_paired, "off"]
+  checkpoint_selection:
+    reference_validation_loss: 0.0413114168
+    reference_pose_mse: 0.0330594443
+    reference_gripper_mse: 0.0853829011
+    validation_loss_ratio_max: 1.005
+    pose_mse_ratio_max: 1.01
+    gripper_mse_ratio_max: 1.01
+    hard_negative_gap_min: 0.10
+    off_gap_min: 0.10
+    positive_task_fraction_min: 0.70
+    residual_hidden_p95_max: 0.20
+
+optimizer:
+  lora_learning_rate: 3.0e-4
+  reader_learning_rate: 2.0e-4
+
+causal_audit:
+  ledger: ${oc.env:FASTWAM_P1_DINO_V2_LEDGER,../evaluation_artifacts/dino_contribution_v2/frozen_validation_ledger_v2.json}
+  draw_seeds: [42]
+  modes: [correct, "off", task_paired]
+  microbatch_size: 16
+
+runner:
+  output_dir: ${oc.env:FASTWAM_P1_FULL_OUTPUT_DIR,./runs/dino_contribution_v2/${now:%Y-%m-%d}_${now:%H-%M-%S}}

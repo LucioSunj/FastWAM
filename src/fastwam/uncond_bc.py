@@ -100,6 +100,7 @@ def compute_action_flow_matching_bc_loss(
     action_is_pad: torch.Tensor | None,
     scheduler: Any,
     gripper_dimension: int = 6,
+    gripper_loss_multiplier: float = 1.0,
     timestep_bins: int = 10,
 ) -> ActionBCLoss:
     """Compute the scheduler-weighted, padding-aware action BC objective.
@@ -123,6 +124,12 @@ def compute_action_flow_matching_bc_loss(
         raise ValueError(
             f"Invalid gripper dimension {gripper_dimension} for action_dim={action_dim}."
         )
+    if (
+        isinstance(gripper_loss_multiplier, bool)
+        or not math.isfinite(float(gripper_loss_multiplier))
+        or float(gripper_loss_multiplier) <= 0.0
+    ):
+        raise ValueError("`gripper_loss_multiplier` must be finite and positive.")
     if timestep_bins <= 0:
         raise ValueError("`timestep_bins` must be positive.")
     if action_is_pad is None:
@@ -141,7 +148,19 @@ def compute_action_flow_matching_bc_loss(
         valid = ~action_is_pad.to(device=prediction.device, dtype=torch.bool)
 
     squared_error = (prediction.float() - target.float()).square()
-    token_mse = squared_error.mean(dim=2)
+    if float(gripper_loss_multiplier) == 1.0:
+        # Preserve the v1 kernel/reduction path exactly.
+        token_mse = squared_error.mean(dim=2)
+    else:
+        dimension_weights = torch.ones(
+            action_dim,
+            dtype=squared_error.dtype,
+            device=squared_error.device,
+        )
+        dimension_weights[gripper_dimension] = float(gripper_loss_multiplier)
+        token_mse = (squared_error * dimension_weights).sum(dim=2) / (
+            dimension_weights.sum()
+        )
     valid_float = valid.to(dtype=token_mse.dtype)
     valid_per_sample = valid_float.sum(dim=1).clamp(min=1.0)
     sample_mse = (token_mse * valid_float).sum(dim=1) / valid_per_sample

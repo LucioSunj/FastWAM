@@ -14,20 +14,49 @@ from fastwam.adapters import PolicyRegime, RegimeContext, RegimeLoRALinear
 
 from .adaptive_sampler import VelocityOutput
 from .kv_tap import GateKVSnapshot, GateKVTapRequest
-from .visual_contracts import ActionVisualReader, NativePatchMemory
+from .visual_contracts import (
+    ActionVisualReader,
+    NativePatchMemory,
+    SpatialPatchMemory,
+)
+
+
+@dataclass(frozen=True)
+class ModalityKeepMask:
+    """Per-sample modality availability shared by one action chunk."""
+
+    wan: torch.Tensor
+    dino: torch.Tensor
+
+    def __post_init__(self) -> None:
+        for name, value in (("wan", self.wan), ("dino", self.dino)):
+            if value.ndim != 1:
+                raise ValueError(f"`{name}` keep mask must have shape [B].")
+            if value.dtype != torch.bool:
+                raise TypeError(f"`{name}` keep mask must use bool dtype.")
+        if self.wan.shape != self.dino.shape:
+            raise ValueError("Wan and DINO keep masks must have the same batch shape.")
+        if self.wan.device != self.dino.device:
+            raise ValueError("Wan and DINO keep masks must share a device.")
+
+    @property
+    def batch_size(self) -> int:
+        """Return the runtime-audited sample count."""
+
+        return int(self.wan.shape[0])
 
 
 @dataclass(frozen=True)
 class VisualReadCondition:
     """Frozen per-replan memory and non-visual inputs for an action reader."""
 
-    memory: NativePatchMemory
+    memory: NativePatchMemory | SpatialPatchMemory
     proprio: torch.Tensor
     video_layout_metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.memory, NativePatchMemory):
-            raise TypeError("`memory` must be a NativePatchMemory instance.")
+        if not isinstance(self.memory, (NativePatchMemory, SpatialPatchMemory)):
+            raise TypeError("`memory` must be a native or spatial patch memory.")
         if self.proprio.ndim != 2:
             raise ValueError("Visual-reader proprioception must have shape [B,D_p].")
         if not self.proprio.is_floating_point():
@@ -49,6 +78,7 @@ class CachedActionCondition:
     video_seq_len: int
     current_frame_video_tokens: int
     visual: VisualReadCondition | None = None
+    modality_keep_mask: ModalityKeepMask | None = None
 
     def __post_init__(self) -> None:
         if self.video_seq_len < 1:
@@ -62,6 +92,17 @@ class CachedActionCondition:
             raise ValueError("`attention_mask` must be a two-dimensional joint mask.")
         if self.context_mask.dtype != torch.bool:
             raise TypeError("`context_mask` must use bool dtype.")
+        if self.modality_keep_mask is not None:
+            if not isinstance(self.modality_keep_mask, ModalityKeepMask):
+                raise TypeError("`modality_keep_mask` must be a ModalityKeepMask.")
+            if self.modality_keep_mask.batch_size != self.context.shape[0]:
+                raise ValueError("Modality keep-mask batch size differs from context.")
+            if self.modality_keep_mask.wan.device != self.context.device:
+                raise ValueError("Modality keep masks and context must share a device.")
+            if self.current_frame_video_tokens != self.video_seq_len:
+                raise ValueError(
+                    "Modality dropout requires a current-frame-only video cache."
+                )
         if self.visual is not None:
             if not isinstance(self.visual, VisualReadCondition):
                 raise TypeError("`visual` must be a VisualReadCondition instance.")
@@ -204,6 +245,12 @@ class CachedActionVelocity:
                 "kv_tap": tap_request,
                 "checkpoint_context_fn": self._checkpoint_regime_contexts,
             }
+            keep_mask = self.condition.modality_keep_mask
+            if keep_mask is not None:
+                if not bool(keep_mask.wan.all().item()):
+                    mot_kwargs["wan_keep_mask"] = keep_mask.wan
+                if not bool(keep_mask.dino.all().item()):
+                    mot_kwargs["dino_keep_mask"] = keep_mask.dino
             if visual is not None:
                 mot_kwargs.update(
                     visual_reader=self.visual_reader,

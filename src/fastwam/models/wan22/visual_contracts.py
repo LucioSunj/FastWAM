@@ -17,8 +17,15 @@ DINO_V3_INPUT_SIZE = 224
 DINO_V3_PATCH_GRID = (14, 14)
 DINO_V3_PATCH_COUNT = 196
 DINO_V3_NATIVE_DIM = 384
+DINO_V3_FLATTEN_ORDER = "row_major"
+DINO_V3_GRID_ORIGIN = "top_left"
+DINO_V3_X_DIRECTION = "right"
+DINO_V3_Y_DIRECTION = "down"
+DINO_V3_COORDINATE_CONTRACT = "normalized_patch_center"
 VISUAL_READER_STATE_SCHEMA = "fastwam-action-visual-reader-v1"
 VISUAL_READER_PARAMETER_FAMILY = "uncond_visual_reader"
+VISUAL_READER_STATE_SCHEMA_V2 = "fastwam-action-visual-reader-v2"
+VISUAL_PATCH_SIZE = 16
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -42,6 +49,58 @@ def contract_sha256(payload: Mapping[str, Any]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def native_patch_layout_contract(
+    camera_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    """Return the exact immutable layout semantics for native DINO patches."""
+
+    ordered_cameras = tuple(str(camera_id) for camera_id in camera_ids)
+    if not ordered_cameras or any(not camera_id for camera_id in ordered_cameras):
+        raise ValueError("Native patch layout requires non-empty camera IDs.")
+    if len(set(ordered_cameras)) != len(ordered_cameras):
+        raise ValueError("Native patch layout camera IDs must be unique and ordered.")
+    return {
+        "patch_grid": list(DINO_V3_PATCH_GRID),
+        "flatten_order": DINO_V3_FLATTEN_ORDER,
+        "origin": DINO_V3_GRID_ORIGIN,
+        "x_direction": DINO_V3_X_DIRECTION,
+        "y_direction": DINO_V3_Y_DIRECTION,
+        "coordinate": DINO_V3_COORDINATE_CONTRACT,
+        "camera_order": list(ordered_cameras),
+    }
+
+
+def spatial_patch_layout_contract(
+    camera_ids: tuple[str, ...],
+    *,
+    grid: tuple[int, int],
+    patch_size: int,
+) -> dict[str, Any]:
+    """Return the dynamic V2 spatial layout contract."""
+
+    ordered_cameras = tuple(str(camera_id) for camera_id in camera_ids)
+    if not ordered_cameras or any(not camera_id for camera_id in ordered_cameras):
+        raise ValueError("Spatial patch layout requires non-empty camera IDs.")
+    if len(set(ordered_cameras)) != len(ordered_cameras):
+        raise ValueError("Spatial patch layout camera IDs must be unique and ordered.")
+    resolved_grid = tuple(int(value) for value in grid)
+    if len(resolved_grid) != 2 or any(value < 1 for value in resolved_grid):
+        raise ValueError("Spatial patch grid must contain two positive dimensions.")
+    resolved_patch_size = int(patch_size)
+    if resolved_patch_size < 1:
+        raise ValueError("Spatial patch size must be positive.")
+    return {
+        "patch_grid": list(resolved_grid),
+        "patch_size": resolved_patch_size,
+        "flatten_order": DINO_V3_FLATTEN_ORDER,
+        "origin": DINO_V3_GRID_ORIGIN,
+        "x_direction": DINO_V3_X_DIRECTION,
+        "y_direction": DINO_V3_Y_DIRECTION,
+        "coordinate": DINO_V3_COORDINATE_CONTRACT,
+        "camera_order": list(ordered_cameras),
+    }
 
 
 @dataclass(frozen=True)
@@ -88,6 +147,69 @@ class PreparedCameraBatch:
             validate_sha256(
                 self.input_contract_sha256,
                 label="Camera input contract SHA256",
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class PreparedVisualCameraBatch:
+    """V2 per-view RGB pixels before a registered frozen visual backbone."""
+
+    pixels: torch.Tensor
+    camera_ids: tuple[str, ...]
+    camera_valid_mask: torch.Tensor
+    input_size: int
+    input_contract_sha256: str
+    source_resolution: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.pixels.ndim != 5:
+            raise ValueError("`pixels` must have shape [B,V,3,H,W].")
+        if self.pixels.dtype != torch.uint8:
+            raise TypeError("Prepared visual pixels must use uint8 dtype.")
+        batch, views, channels, height, width = self.pixels.shape
+        input_size = int(self.input_size)
+        if input_size < VISUAL_PATCH_SIZE or input_size % VISUAL_PATCH_SIZE:
+            raise ValueError("Visual input size must be a positive multiple of 16.")
+        if channels != 3 or height != input_size or width != input_size:
+            raise ValueError(
+                "Prepared visual pixels must be square RGB tensors matching "
+                "`input_size`."
+            )
+        if batch < 1 or views < 1:
+            raise ValueError("Prepared visual batches and view sets must be non-empty.")
+        camera_ids = tuple(str(camera_id) for camera_id in self.camera_ids)
+        if len(camera_ids) != views or any(not value for value in camera_ids):
+            raise ValueError("Visual camera IDs must be non-empty and match V.")
+        if len(set(camera_ids)) != len(camera_ids):
+            raise ValueError("Visual camera identifiers must be unique and ordered.")
+        if self.camera_valid_mask.shape != (batch, views):
+            raise ValueError("`camera_valid_mask` must have shape [B,V].")
+        if self.camera_valid_mask.dtype != torch.bool:
+            raise TypeError("`camera_valid_mask` must use bool dtype.")
+        if bool((~self.camera_valid_mask.any(dim=1)).any().item()):
+            raise ValueError("Every sample must contain at least one valid camera.")
+        source_resolution = self.source_resolution
+        if source_resolution is not None:
+            if source_resolution.shape != (batch, views, 2):
+                raise ValueError("`source_resolution` must have shape [B,V,2].")
+            if source_resolution.dtype not in {
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            }:
+                raise TypeError("Visual source resolutions must use an integer dtype.")
+            valid_sizes = source_resolution[self.camera_valid_mask]
+            if valid_sizes.numel() and bool((valid_sizes < 1).any().item()):
+                raise ValueError("Valid cameras require positive source resolutions.")
+        object.__setattr__(self, "camera_ids", camera_ids)
+        object.__setattr__(self, "input_size", input_size)
+        object.__setattr__(
+            self,
+            "input_contract_sha256",
+            validate_sha256(
+                self.input_contract_sha256,
+                label="Visual camera input contract SHA256",
             ),
         )
 
@@ -141,6 +263,10 @@ class NativePatchMemory:
             raise ValueError("Every native-memory sample needs one valid camera.")
         if self.tokens.requires_grad:
             raise ValueError("Native DINOv3 memory must be detached from autograd.")
+        if self.tokens.is_inference():
+            raise ValueError(
+                "Native DINOv3 memory must be materialized as an ordinary tensor."
+            )
         valid_tokens = self.tokens[self.patch_valid_mask]
         if not bool(torch.isfinite(valid_tokens).all().item()):
             raise ValueError("Native DINOv3 memory contains non-finite values.")
@@ -167,6 +293,149 @@ class NativePatchMemory:
                 field_name,
                 validate_sha256(getattr(self, field_name), label=label),
             )
+
+    @property
+    def layout_contract(self) -> dict[str, Any]:
+        """Return the exact patch/camera layout bound into the memory hash."""
+
+        return native_patch_layout_contract(self.camera_ids)
+
+    @property
+    def native_dim(self) -> int:
+        """Return the fixed V1 native token width."""
+
+        return DINO_V3_NATIVE_DIM
+
+    @property
+    def patch_count(self) -> int:
+        """Return the fixed V1 patch count."""
+
+        return DINO_V3_PATCH_COUNT
+
+
+@dataclass(frozen=True)
+class SpatialPatchMemory:
+    """Frozen V2 native spatial patches with an explicit dynamic contract."""
+
+    tokens: torch.Tensor
+    patch_valid_mask: torch.Tensor
+    camera_valid_mask: torch.Tensor
+    camera_ids: tuple[str, ...]
+    grid: tuple[int, int]
+    patch_size: int
+    backbone_family: str
+    backbone_variant: str
+    native_dim: int
+    source_revision: str
+    weights_sha256: str
+    asset_contract_sha256: str
+    input_contract_sha256: str
+    preprocess_sha256: str
+    output_contract_sha256: str
+    memory_contract_sha256: str
+    source_resolution: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.tokens.ndim != 4:
+            raise ValueError("Spatial patch tokens must have shape [B,V,N,D].")
+        if not self.tokens.is_floating_point():
+            raise TypeError("Spatial patch tokens must use a floating dtype.")
+        batch, views, patches, dimension = self.tokens.shape
+        grid = tuple(int(value) for value in self.grid)
+        if len(grid) != 2 or any(value < 1 for value in grid):
+            raise ValueError("Spatial patch grid must have two positive dimensions.")
+        if patches != grid[0] * grid[1]:
+            raise ValueError("Spatial token count must equal the declared patch grid.")
+        native_dim = int(self.native_dim)
+        if native_dim < 1 or dimension != native_dim:
+            raise ValueError("Spatial token width must match `native_dim`.")
+        patch_size = int(self.patch_size)
+        if patch_size < 1:
+            raise ValueError("Spatial patch size must be positive.")
+        camera_ids = tuple(str(camera_id) for camera_id in self.camera_ids)
+        if len(camera_ids) != views or len(set(camera_ids)) != views:
+            raise ValueError("Spatial memory camera IDs must be unique and match V.")
+        if any(not value for value in camera_ids):
+            raise ValueError("Spatial memory camera IDs cannot be empty.")
+        family = str(self.backbone_family).strip().lower()
+        variant = str(self.backbone_variant).strip().lower()
+        if not family or not variant:
+            raise ValueError(
+                "Spatial memory must identify its backbone family/variant."
+            )
+        if self.patch_valid_mask.shape != (batch, views, patches):
+            raise ValueError("Spatial `patch_valid_mask` must have shape [B,V,N].")
+        if self.camera_valid_mask.shape != (batch, views):
+            raise ValueError("Spatial `camera_valid_mask` must have shape [B,V].")
+        if self.patch_valid_mask.dtype != torch.bool:
+            raise TypeError("Spatial patch masks must use bool dtype.")
+        if self.camera_valid_mask.dtype != torch.bool:
+            raise TypeError("Spatial camera masks must use bool dtype.")
+        if self.patch_valid_mask.device != self.tokens.device:
+            raise ValueError("Spatial patch masks and tokens must share a device.")
+        if self.camera_valid_mask.device != self.tokens.device:
+            raise ValueError("Spatial camera masks and tokens must share a device.")
+        if not torch.equal(self.patch_valid_mask.any(dim=-1), self.camera_valid_mask):
+            raise ValueError("Spatial patch validity must match camera validity.")
+        if bool((~self.camera_valid_mask.any(dim=1)).any().item()):
+            raise ValueError("Every spatial-memory sample needs one valid camera.")
+        if self.tokens.requires_grad or self.tokens.is_inference():
+            raise ValueError("Spatial patch memory must be detached ordinary tensors.")
+        valid_tokens = self.tokens[self.patch_valid_mask]
+        if not bool(torch.isfinite(valid_tokens).all().item()):
+            raise ValueError("Spatial patch memory contains non-finite values.")
+        if bool(
+            (torch.linalg.vector_norm(valid_tokens.float(), dim=-1) == 0).any().item()
+        ):
+            raise ValueError("Valid spatial patches must have non-zero row norms.")
+        invalid_tokens = self.tokens.masked_select(
+            (~self.patch_valid_mask).unsqueeze(-1)
+        )
+        if invalid_tokens.numel() and bool((invalid_tokens != 0).any().item()):
+            raise ValueError("Invalid spatial-memory slots must be exact zeros.")
+        source_resolution = self.source_resolution
+        if source_resolution is not None:
+            if source_resolution.shape != (batch, views, 2):
+                raise ValueError("Spatial source resolution must have shape [B,V,2].")
+            if source_resolution.device != self.tokens.device:
+                raise ValueError(
+                    "Spatial source resolution must share the token device."
+                )
+        object.__setattr__(self, "camera_ids", camera_ids)
+        object.__setattr__(self, "grid", grid)
+        object.__setattr__(self, "patch_size", patch_size)
+        object.__setattr__(self, "native_dim", native_dim)
+        object.__setattr__(self, "backbone_family", family)
+        object.__setattr__(self, "backbone_variant", variant)
+        for field_name, label in (
+            ("weights_sha256", "Visual weights SHA256"),
+            ("asset_contract_sha256", "Visual asset contract SHA256"),
+            ("input_contract_sha256", "Visual input contract SHA256"),
+            ("preprocess_sha256", "Visual preprocess SHA256"),
+            ("output_contract_sha256", "Visual output contract SHA256"),
+            ("memory_contract_sha256", "Spatial memory contract SHA256"),
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                validate_sha256(getattr(self, field_name), label=label),
+            )
+
+    @property
+    def patch_count(self) -> int:
+        """Return the dynamic number of spatial patch tokens per camera."""
+
+        return self.grid[0] * self.grid[1]
+
+    @property
+    def layout_contract(self) -> dict[str, Any]:
+        """Return the exact dynamic patch/camera layout contract."""
+
+        return spatial_patch_layout_contract(
+            self.camera_ids,
+            grid=self.grid,
+            patch_size=self.patch_size,
+        )
 
 
 @dataclass(frozen=True)
@@ -203,6 +472,49 @@ class RoutingWeights:
             validate_sha256(
                 self.router_contract_sha256,
                 label="Router contract SHA256",
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class PatchRoutingWeights:
+    """Ephemeral V2 per-view routing weights over a dynamic patch grid."""
+
+    weights: torch.Tensor
+    patch_valid_mask: torch.Tensor
+    camera_valid_mask: torch.Tensor
+    camera_ids: tuple[str, ...]
+    grid: tuple[int, int]
+    router_contract_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.weights.ndim != 4:
+            raise ValueError("Patch routing weights must have shape [B,V,A,N].")
+        batch, views, _actions, patches = self.weights.shape
+        grid = tuple(int(value) for value in self.grid)
+        if len(grid) != 2 or patches != grid[0] * grid[1]:
+            raise ValueError("Patch routing weights do not match their grid.")
+        if self.patch_valid_mask.shape != (batch, views, patches):
+            raise ValueError("Patch routing mask shape does not match weights.")
+        if self.camera_valid_mask.shape != (batch, views):
+            raise ValueError("Patch routing camera mask must have shape [B,V].")
+        if self.patch_valid_mask.dtype != torch.bool:
+            raise TypeError("Patch routing masks must use bool dtype.")
+        if self.camera_valid_mask.dtype != torch.bool:
+            raise TypeError("Patch routing camera masks must use bool dtype.")
+        camera_ids = tuple(str(value) for value in self.camera_ids)
+        if len(camera_ids) != views or len(set(camera_ids)) != views:
+            raise ValueError("Patch routing camera IDs must be unique and match V.")
+        if not bool(torch.isfinite(self.weights).all().item()):
+            raise ValueError("Patch routing weights contain non-finite values.")
+        object.__setattr__(self, "camera_ids", camera_ids)
+        object.__setattr__(self, "grid", grid)
+        object.__setattr__(
+            self,
+            "router_contract_sha256",
+            validate_sha256(
+                self.router_contract_sha256,
+                label="Patch router contract SHA256",
             ),
         )
 
@@ -290,6 +602,7 @@ class ActionVisualReader(nn.Module, ABC):
 
     reader_kind: str
     reader_contract_sha256: str
+    reader_state_schema: str = VISUAL_READER_STATE_SCHEMA
 
     @property
     @abstractmethod
@@ -305,7 +618,9 @@ class ActionVisualReader(nn.Module, ABC):
     def forward_layer(
         self,
         context: ActionLayerReadContext,
-        memory: NativePatchMemory,
+        memory: NativePatchMemory | SpatialPatchMemory,
+        *,
+        dino_keep_mask: torch.Tensor | None = None,
     ) -> VisualResidual:
         """Return the additive residual for one selected ActionDiT layer."""
 
@@ -328,7 +643,7 @@ class ActionVisualReader(nn.Module, ABC):
         manifest = self.trainable_parameter_manifest()
         names = manifest[VISUAL_READER_PARAMETER_FAMILY]
         return {
-            "schema": VISUAL_READER_STATE_SCHEMA,
+            "schema": self.reader_state_schema,
             "reader_kind": self.reader_kind,
             "reader_contract_sha256": self.reader_contract_sha256,
             "parameter_names": names,
@@ -347,7 +662,7 @@ class ActionVisualReader(nn.Module, ABC):
         }
         if set(payload) != expected_keys:
             raise ValueError("Visual reader state has an unexpected key set.")
-        if payload["schema"] != VISUAL_READER_STATE_SCHEMA:
+        if payload["schema"] != self.reader_state_schema:
             raise ValueError("Unsupported visual reader state schema.")
         if payload["reader_kind"] != self.reader_kind:
             raise ValueError("Visual reader kind does not match this module.")

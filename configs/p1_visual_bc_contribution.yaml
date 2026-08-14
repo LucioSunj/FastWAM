@@ -1,0 +1,31 @@
+# @package _global_
+
+defaults:
+  - p1_visual_bc_full
+  - _self_
+
+lora:
+  rank: 32
+  alpha: 32.0
+
+p1:
+  reader:
+    semantic_gate_floor: 0.05
+    semantic_gate_temperature: 1.25
+
+training:
+  dino_contribution_profile: dino_contribution_v1
+  reader_only_warmup_steps: 256
+  memory_dependency:
+    enabled: true
+    negative_mode: shuffled
+    weight: 0.1
+    relative_margin: 0.05
+    every_n_steps: 4
+
+optimizer:
+  lora_learning_rate: 3.0e-4
+  reader_learning_rate: 2.0e-4
+
+runner:
+  output_dir: ${oc.env:FASTWAM_P1_VISUAL_OUTPUT_DIR,./runs/p1_visual_bc_contribution/${p1.visual_backbone.family}_${p1.visual_backbone.variant}_${p1.visual_backbone.input_size}/${now:%Y-%m-%d}_${now:%H-%M-%S}}

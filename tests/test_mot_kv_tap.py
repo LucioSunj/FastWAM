@@ -26,6 +26,7 @@ from fastwam.adapters import (
 from fastwam.models.wan22.adaptive_action import (
     CachedActionCondition,
     CachedActionVelocity,
+    ModalityKeepMask,
     VisualReadCondition,
 )
 from fastwam.models.wan22.kv_tap import GateKVTapRequest, KVSource
@@ -109,6 +110,8 @@ class _RecordingReader(ActionVisualReader):
         self,
         context: ActionLayerReadContext,
         memory: NativePatchMemory,
+        *,
+        dino_keep_mask: torch.Tensor | None = None,
     ) -> VisualResidual:
         del memory
         self.contexts.append(context)
@@ -118,8 +121,11 @@ class _RecordingReader(ActionVisualReader):
             dtype=context.post_block_hidden.dtype,
             device=context.post_block_hidden.device,
         ).view(1, 1, -1)
+        tensor = pattern.expand_as(context.post_block_hidden) * self.scale
+        if dino_keep_mask is not None:
+            tensor = tensor * dino_keep_mask[:, None, None]
         return VisualResidual(
-            tensor=pattern.expand_as(context.post_block_hidden) * self.scale,
+            tensor=tensor,
             layer_index=context.layer_index,
             branch_kinds=("recording-branch",),
         )
@@ -409,6 +415,78 @@ def test_cached_visual_hook_uses_exact_modulated_input_and_zero_delta() -> None:
     )
     assert torch.equal(reader.contexts[0].modulated_attn_input, expected)
     assert reader.contexts[0].video.layout_metadata == {"grid": (1, 2, 2)}
+
+
+def test_cached_wan_dropout_masks_keys_and_zeroes_cache_per_sample(monkeypatch) -> None:
+    mot = _mot()
+    inputs = _cached_action_inputs()
+    observed = []
+    original = mot._mixed_attention
+
+    def capture(q_cat, k_cat, v_cat, attention_mask):
+        observed.append((k_cat.detach(), v_cat.detach(), attention_mask.detach()))
+        return original(q_cat, k_cat, v_cat, attention_mask)
+
+    monkeypatch.setattr(mot, "_mixed_attention", capture)
+    mot.forward_action_with_video_cache(
+        **inputs,
+        current_frame_video_tokens=4,
+        wan_keep_mask=torch.tensor([False, True]),
+    )
+
+    key, value, mask = observed[0]
+    video_tokens = inputs["video_seq_len"]
+    assert mask.shape == (2, 1, 3, 7)
+    assert not mask[0, ..., :video_tokens].any()
+    assert mask[0, ..., video_tokens:].all()
+    assert mask[1].all()
+    assert torch.count_nonzero(key[0, :video_tokens]) == 0
+    assert torch.count_nonzero(value[0, :video_tokens]) == 0
+    assert torch.equal(key[1, :video_tokens], inputs["video_kv_cache"][0]["k"][1])
+    assert torch.equal(value[1, :video_tokens], inputs["video_kv_cache"][0]["v"][1])
+    assert torch.count_nonzero(inputs["video_kv_cache"][0]["k"][0]) > 0
+
+
+def test_cached_condition_reuses_one_modality_mask_across_velocity_calls() -> None:
+    action = _TinyCachedActionExpert()
+    adapter = inject_action_dit_lora(
+        action,
+        RegimeLoRAConfig(
+            rank=2,
+            alpha=2.0,
+            target_groups=(ActionLoRATargetGroup.FFN,),
+        ),
+    )
+    mot = MoT(
+        mixtures={"video": _TinyExpert(num_layers=1), "action": action},
+        mot_checkpoint_mixed_attn=False,
+    ).eval()
+    keep = ModalityKeepMask(
+        wan=torch.tensor([False, True]),
+        dino=torch.ones(2, dtype=torch.bool),
+    )
+    condition = CachedActionCondition(
+        context=torch.randn(2, 5, 8),
+        context_mask=torch.ones(2, 5, dtype=torch.bool),
+        video_kv_cache=[{"k": torch.randn(2, 4, 8), "v": torch.randn(2, 4, 8)}],
+        attention_mask=torch.ones(7, 7, dtype=torch.bool),
+        video_seq_len=4,
+        current_frame_video_tokens=4,
+        modality_keep_mask=keep,
+    )
+    velocity = CachedActionVelocity(
+        action_expert=action,
+        mot=mot,
+        condition=condition,
+        regime=PolicyRegime.UNCOND,
+        regime_context=adapter.regime_context,
+    )
+
+    first = velocity(torch.randn(2, 3, 8), torch.tensor([0.2, 0.8])).velocity
+    second = velocity(torch.randn(2, 3, 8), torch.tensor([0.4, 0.6])).velocity
+
+    assert first.shape == second.shape == (2, 3, 8)
+    assert velocity.condition.modality_keep_mask is keep
 
 
 def test_visual_residual_affects_only_later_gate_action_kv() -> None:

@@ -1,0 +1,58 @@
+# @package _global_
+
+defaults:
+  - p1_visual_bc_full
+  - _self_
+
+runner:
+  arm: ${oc.env:FASTWAM_MODALITY_DROPOUT_ARM,A}
+  output_dir: ${oc.env:FASTWAM_MODALITY_DROPOUT_OUTPUT,./runs/modality_dropout_bc_pilot/${runner.arm}/${now:%Y-%m-%d}_${now:%H-%M-%S}}
+  baseline_endpoint: ${oc.env:FASTWAM_MODALITY_DROPOUT_BASELINE_ENDPOINT,null}
+  resume: null
+  stop_after_steps: null
+
+provenance:
+  dataset_paths:
+    - /home/amax/data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+
+data:
+  # The pilot runner audits these values from the live single-suite dataset and
+  # intentionally does not reuse the four-suite full-trainer count constants.
+  expected_train_episodes: null
+  expected_validation_episodes: null
+  expected_source_episodes: null
+  expected_source_transitions: null
+  num_workers: 3
+  prefetch_factor: 1
+  train:
+    dataset_dirs: ${provenance.dataset_paths}
+  validation:
+    dataset_dirs: ${provenance.dataset_paths}
+
+training:
+  deterministic_algorithms: true
+  stateless_flow_inputs: true
+  microbatch_size: 32
+  gradient_accumulation_steps: 1
+  global_batch_size: 32
+  max_steps: 3000
+  max_epochs: 100
+  save_every_steps: 500
+  checkpoint_keep_last: 1
+
+pilot:
+  eval_interval_steps: 500
+  heldout_windows: 256
+  bootstrap_draws: 10000
+  random_patch_seed: 42
+  clean_rollout_episodes: 30
+  clean_rollout_reset_ids: [0, 8, 16]
+  ood_paired_episodes_per_condition: 10
+  language_canary_cases: 12
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

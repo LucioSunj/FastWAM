@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from fastwam.models.wan22.visual_contracts import (
 )
 from fastwam.models.wan22.visual_sidecar import (
     DINO_SEMANTIC_READER_KIND,
+    DinoContributionDiagnosticsCollector,
     DinoSemanticReaderConfig,
     NativeDinoRouter,
     ProjectionSpec,
@@ -239,6 +241,46 @@ def test_asset_and_reader_configs_fail_closed() -> None:
         DinoSemanticReaderConfig(
             **{**config.__dict__, "temperature": 0.0},
         )
+    with pytest.raises(ValueError, match="gate floor"):
+        replace(config, semantic_gate_floor=1.0)
+    with pytest.raises(ValueError, match="gate temperature"):
+        replace(config, semantic_gate_temperature=0.0)
+
+
+def test_semantic_gate_contribution_controls_preserve_legacy_contract() -> None:
+    memory = _memory()
+    legacy_config = _reader_config(memory)
+    legacy = build_dino_semantic_reader(legacy_config)
+    legacy_branch = legacy.branches["0"][0]
+
+    assert "semantic_gate_floor" not in legacy_config.contract_payload()
+    assert "semantic_gate_temperature" not in legacy_config.contract_payload()
+    assert (
+        legacy_branch.branch_contract_sha256
+        == "c99ebb5beee45ef2fe7957ba66f62e1402dd356a1e06a5c39952e2e2ceb7c8f0"
+    )
+    assert (
+        legacy.reader_contract_sha256
+        == "b46fc667e9dfce718bb70710541430c4fbbe397ea58b94e30dcbe585854b5eed"
+    )
+    logits = torch.tensor([[-4.0], [0.5]])
+    assert torch.equal(legacy_branch.effective_gate(logits), torch.sigmoid(logits))
+
+    enhanced_config = replace(
+        legacy_config,
+        semantic_gate_floor=0.05,
+        semantic_gate_temperature=1.25,
+    )
+    enhanced_payload = enhanced_config.contract_payload()
+    round_tripped = DinoSemanticReaderConfig.from_mapping(enhanced_payload)
+    enhanced = build_dino_semantic_reader(round_tripped)
+    enhanced_branch = enhanced.branches["0"][0]
+    tempered_logits = torch.where(logits < 0, logits / 1.25, logits)
+    expected = 0.05 + 0.95 * torch.sigmoid(tempered_logits)
+
+    torch.testing.assert_close(enhanced_branch.effective_gate(logits), expected)
+    assert torch.all(enhanced_branch.effective_gate(logits) > torch.sigmoid(logits))
+    assert enhanced.reader_contract_sha256 != legacy.reader_contract_sha256
 
 
 def test_native_router_matches_reference_and_preserves_view_slots() -> None:
@@ -318,6 +360,41 @@ def test_p1_zero_init_and_gradient_unlock_order() -> None:
 
     assert torch.count_nonzero(query_weight.grad) > 0
     assert torch.count_nonzero(branch.semantic_gate.weight.grad) > 0
+
+
+def test_dino_diagnostics_capture_is_detached_and_output_exact() -> None:
+    memory = _memory()
+    context = _context()
+    reader = build_dino_semantic_reader(_reader_config(memory))
+    branch = reader.branches["0"][0]
+    with torch.no_grad():
+        branch.output_projection.weight.fill_(0.01)
+    state_keys = tuple(reader.state_dict())
+    baseline = reader.forward_layer(context, memory).tensor.detach().clone()
+    collector = DinoContributionDiagnosticsCollector()
+
+    with reader.capture_diagnostics(collector):
+        captured = reader.forward_layer(context, memory).tensor
+
+    assert torch.equal(captured, baseline)
+    assert tuple(reader.state_dict()) == state_keys
+    assert len(collector.records) == 1
+    record = collector.records[0]
+    assert record["layer_index"] == 0
+    assert record["gate_logits"].shape == (2, 1)
+    assert record["effective_gate"].shape == (2, 1)
+    assert record["projected_residual_over_hidden"].shape == (2, 3)
+    assert record["effective_residual_over_hidden"].shape == (2, 3)
+    assert record["attention_entropy"].shape == (2, 2, 3)
+    assert record["attention_top1"].shape == (2, 2, 3)
+    assert record["attention_top5"].shape == (2, 2, 3)
+    assert record["effective_patch_count"].shape == (2, 2, 3)
+    assert all(
+        not value.requires_grad
+        for value in record.values()
+        if isinstance(value, torch.Tensor)
+    )
+    assert branch._diagnostics_collector is None
 
 
 def test_low_rank_reader_state_is_strict_and_reader_only() -> None:

@@ -23,6 +23,7 @@ from .visual_contracts import (
     ActionVisualReader,
     LayerVideoKVView,
     NativePatchMemory,
+    SpatialPatchMemory,
 )
 from .wan_video_dit import flash_attention, modulate, rope_apply
 
@@ -526,11 +527,13 @@ class MoT(nn.Module):
         kv_tap: GateKVTapRequest | None = None,
         checkpoint_context_fn: CheckpointContextFn | None = None,
         visual_reader: ActionVisualReader | None = None,
-        visual_memory: NativePatchMemory | None = None,
+        visual_memory: NativePatchMemory | SpatialPatchMemory | None = None,
         visual_proprio: torch.Tensor | None = None,
         action_time_embedding: torch.Tensor | None = None,
         current_frame_video_tokens: int | None = None,
         video_layout_metadata: Mapping[str, Any] | None = None,
+        wan_keep_mask: torch.Tensor | None = None,
+        dino_keep_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Core loop of forward_action_with_video_cache without NVTX or validation.
 
@@ -568,6 +571,10 @@ class MoT(nn.Module):
             )
             k_video = video_cache_k[layer_idx]
             v_video = video_cache_v[layer_idx]
+            if wan_keep_mask is not None:
+                keep = wan_keep_mask[:, None, None]
+                k_video = k_video * keep
+                v_video = v_video * keep
 
             if kv_tap is not None and kv_tap.should_capture(layer_idx, self.num_layers):
                 self._capture_gate_layer_kv(
@@ -621,10 +628,17 @@ class MoT(nn.Module):
                         layout_metadata=video_layout_metadata,
                     ),
                 )
-                visual_residual = visual_reader.forward_layer(
-                    visual_context,
-                    visual_memory,
-                )
+                if dino_keep_mask is None:
+                    visual_residual = visual_reader.forward_layer(
+                        visual_context,
+                        visual_memory,
+                    )
+                else:
+                    visual_residual = visual_reader.forward_layer(
+                        visual_context,
+                        visual_memory,
+                        dino_keep_mask=dino_keep_mask,
+                    )
                 x = x + visual_residual.tensor
         return x
 
@@ -713,11 +727,13 @@ class MoT(nn.Module):
         kv_tap: GateKVTapRequest | None = None,
         checkpoint_context_fn: CheckpointContextFn | None = None,
         visual_reader: ActionVisualReader | None = None,
-        visual_memory: NativePatchMemory | None = None,
+        visual_memory: NativePatchMemory | SpatialPatchMemory | None = None,
         visual_proprio: torch.Tensor | None = None,
         action_time_embedding: torch.Tensor | None = None,
         current_frame_video_tokens: int | None = None,
         video_layout_metadata: Mapping[str, Any] | None = None,
+        wan_keep_mask: torch.Tensor | None = None,
+        dino_keep_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -751,6 +767,28 @@ class MoT(nn.Module):
             raise ValueError(
                 f"`attention_mask` must be 2D [S,S], got shape {tuple(attention_mask.shape)}"
             )
+        batch_size = int(action_tokens.shape[0])
+        for name, keep_mask in (
+            ("wan_keep_mask", wan_keep_mask),
+            ("dino_keep_mask", dino_keep_mask),
+        ):
+            if keep_mask is None:
+                continue
+            if keep_mask.shape != (batch_size,) or keep_mask.dtype != torch.bool:
+                raise ValueError(f"`{name}` must be a bool tensor with shape [B].")
+            if keep_mask.device != action_tokens.device:
+                raise ValueError(f"`{name}` and action tokens must share a device.")
+        if wan_keep_mask is not None:
+            if current_frame_video_tokens is None:
+                current_frame_video_tokens = int(video_seq_len)
+            if int(current_frame_video_tokens) != int(video_seq_len):
+                raise ValueError(
+                    "Wan modality dropout requires a current-frame-only video cache."
+                )
+        if dino_keep_mask is not None and visual_reader is None:
+            if not bool(dino_keep_mask.all().item()):
+                raise ValueError("DINO dropout requires an active visual reader.")
+            dino_keep_mask = None
         if attention_mask.shape[0] != attention_mask.shape[1]:
             raise ValueError(
                 f"`attention_mask` must be square, got shape {tuple(attention_mask.shape)}"
@@ -760,7 +798,6 @@ class MoT(nn.Module):
             visual_memory,
             visual_proprio,
             action_time_embedding,
-            current_frame_video_tokens,
         )
         if visual_reader is None:
             if any(value is not None for value in visual_values) or (
@@ -770,7 +807,9 @@ class MoT(nn.Module):
                     "Visual inputs cannot be supplied without an action visual reader."
                 )
         else:
-            if any(value is None for value in visual_values):
+            if any(value is None for value in visual_values) or (
+                current_frame_video_tokens is None
+            ):
                 raise ValueError(
                     "Visual readers require memory, proprio, time embedding, and "
                     "current-frame video extent."
@@ -827,6 +866,17 @@ class MoT(nn.Module):
         action_attention_mask = attention_mask[
             video_seq_len:total_seq_len, :total_seq_len
         ]
+        if wan_keep_mask is not None:
+            action_attention_mask = action_attention_mask.unsqueeze(0).unsqueeze(1)
+            action_attention_mask = action_attention_mask.expand(
+                batch_size,
+                1,
+                action_seq_len,
+                total_seq_len,
+            ).clone()
+            action_attention_mask[..., :video_seq_len] &= wan_keep_mask[
+                :, None, None, None
+            ]
 
         # Extract flat lists for compile-friendly inner method
         video_cache_k = [layer_cache["k"] for layer_cache in video_kv_cache]
@@ -848,6 +898,8 @@ class MoT(nn.Module):
             action_time_embedding=action_time_embedding,
             current_frame_video_tokens=current_frame_video_tokens,
             video_layout_metadata=video_layout_metadata,
+            wan_keep_mask=wan_keep_mask,
+            dino_keep_mask=dino_keep_mask,
         )
 
     def forward(

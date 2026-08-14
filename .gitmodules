@@ -1,3 +1,6 @@
 [submodule "src/fastwam/models/dinov3"]
 	path = src/fastwam/models/dinov3
 	url = https://github.com/facebookresearch/dinov3.git
+[submodule "src/fastwam/models/lingbot_vision"]
+	path = src/fastwam/models/lingbot_vision
+	url = https://github.com/robbyant/lingbot-vision.git

@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 import inspect
 import json
 import logging
@@ -25,7 +26,7 @@ project_root = Path(__file__).resolve().parents[2]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from action_ensembler import ActionEnsembler
+from experiments.libero.action_ensembler import ActionEnsembler
 from libero.libero import benchmark
 
 from experiments.libero.libero_utils import (
@@ -426,6 +427,24 @@ def _warmup_model(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    if bool(getattr(model, "requires_external_visual_pixels", False)):
+        visual_size = int(model.visual_input_size)
+        camera_count = len(model.visual_camera_ids)
+        infer_kwargs.update(
+            visual_camera_pixels=torch.zeros(
+                (1, camera_count, 3, visual_size, visual_size),
+                dtype=torch.uint8,
+            ),
+            visual_camera_valid_mask=torch.ones(
+                (1, camera_count),
+                dtype=torch.bool,
+            ),
+            visual_camera_source_resolution=torch.full(
+                (1, camera_count, 2),
+                visual_size,
+                dtype=torch.int32,
+            ),
+        )
     if "num_video_frames" in inspect.signature(model.infer_action).parameters:
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
     with torch.no_grad():
@@ -482,6 +501,49 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    if bool(getattr(model, "requires_external_visual_pixels", False)):
+        visual_size = int(model.visual_input_size)
+        camera_keys = {"main": "image", "wrist": "wrist_image"}
+        visual_pixels = []
+        source_resolutions = []
+        valid_mask = []
+        for camera_id in model.visual_camera_ids:
+            if camera_id not in camera_keys:
+                raise ValueError(
+                    f"No LIBERO raw-camera mapping for V2 camera {camera_id!r}."
+                )
+            key = camera_keys[camera_id]
+            if key not in imgs:
+                visual_pixels.append(
+                    np.zeros((visual_size, visual_size, 3), dtype=np.uint8)
+                )
+                source_resolutions.append((0, 0))
+                valid_mask.append(False)
+                continue
+            raw = np.asarray(imgs[key], dtype=np.uint8)
+            if raw.ndim != 3 or raw.shape[-1] != 3:
+                raise ValueError(f"LIBERO raw camera {key!r} is not RGB.")
+            source_resolutions.append((int(raw.shape[0]), int(raw.shape[1])))
+            visual_pixels.append(
+                _center_crop_resize(raw, width=visual_size, height=visual_size)
+            )
+            valid_mask.append(True)
+        if not any(valid_mask):
+            raise ValueError("LIBERO V2 inference received no valid raw cameras.")
+        infer_kwargs.update(
+            visual_camera_pixels=torch.from_numpy(np.stack(visual_pixels, axis=0))
+            .permute(0, 3, 1, 2)
+            .unsqueeze(0)
+            .contiguous(),
+            visual_camera_valid_mask=torch.tensor(
+                [valid_mask],
+                dtype=torch.bool,
+            ),
+            visual_camera_source_resolution=torch.tensor(
+                [source_resolutions],
+                dtype=torch.int32,
+            ),
+        )
     # Prompt caching: reuse pre-encoded context if available
     if cached_context is not None and cached_context_mask is not None:
         infer_kwargs["prompt"] = None
@@ -570,10 +632,15 @@ def run_single_episode(
     current_replan_step = 0
     current_replan_idx = -1
     episode_infer_time = 0.0
+    capture_rollout = bool(cfg.EVALUATION.get("save_rollout_video", True))
 
     t = 0
     done = False
-    pbar = tqdm(total=max_steps + num_steps_wait, desc=f"Episode {episode_idx + 1}")
+    pbar = tqdm(
+        total=max_steps + num_steps_wait,
+        desc=f"Episode {episode_idx + 1}",
+        disable=not bool(cfg.EVALUATION.get("show_progress", True)),
+    )
     while t < max_steps + num_steps_wait:
         pbar.update(1)
         if t < num_steps_wait:
@@ -616,10 +683,12 @@ def run_single_episode(
                 ]
             else:
                 pending_actions = action_chunk[:replan_steps].tolist()
-            replay_images.append(imgs.copy())
+            if capture_rollout:
+                replay_images.append(imgs.copy())
         else:
-            imgs = get_libero_image(obs)
-            replay_images.append(imgs.copy())
+            if capture_rollout:
+                imgs = get_libero_image(obs)
+                replay_images.append(imgs.copy())
 
         obs, _, done, _ = env.step(pending_actions.pop(0))
         if visualize_future_video and current_predicted_future_clip is not None:

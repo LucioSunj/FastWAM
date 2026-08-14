@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
+import sys
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,7 @@ from .visual_contracts import (
     NativePatchMemory,
     PreparedCameraBatch,
     contract_sha256,
+    native_patch_layout_contract,
     validate_sha256,
 )
 
@@ -183,7 +187,8 @@ def native_memory_contract_sha256(
             "preprocess_sha256": asset.preprocess_sha256,
             "output_contract_sha256": asset.output_contract_sha256,
             "camera_ids": list(camera_ids),
-            "patch_grid": list(DINO_V3_PATCH_GRID),
+            "layout": native_patch_layout_contract(camera_ids),
+            "crop_orientation_contract_sha256": input_hash,
         }
     )
 
@@ -218,6 +223,153 @@ def _verify_local_asset(asset: DinoV3AssetSpec) -> None:
         )
 
 
+@contextmanager
+def _local_dinov3_import(source_root: Path):
+    """Import the pinned local package without importing optional hub tasks."""
+
+    value = str(source_root)
+    sys.path.insert(0, value)
+    try:
+        module = importlib.import_module("dinov3.hub.backbones")
+        module_path = Path(module.__file__).resolve()
+        if not module_path.is_relative_to(source_root):
+            raise ImportError(f"Imported DINOv3 from {module_path}, not {source_root}.")
+        yield module
+    finally:
+        if sys.path and sys.path[0] == value:
+            sys.path.pop(0)
+
+
+def _load_tensor_state(path: Path) -> dict[str, torch.Tensor]:
+    """Load a local PyTorch or safetensors state dictionary."""
+
+    if path.suffix == ".safetensors":
+        try:
+            from safetensors.torch import load_file
+        except ImportError as error:
+            raise ImportError(
+                "Loading a local DINOv3 safetensors file requires safetensors."
+            ) from error
+        state = load_file(str(path), device="cpu")
+    else:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(state, Mapping) or not all(
+        isinstance(name, str) and isinstance(tensor, torch.Tensor)
+        for name, tensor in state.items()
+    ):
+        raise TypeError("DINOv3 weights must be a flat tensor state dictionary.")
+    return dict(state)
+
+
+def _convert_hf_vits16_state(
+    state: Mapping[str, torch.Tensor],
+    *,
+    official_state: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Convert the verified HF ViT-S/16 serialization to pinned source keys."""
+
+    expected_global = {
+        "embeddings.cls_token",
+        "embeddings.mask_token",
+        "embeddings.patch_embeddings.bias",
+        "embeddings.patch_embeddings.weight",
+        "embeddings.register_tokens",
+        "norm.bias",
+        "norm.weight",
+    }
+    expected_layer_suffixes = {
+        "attention.k_proj.weight",
+        "attention.o_proj.bias",
+        "attention.o_proj.weight",
+        "attention.q_proj.bias",
+        "attention.q_proj.weight",
+        "attention.v_proj.bias",
+        "attention.v_proj.weight",
+        "layer_scale1.lambda1",
+        "layer_scale2.lambda1",
+        "mlp.down_proj.bias",
+        "mlp.down_proj.weight",
+        "mlp.up_proj.bias",
+        "mlp.up_proj.weight",
+        "norm1.bias",
+        "norm1.weight",
+        "norm2.bias",
+        "norm2.weight",
+    }
+    expected = set(expected_global)
+    expected.update(
+        f"layer.{index}.{suffix}"
+        for index in range(12)
+        for suffix in expected_layer_suffixes
+    )
+    if set(state) != expected:
+        raise ValueError(
+            "Hugging Face DINOv3 ViT-S/16 tensor schema mismatch: "
+            f"missing={sorted(expected - set(state))[:16]}, "
+            f"unexpected={sorted(set(state) - expected)[:16]}."
+        )
+    converted = {
+        name: tensor.detach().cpu().clone() for name, tensor in official_state.items()
+    }
+    direct = {
+        "embeddings.cls_token": "cls_token",
+        "embeddings.register_tokens": "storage_tokens",
+        "embeddings.patch_embeddings.weight": "patch_embed.proj.weight",
+        "embeddings.patch_embeddings.bias": "patch_embed.proj.bias",
+        "norm.weight": "norm.weight",
+        "norm.bias": "norm.bias",
+    }
+    for source, target in direct.items():
+        converted[target] = state[source]
+    converted["mask_token"] = state["embeddings.mask_token"].squeeze(0)
+    for index in range(12):
+        source = f"layer.{index}"
+        target = f"blocks.{index}"
+        for suffix in ("norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias"):
+            converted[f"{target}.{suffix}"] = state[f"{source}.{suffix}"]
+        converted[f"{target}.attn.qkv.weight"] = torch.cat(
+            (
+                state[f"{source}.attention.q_proj.weight"],
+                state[f"{source}.attention.k_proj.weight"],
+                state[f"{source}.attention.v_proj.weight"],
+            ),
+            dim=0,
+        )
+        converted[f"{target}.attn.qkv.bias"] = torch.cat(
+            (
+                state[f"{source}.attention.q_proj.bias"],
+                torch.zeros_like(state[f"{source}.attention.q_proj.bias"]),
+                state[f"{source}.attention.v_proj.bias"],
+            ),
+            dim=0,
+        )
+        layer_direct = {
+            "attention.o_proj.weight": "attn.proj.weight",
+            "attention.o_proj.bias": "attn.proj.bias",
+            "layer_scale1.lambda1": "ls1.gamma",
+            "layer_scale2.lambda1": "ls2.gamma",
+            "mlp.up_proj.weight": "mlp.fc1.weight",
+            "mlp.up_proj.bias": "mlp.fc1.bias",
+            "mlp.down_proj.weight": "mlp.fc2.weight",
+            "mlp.down_proj.bias": "mlp.fc2.bias",
+        }
+        for source_suffix, target_suffix in layer_direct.items():
+            converted[f"{target}.{target_suffix}"] = state[f"{source}.{source_suffix}"]
+    mismatches = {
+        name: (tuple(official_state[name].shape), tuple(value.shape))
+        for name, value in converted.items()
+        if name not in official_state or value.shape != official_state[name].shape
+    }
+    if set(converted) != set(official_state) or mismatches:
+        raise ValueError(
+            "Converted DINOv3 state does not match the pinned architecture: "
+            f"missing={sorted(set(official_state) - set(converted))[:16]}, "
+            f"unexpected={sorted(set(converted) - set(official_state))[:16]}, "
+            f"shape_mismatches={dict(list(mismatches.items())[:16])}."
+        )
+    return converted
+
+
 class FrozenDinoV3Encoder(nn.Module):
     """Frozen DINOv3 encoder that emits only native normalized patch tokens."""
 
@@ -249,18 +401,19 @@ class FrozenDinoV3Encoder(nn.Module):
         """Verify and load the pinned source and local weights without networking."""
 
         _verify_local_asset(asset)
-        model = torch.hub.load(
-            str(asset.source_root),
-            asset.model_name,
-            source="local",
-            pretrained=False,
-        )
-        state = torch.load(asset.weights_path, map_location="cpu", weights_only=True)
-        if not isinstance(state, Mapping) or not all(
-            isinstance(name, str) and isinstance(tensor, torch.Tensor)
-            for name, tensor in state.items()
-        ):
-            raise TypeError("DINOv3 weights must be a flat tensor state dictionary.")
+        with _local_dinov3_import(asset.source_root) as backbones:
+            factory = getattr(backbones, asset.model_name, None)
+            if factory is None:
+                raise AttributeError(
+                    f"Pinned DINOv3 source has no {asset.model_name!r} factory."
+                )
+            model = factory(pretrained=False)
+        state = _load_tensor_state(asset.weights_path)
+        if "embeddings.patch_embeddings.weight" in state:
+            state = _convert_hf_vits16_state(
+                state,
+                official_state=model.state_dict(),
+            )
         model.load_state_dict(state, strict=True)
         model.to(device=torch.device(device), dtype=asset.torch_dtype)
         return cls(model=model, asset=asset).to(device=torch.device(device))
@@ -301,6 +454,11 @@ class FrozenDinoV3Encoder(nn.Module):
         selected = PolicyRegime.parse(regime)
         if selected is PolicyRegime.IDM:
             return None
+        return self(camera_batch)
+
+    def forward(self, camera_batch: PreparedCameraBatch) -> NativePatchMemory:
+        """Encode one camera batch through the hook-visible module path."""
+
         return self.encode(camera_batch)
 
     def encode(self, camera_batch: PreparedCameraBatch) -> NativePatchMemory:
@@ -352,12 +510,17 @@ class FrozenDinoV3Encoder(nn.Module):
                 device=valid_tokens.device,
             )
             tokens[flat_valid.to(device=valid_tokens.device)] = valid_tokens
-            tokens = tokens.reshape(
+            inference_tokens = tokens.reshape(
                 batch,
                 views,
                 DINO_V3_PATCH_COUNT,
                 DINO_V3_NATIVE_DIM,
             ).detach()
+        # Tensors created inside ``inference_mode`` cannot be saved for backward
+        # by the trainable ActionDiT reader.  Clone after leaving that scope so
+        # the memory remains detached/frozen but has normal tensor semantics.
+        with torch.inference_mode(False):
+            tokens = inference_tokens.clone().detach()
         camera_valid_mask = camera_batch.camera_valid_mask.to(device=tokens.device)
         patch_valid_mask = camera_valid_mask.unsqueeze(-1).expand(
             -1,

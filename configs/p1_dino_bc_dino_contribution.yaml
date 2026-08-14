@@ -1,0 +1,40 @@
+# @package _global_
+
+defaults:
+  - p1_dino_bc_full
+  - _self_
+
+# A separate post-diagnostic lineage. The legacy P1 full config remains
+# unchanged and continues to reproduce the rank-16/rank-32 checkpoints.
+lora:
+  rank: 32
+  alpha: 32.0
+
+p1:
+  reader:
+    # The prior rank-32 checkpoint learned raw gates of roughly 0.036--0.120.
+    # A small floor plus mild negative-logit softening raises the effective
+    # residual without reducing already-open positive-logit gates.
+    semantic_gate_floor: 0.05
+    semantic_gate_temperature: 1.25
+
+training:
+  dino_contribution_profile: dino_contribution_v1
+  # DDP still evaluates/reduces the complete graph; only LoRA optimizer grads
+  # are suppressed during these updates, so no unused-parameter mode is needed.
+  reader_only_warmup_steps: 256
+  memory_dependency:
+    enabled: true
+    negative_mode: shuffled
+    weight: 0.1
+    relative_margin: 0.05
+    # Reuse the same DINO memory and add one counterfactual ActionDiT forward on
+    # one in four updates rather than doubling every training step.
+    every_n_steps: 4
+
+optimizer:
+  lora_learning_rate: 3.0e-4
+  reader_learning_rate: 2.0e-4
+
+runner:
+  output_dir: ${oc.env:FASTWAM_P1_FULL_OUTPUT_DIR,./runs/p1_dino_bc_dino_contribution/${now:%Y-%m-%d}_${now:%H-%M-%S}}

@@ -1,0 +1,184 @@
+# @package _global_
+
+defaults:
+  - task: libero_uncond_lora_bc
+  - _self_
+
+precision: bf16
+compile: false
+seed: 42
+
+runner:
+  stage: t1_smoke
+  arm: a3_joint
+  output_dir: ${oc.env:FASTWAM_P1_OUTPUT_DIR,../evaluation_artifacts/p1_dino_semantic_memory_feasibility_${now:%Y%m%d}_${now:%H%M%S}}
+  prerequisite_t1_manifest: null
+  prerequisite_t2_manifest: null
+
+parent:
+  checkpoint: ${oc.env:FASTWAM_P1_PARENT,/home/amax/data0/Checkpoints/fastwam-idm/libero-wan-robot/fastwam-idm-libero-wan-robot-init-step_021700.pt}
+  checkpoint_sha256: e979511a2d7a1310009496c6b2f06957171bba28b96aac0d513992c6ed21ca5a
+  statistics: ${oc.env:FASTWAM_P1_STATISTICS,/home/amax/data0/Checkpoints/fastwam-idm/uncond-lora-bc/dataset_stats.json}
+  statistics_sha256: 30f81ad7d5076e97323e3328bce003e01a04cb21327b5bacd21bb72846768638
+
+provenance:
+  dataset_paths:
+    - /home/amax/data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+    - /home/amax/data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_object_no_noops_lerobot
+    - /home/amax/data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_goal_no_noops_lerobot
+    - /home/amax/data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_10_no_noops_lerobot
+  text_cache_path: /home/amax/data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/repo-runs-performance-assets/text_embeds_cache/libero
+
+p1:
+  camera_ids: [main, wrist]
+  position_mode: native_contextual_only
+  camera_input_contract:
+    schema: fastwam-p1-libero-camera-input-v1
+    source: RobotVideoDataset.processor_output_before_camera_concat
+    frame_index: 0
+    camera_order: [main, wrist]
+    color_space: RGB
+    orientation: identity_no_flip_no_rotation
+    per_camera_resize:
+      kind: torchvision.transforms.Resize
+      size: [224, 224]
+      interpolation: bilinear
+      antialias: true
+    source_dtype: float32
+    source_range: [0.0, 1.0]
+    uint8_conversion: round(value*255)
+  camera_input_contract_sha256: 09e24a678759c588d5f573870ea6e1d7192111aa5b90acfe596a7265f3107801
+  dinov3:
+    source_root: ${oc.env:FASTWAM_P1_DINOV3_SOURCE_ROOT,/home/amax/SJ/When-will-inference-time-prediction-beneficial--with-other-vit-experiments/FastWAM/src/fastwam/models/dinov3}
+    source_revision: 6876159a11b4df116f30f667f8c9888617df0751
+    model_name: dinov3_vits16
+    weights_path: ${oc.env:FASTWAM_P1_DINOV3_VITS16_WEIGHTS,/home/amax/data0/dinov3-vits16-pretrain-lvd1689m/model.safetensors}
+    weights_sha256: ${oc.env:FASTWAM_P1_DINOV3_VITS16_SHA256,4610ad75edef83e75afdebf162d148dc628045ea6cbb83d67d4708c709c4f91d}
+    preprocess_sha256: 0a70d846042c4bb29893ead5d9433e97d1ec5089875704e472dd821632e24dc0
+    output_contract_sha256: 631bb13876a3e9c79476eb1ac089bced12aae93302f117cfeb106dd8acfe9f18
+    compute_dtype: bfloat16
+    license_id: DINOv3 License
+  fastwam_runtime:
+    model_base_path: /home/amax/data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/checkpoint
+    vae_path: /home/amax/data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/checkpoint/DiffSynth-Studio/Wan-Series-Converted-Safetensors/Wan2.2_VAE.safetensors
+    vae_sha256: 0e913a2ca571c75fcb63385a8edadcca73454af5842596cb1ad11e4142590996
+    skip_download: true
+  reader:
+    layer_indices: [6, 12, 18, 22]
+    temperature: 0.07
+    residual_scale: 1.0
+    query_projection: {kind: full_linear, rank: null}
+    output_projection: {kind: full_linear, rank: null}
+  thresholds:
+    tiny_final_over_initial_max: 0.20
+    memory_relative_improvement_min: 0.10
+    delta_position_relative_loss: 0.05
+    spatial_pair_count: 4
+    spatial_positive_pairs_min: 3
+    short_a3_over_a0_dev_max: 1.02
+    short_correct_over_shuffled_improvement_min: 0.01
+  spatial_pairs:
+    - pair_id: spatial-task0-episode0-vs1-frame0
+      suite: libero_spatial_no_noops_lerobot
+      task_index: 0
+      object: black_bowl
+      left: {episode_index: 0, frame_index: 0}
+      right: {episode_index: 1, frame_index: 0}
+      relation: same_task_object_different_reset_position
+    - pair_id: spatial-task0-episode2-vs3-frame0
+      suite: libero_spatial_no_noops_lerobot
+      task_index: 0
+      object: black_bowl
+      left: {episode_index: 2, frame_index: 0}
+      right: {episode_index: 3, frame_index: 0}
+      relation: same_task_object_different_reset_position
+    - pair_id: spatial-task1-episode50-vs51-frame0
+      suite: libero_spatial_no_noops_lerobot
+      task_index: 1
+      object: black_bowl
+      left: {episode_index: 50, frame_index: 0}
+      right: {episode_index: 51, frame_index: 0}
+      relation: same_task_object_different_reset_position
+    - pair_id: spatial-task1-episode52-vs53-frame0
+      suite: libero_spatial_no_noops_lerobot
+      task_index: 1
+      object: black_bowl
+      left: {episode_index: 52, frame_index: 0}
+      right: {episode_index: 53, frame_index: 0}
+      relation: same_task_object_different_reset_position
+
+training:
+  tiny_steps: 300
+  short_steps: 1000
+  matched_sample_budget: true
+  matched_batch_order: true
+  matched_flow_noise_timestep: true
+
+lora:
+  rank: 16
+  alpha: 16.0
+  dropout: 0.0
+  target_groups:
+    - self_attention_qkvo
+    - cross_attention_qkvo
+    - ffn
+
+bc_policy:
+  action_horizon: 32
+  action_dim: 7
+  proprio_dim: 8
+  expected_video_frames: 9
+  expected_video_height: 224
+  expected_video_width: 448
+  gripper_dimension: 6
+  timestep_bins: 10
+  tiled_vae: false
+
+optimizer:
+  lora_learning_rate: 3.0e-4
+  reader_learning_rate: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 0.01
+  gradient_clip: 1.0
+
+data:
+  dataset_revision: libero_mujoco3.3.2+lerobot-v2.1
+  dataset_info: /home/amax/data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot/meta/info.json
+  dataset_info_sha256: 2261dbde7c5d5d1216e0f5f1ae6cf345474037ff11630391829c4f01333d8983
+  dataset_metadata: /home/amax/data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot/meta/episodes.jsonl
+  dataset_metadata_sha256: 1362a116870cf13be50c55074d6e9071936d567d0e5df30ac5c1b2eee86aa7de
+  smoke_window_indices: [0, 1]
+  tiny_window_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+  short_train_episode_ids: [0, 1, 2, 3, 50, 51, 52, 53]
+  short_dev_episode_ids: [4, 5, 54, 55]
+  short_frame_index: 0
+  split_contract: explicit_episode_disjoint_no_overlapping_windows
+  smoke:
+    _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+    dataset_dirs:
+      - ${provenance.dataset_paths.0}
+    shape_meta: ${data.train.shape_meta}
+    num_frames: ${data.train.num_frames}
+    global_sample_stride: ${data.train.global_sample_stride}
+    action_video_freq_ratio: ${data.train.action_video_freq_ratio}
+    video_size: ${data.train.video_size}
+    camera_key: null
+    val_set_proportion: 0.0
+    is_training_set: true
+    split_seed: ${seed}
+    skip_padding_as_possible: false
+    concat_multi_camera: horizontal
+    text_embedding_cache_dir: ${provenance.text_cache_path}
+    context_len: ${data.train.context_len}
+    pretrained_norm_stats: ${parent.statistics}
+    processor: ${data.train.processor}
+    return_p1_camera_uint8: true
+    p1_camera_ids: ${p1.camera_ids}
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

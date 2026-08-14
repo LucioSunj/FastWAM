@@ -1,0 +1,14 @@
+# @package p1.visual_backbone
+family: dinov3
+variant: vitb16
+input_size: 224
+source_root: /home/amax/SJ/When-will-inference-time-prediction-beneficial--with-other-vit-experiments/FastWAM/src/fastwam/models/dinov3
+source_revision: 6876159a11b4df116f30f667f8c9888617df0751
+weights_revision: 5931719e67bbdb9737e363e781fb0c67687896bc
+weights_path: /home/amax/data0/Checkpoints/visual-backbones/dinov3-vitb16-lvd1689m/model.safetensors
+weights_sha256: 9a21ac3df0c63839d62612dda6f454d816c25611cc7a52966ed5a5a94921dc8b
+preprocess_sha256: cd5d345e76d09c307e8926cd045afd89590be80d2e648651b298d487e1845141
+output_contract_sha256: d90fb961819db6ea16bb107c964e32a54a40884ef54ae0152c1a68428a1f14b5
+compute_dtype: bfloat16
+encode_microbatch_size: 8
+license_id: DINOv3 License

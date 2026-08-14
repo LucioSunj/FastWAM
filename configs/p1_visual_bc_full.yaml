@@ -1,0 +1,54 @@
+# @package _global_
+
+defaults:
+  - p1_dino_bc_full
+  - visual_backbone: dinov3_vits16_224
+  - _self_
+
+runner:
+  output_dir: ${oc.env:FASTWAM_P1_VISUAL_OUTPUT_DIR,./runs/p1_visual_bc_full/${p1.visual_backbone.family}_${p1.visual_backbone.variant}_${p1.visual_backbone.input_size}/${now:%Y-%m-%d}_${now:%H-%M-%S}}
+
+p1:
+  lineage: visual_v2
+  visual_camera_input_contract:
+    schema: fastwam-p1-visual-camera-input-v2
+    source_stage: raw_oriented_rgb_before_fastwam_resize
+    frame_index: 0
+    camera_order: [main, wrist]
+    color_space: RGB
+    canonical_orientation: robot_upright
+    source_dtype: uint8_or_finite_float_[0,1]
+    spatial_transform: center_crop_square_then_bilinear_resize
+    antialias: true
+    target_input_size: ${p1.visual_backbone.input_size}
+    uint8_conversion: preserve_uint8_or_round(float*255)
+    source_resolution_recorded: true
+  visual_camera_input_contract_hashes:
+    "224": c103453e2433b791de064af5fe4e98a9756d8de86bf53d383cac28078add5259
+    "512": d5b8367c400ec1bbfc6b1a5028a87b52bc4a5f5307263f063fb6729bc39a7829
+  visual_camera_input_contract_sha256: ${oc.select:p1.visual_camera_input_contract_hashes.${p1.visual_backbone.input_size}}
+
+data:
+  train:
+    return_p1_camera_uint8: false
+    return_visual_camera_uint8: true
+    visual_camera_ids: ${p1.camera_ids}
+    visual_camera_input_size: ${p1.visual_backbone.input_size}
+    processor:
+      visual_camera_ids: ${p1.camera_ids}
+      visual_camera_input_size: ${p1.visual_backbone.input_size}
+  validation:
+    return_p1_camera_uint8: false
+    return_visual_camera_uint8: true
+    visual_camera_ids: ${p1.camera_ids}
+    visual_camera_input_size: ${p1.visual_backbone.input_size}
+    processor:
+      visual_camera_ids: ${p1.camera_ids}
+      visual_camera_input_size: ${p1.visual_backbone.input_size}
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

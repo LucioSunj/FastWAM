@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from pathlib import Path
-from typing import List, Literal, Dict, Optional, Any, DefaultDict
+from typing import List, Dict, Optional, Any, DefaultDict
 from tqdm import tqdm
 from .lerobot.lerobot_dataset import LeRobotDatasetMetadata, MultiLeRobotDataset
 
@@ -14,31 +14,32 @@ logger = get_logger(__name__)
 
 MAX_GETITEM_ATTEMPT = 5
 
+
 class BaseLerobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         dataset_dirs: List[str],
-
         # shapes
         shape_meta: Dict[str, Any],
-        action_size: int = 1, 
-        past_action_size: int = 0, # Excludes the current frame
-        obs_size: int = 1, # should be 
+        action_size: int = 1,
+        past_action_size: int = 0,  # Excludes the current frame
+        obs_size: int = 1,  # should be
         past_obs_size: int = 0,
-
         # train vs val
-        val_set_proportion: float = 0.05, 
+        val_set_proportion: float = 0.05,
         is_training_set: bool = False,
         seed: int = 42,
-
         # sampling
         global_sample_stride: int = 1,
+        image_current_frame_only: bool = False,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
         assert past_obs_size == 0
-        assert action_size == obs_size - 1, "In this dataset, action_size should be obs_size - 1"
-        
+        assert action_size == obs_size - 1, (
+            "In this dataset, action_size should be obs_size - 1"
+        )
+
         self.dataset_dirs = dataset_dirs
         self.shape_meta = shape_meta
         self.action_size = action_size
@@ -53,10 +54,13 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             metas.append(meta)
 
         fps_list = [m.fps for m in metas]
-        assert len(set(fps_list)) == 1, f"All dataset_dirs must have the same fps, got {fps_list}"
+        assert len(set(fps_list)) == 1, (
+            f"All dataset_dirs must have the same fps, got {fps_list}"
+        )
         fps = fps_list[0]
-        
+
         self.global_sample_stride = global_sample_stride
+        self.image_current_frame_only = bool(image_current_frame_only)
 
         self.val_set_proportion = val_set_proportion
         self.is_training_set = is_training_set
@@ -68,22 +72,37 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         delta_timestamps = {}
         for meta in self.image_meta:
             key = meta["key"]
-            meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
+            meta["lerobot_key"] = (
+                f"observation.images.{key}"
+                if key != "default"
+                else "observation.images"
+            )
+            image_steps = (
+                (0,)
+                if self.image_current_frame_only
+                else range(-past_obs_size, -past_obs_size + obs_size)
+            )
             delta_timestamps[meta["lerobot_key"]] = [
-                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
+                (t * global_sample_stride) / fps for t in image_steps
             ]
-        
+
         for meta in self.state_meta:
             key = meta["key"]
-            meta["lerobot_key"] = f"observation.state.{key}" if key != "default" else "observation.state"
+            meta["lerobot_key"] = (
+                f"observation.state.{key}" if key != "default" else "observation.state"
+            )
             delta_timestamps[meta["lerobot_key"]] = [
-                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
+                (t * global_sample_stride) / fps
+                for t in range(-past_obs_size, -past_obs_size + obs_size)
             ]
-        
+
         for meta in self.action_meta:
             key = meta["key"]
             meta["lerobot_key"] = f"action.{key}" if key != "default" else "action"
-            delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
+            delta_timestamps[meta["lerobot_key"]] = [
+                (t * global_sample_stride) / fps
+                for t in range(-past_action_size, -past_action_size + action_size)
+            ]
 
         episodes = {}
         if val_set_proportion < 1e-6:
@@ -97,16 +116,25 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 rng = np.random.default_rng(seed)
                 rng.shuffle(episode_indices)
                 if self.is_training_set:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx)]})
+                    episodes.update(
+                        {meta.repo_id: [episode_indices[i] for i in range(split_idx)]}
+                    )
                 else:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
+                    episodes.update(
+                        {
+                            meta.repo_id: [
+                                episode_indices[i]
+                                for i in range(split_idx, meta.total_episodes)
+                            ]
+                        }
+                    )
 
         self.multi_dataset = MultiLeRobotDataset(
             dataset_dirs=self.dataset_dirs,
             episodes=episodes,
             delta_timestamps=delta_timestamps,
         )
-        
+
         # HACK: lerobot 3.0 will fix this
         episode_data_index = []
         end_index = 0
@@ -124,35 +152,47 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         }
 
     def _get_action(self, meta, lerobot_sample) -> torch.Tensor:
-        key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
-        action: torch.Tensor = lerobot_sample[lerobot_key] # [T, action_dim]
-        if action.ndim == 1: # for shape of 1, like gripper
+        key, lerobot_key, raw_shape = (
+            meta["key"],
+            meta["lerobot_key"],
+            meta["raw_shape"],
+        )
+        action: torch.Tensor = lerobot_sample[lerobot_key]  # [T, action_dim]
+        if action.ndim == 1:  # for shape of 1, like gripper
             action = action.unsqueeze(-1)
-        assert action.shape[-1] == raw_shape, f"Action '{key}' shape {action.shape[-1]} mismatch with meta {raw_shape}."
+        assert action.shape[-1] == raw_shape, (
+            f"Action '{key}' shape {action.shape[-1]} mismatch with meta {raw_shape}."
+        )
         return action
 
     def _get_state(self, meta, lerobot_sample) -> torch.Tensor:
-        key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
+        key, lerobot_key, raw_shape = (
+            meta["key"],
+            meta["lerobot_key"],
+            meta["raw_shape"],
+        )
         state: torch.Tensor = lerobot_sample[lerobot_key]
-        if state.ndim == 1: # for shape of 1, like gripper
+        if state.ndim == 1:  # for shape of 1, like gripper
             state = state.unsqueeze(-1)
         # state = state[..., :-1, :]  # use state_{t} as observation_t
-        assert state.shape[-1] == raw_shape, f"State '{key}' shape {state.shape[-1]} mismatch with meta {raw_shape}."
+        assert state.shape[-1] == raw_shape, (
+            f"State '{key}' shape {state.shape[-1]} mismatch with meta {raw_shape}."
+        )
         return state
-    
+
     def _get_image(self, meta, lerobot_sample) -> torch.Tensor:
-        key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]
+        lerobot_key = meta["lerobot_key"]
         image: torch.Tensor = lerobot_sample[lerobot_key]
-        if image.ndim == 3: # time dim will lost when obs_size is 1
-            image = image.unsqueeze(0)        
-        image = (image * 255).to(torch.uint8) # (1, 3, H, W)
+        if image.ndim == 3:  # time dim will lost when obs_size is 1
+            image = image.unsqueeze(0)
+        image = (image * 255).to(torch.uint8)  # (1, 3, H, W)
         # For config simplication
         # assert image.shape[1:] == raw_shape, f"Image '{key}' shape {image.shape[1:]} mismatch with {raw_shape}."
         return image
-    
+
     def _split_lerobot_sample(self, lerobot_sample) -> Dict[str, Any]:
         return lerobot_sample
-    
+
     def _get_episode_data(self, episode_idx):
         lerobot_sample = self.multi_dataset.get_episode_data(episode_idx)
         lerobot_sample = self._split_lerobot_sample(lerobot_sample)
@@ -222,9 +262,15 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         for meta in self.image_meta:
             sample["images"][meta["key"]] = self._get_image(meta, lerobot_sample)
 
-        sample["action_is_pad"] = lerobot_sample[f"{self.action_meta[0]['lerobot_key']}_is_pad"]
-        sample["state_is_pad"] = lerobot_sample[f"{self.state_meta[0]['lerobot_key']}_is_pad"]
-        sample["image_is_pad"] = lerobot_sample[f"{self.image_meta[0]['lerobot_key']}_is_pad"]
+        sample["action_is_pad"] = lerobot_sample[
+            f"{self.action_meta[0]['lerobot_key']}_is_pad"
+        ]
+        sample["state_is_pad"] = lerobot_sample[
+            f"{self.state_meta[0]['lerobot_key']}_is_pad"
+        ]
+        sample["image_is_pad"] = lerobot_sample[
+            f"{self.image_meta[0]['lerobot_key']}_is_pad"
+        ]
 
         sample = self._get_additional_data(sample, lerobot_sample)
 
@@ -264,61 +310,87 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         action_q99 = DefaultDict(list)
 
         episodes_num = self.multi_dataset.num_episodes
-        
+
         def process_episode(episode_idx):
-            batch = self._get_episode_data(episode_idx) 
+            batch = self._get_episode_data(episode_idx)
             batch = preprocessor.action_state_transform(batch)
             return batch
-        
+
         multi_thread = True
         if not multi_thread:
-            for episode_idx in tqdm(range(episodes_num), desc="Iterating dataset to get normalization"):
+            for episode_idx in tqdm(
+                range(episodes_num), desc="Iterating dataset to get normalization"
+            ):
                 batch = process_episode(episode_idx)
                 for meta in self.state_meta:
                     key = meta["key"]
-                    cur_state: torch.Tensor = batch["state"][key] # (B, T, dim)
+                    cur_state: torch.Tensor = batch["state"][key]  # (B, T, dim)
                     state_min[key].append(cur_state.amin(0))
                     state_max[key].append(cur_state.amax(0))
                     state_mean[key].append(cur_state.mean(0))
                     state_var[key].append(cur_state.var(0))
-                    state_q01[key].append(torch.quantile(cur_state, 0.01, dim=0, keepdim=False))
-                    state_q99[key].append(torch.quantile(cur_state, 0.99, dim=0, keepdim=False))
+                    state_q01[key].append(
+                        torch.quantile(cur_state, 0.01, dim=0, keepdim=False)
+                    )
+                    state_q99[key].append(
+                        torch.quantile(cur_state, 0.99, dim=0, keepdim=False)
+                    )
                 for meta in self.action_meta:
                     key = meta["key"]
-                    cur_action: torch.Tensor = batch["action"][key] # (B, T, dim)
+                    cur_action: torch.Tensor = batch["action"][key]  # (B, T, dim)
                     action_min[key].append(cur_action.amin(0))
                     action_max[key].append(cur_action.amax(0))
                     action_mean[key].append(cur_action.mean(0))
                     action_var[key].append(cur_action.var(0))
-                    action_q01[key].append(torch.quantile(cur_action, 0.01, dim=0, keepdim=False))
-                    action_q99[key].append(torch.quantile(cur_action, 0.99, dim=0, keepdim=False))
-        
+                    action_q01[key].append(
+                        torch.quantile(cur_action, 0.01, dim=0, keepdim=False)
+                    )
+                    action_q99[key].append(
+                        torch.quantile(cur_action, 0.99, dim=0, keepdim=False)
+                    )
+
         else:
             with ThreadPoolExecutor() as executor:
-                futures = [executor.submit(process_episode, num) for num in range(episodes_num)]
-                
-                for future in tqdm(as_completed(futures), total=episodes_num, desc="Iterating dataset to get normalization"):
+                futures = [
+                    executor.submit(process_episode, num) for num in range(episodes_num)
+                ]
+
+                for future in tqdm(
+                    as_completed(futures),
+                    total=episodes_num,
+                    desc="Iterating dataset to get normalization",
+                ):
                     try:
                         batch = future.result()
                         for meta in self.state_meta:
                             key = meta["key"]
-                            cur_state: torch.Tensor = batch["state"][key] # (B, T, dim)
+                            cur_state: torch.Tensor = batch["state"][key]  # (B, T, dim)
                             state_min[key].append(cur_state.amin(0))
                             state_max[key].append(cur_state.amax(0))
                             state_mean[key].append(cur_state.mean(0))
                             state_var[key].append(cur_state.var(0))
-                            state_q01[key].append(torch.quantile(cur_state, 0.01, dim=0, keepdim=False))
-                            state_q99[key].append(torch.quantile(cur_state, 0.99, dim=0, keepdim=False))
+                            state_q01[key].append(
+                                torch.quantile(cur_state, 0.01, dim=0, keepdim=False)
+                            )
+                            state_q99[key].append(
+                                torch.quantile(cur_state, 0.99, dim=0, keepdim=False)
+                            )
 
                         for meta in self.action_meta:
                             key = meta["key"]
-                            cur_action: torch.Tensor = batch["action"][key] # (B, T, dim)
+                            cur_action: torch.Tensor = batch["action"][
+                                key
+                            ]  # (B, T, dim)
                             action_min[key].append(cur_action.amin(0))
                             action_max[key].append(cur_action.amax(0))
                             action_mean[key].append(cur_action.mean(0))
                             action_var[key].append(cur_action.var(0))
-                            action_q01[key].append(torch.quantile(cur_action, 0.01, dim=0, keepdim=False))
-                            action_q99[key].append(torch.quantile(cur_action, 0.99, dim=0, keepdim=False))
+                            action_q01[key].append(
+                                torch.quantile(cur_action, 0.01, dim=0, keepdim=False)
+                            )
+                            action_q99[key].append(
+                                torch.quantile(cur_action, 0.99, dim=0, keepdim=False)
+                            )
 
                     except Exception as e:
                         logger.error(f"Error processing episode: {e}")
@@ -335,17 +407,30 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             global_std = (vars + (means - global_mean) ** 2).mean((0, 1)).sqrt()
             return stepwise_mean, stepwise_std, global_mean, global_std
 
-        stats = {"state": DefaultDict(dict), "action": DefaultDict(dict), "num_episodes": episodes_num, "num_transition": self.multi_dataset.num_frames}
+        stats = {
+            "state": DefaultDict(dict),
+            "action": DefaultDict(dict),
+            "num_episodes": episodes_num,
+            "num_transition": self.multi_dataset.num_frames,
+        }
         for meta in self.state_meta:
             key = meta["key"]
             stats["state"][key]["stepwise_min"] = torch.stack(state_min[key]).amin(0)
             stats["state"][key]["stepwise_max"] = torch.stack(state_max[key]).amax(0)
-            stats["state"][key]["global_min"] = stats["state"][key]["stepwise_min"].amin(0)
-            stats["state"][key]["global_max"] = stats["state"][key]["stepwise_max"].amax(0)
+            stats["state"][key]["global_min"] = stats["state"][key][
+                "stepwise_min"
+            ].amin(0)
+            stats["state"][key]["global_max"] = stats["state"][key][
+                "stepwise_max"
+            ].amax(0)
             stats["state"][key]["stepwise_q01"] = torch.stack(state_q01[key]).amin(0)
             stats["state"][key]["stepwise_q99"] = torch.stack(state_q99[key]).amax(0)
-            stats["state"][key]["global_q01"] = stats["state"][key]["stepwise_q01"].amin(0)
-            stats["state"][key]["global_q99"] = stats["state"][key]["stepwise_q99"].amax(0)
+            stats["state"][key]["global_q01"] = stats["state"][key][
+                "stepwise_q01"
+            ].amin(0)
+            stats["state"][key]["global_q99"] = stats["state"][key][
+                "stepwise_q99"
+            ].amax(0)
             (
                 stats["state"][key]["stepwise_mean"],
                 stats["state"][key]["stepwise_std"],
@@ -357,16 +442,24 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             key = meta["key"]
             stats["action"][key]["stepwise_min"] = torch.stack(action_min[key]).amin(0)
             stats["action"][key]["stepwise_max"] = torch.stack(action_max[key]).amax(0)
-            stats["action"][key]["global_min"] = stats["action"][key]["stepwise_min"].amin(0)
-            stats["action"][key]["global_max"] = stats["action"][key]["stepwise_max"].amax(0)
+            stats["action"][key]["global_min"] = stats["action"][key][
+                "stepwise_min"
+            ].amin(0)
+            stats["action"][key]["global_max"] = stats["action"][key][
+                "stepwise_max"
+            ].amax(0)
             stats["action"][key]["stepwise_q01"] = torch.stack(action_q01[key]).amin(0)
             stats["action"][key]["stepwise_q99"] = torch.stack(action_q99[key]).amax(0)
-            stats["action"][key]["global_q01"] = stats["action"][key]["stepwise_q01"].amin(0)
-            stats["action"][key]["global_q99"] = stats["action"][key]["stepwise_q99"].amax(0)
+            stats["action"][key]["global_q01"] = stats["action"][key][
+                "stepwise_q01"
+            ].amin(0)
+            stats["action"][key]["global_q99"] = stats["action"][key][
+                "stepwise_q99"
+            ].amax(0)
             (
-                stats["action"][key]["stepwise_mean"], 
-                stats["action"][key]["stepwise_std"], 
-                stats["action"][key]["global_mean"], 
+                stats["action"][key]["stepwise_mean"],
+                stats["action"][key]["stepwise_std"],
+                stats["action"][key]["global_mean"],
                 stats["action"][key]["global_std"],
             ) = get_mean_std(action_mean[key], action_var[key])
 
@@ -377,29 +470,29 @@ def sliding_window_with_replication(x: torch.Tensor, window_size: int) -> torch.
     """
     Construct a sliding-window tensor from the input tensor x (shape: [N, D]).
     The output shape is [N, window_size, D].
-    
+
     For each starting index i:
         out[i, j, :] =
             x[i + j, :]      if i + j < N
             x[-1, :]         otherwise (replicate the last row when out of bounds)
-    
+
     Args:
         x (torch.Tensor): Input tensor of shape [N, D]
         window_size (int): Size of the sliding window
-    
+
     Returns:
         torch.Tensor: Tensor of shape [N, window_size, D]
     """
     assert x.dim() == 2
     assert window_size > 0
-    
+
     N, D = x.shape
-    
+
     # shape [N, window_size]
     # indices[i, j] = i + j
-    i_indices = torch.arange(N).unsqueeze(1)            # [N, 1]
+    i_indices = torch.arange(N).unsqueeze(1)  # [N, 1]
     j_indices = torch.arange(window_size).unsqueeze(0)  # [1, window_size]
-    indices = i_indices + j_indices                     # [N, window_size]
+    indices = i_indices + j_indices  # [N, window_size]
 
     # N-1
     # torch.clamp  [0, N-1]
