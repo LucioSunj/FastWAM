@@ -270,6 +270,148 @@ def test_cached_action_forward_tap_excludes_generated_future_video() -> None:
         assert layer.current_frame_video.sequence_length == 2
 
 
+def test_condition_reader_matches_gate_video_and_context_banks() -> None:
+    mot = _mot()
+    generator = torch.Generator().manual_seed(23)
+    context = torch.randn(2, 5, 8, generator=generator)
+    context_mask = torch.tensor(
+        [[True, True, True, False, False], [True, True, True, True, False]]
+    )
+    video_cache = []
+    for _ in range(2):
+        video_cache.append(
+            {
+                "k": torch.randn(2, 6, 8, generator=generator),
+                "v": torch.randn(2, 6, 8, generator=generator),
+                "_gate_current_frame_video_tokens": 2,
+            }
+        )
+
+    condition_layer = mot.read_condition_layer_kv(
+        layer_index=1,
+        video_kv_cache=video_cache,
+        current_frame_video_tokens=2,
+        context=context,
+        context_mask=context_mask,
+    )
+    tap = GateKVTapRequest(
+        current_mode="idm",
+        denoise_timestep=0.4,
+        current_frame_video_tokens=2,
+        layer_indices=(1,),
+    )
+    mot.forward_action_with_video_cache(
+        action_tokens=torch.randn(2, 3, 8, generator=generator),
+        action_freqs=_freqs(3),
+        action_t_mod=torch.zeros(2, 6, 8),
+        action_context_payload={
+            "context": context,
+            "mask": context_mask[:, None, :].expand(-1, 3, -1),
+        },
+        video_kv_cache=video_cache,
+        attention_mask=torch.ones(9, 9, dtype=torch.bool),
+        video_seq_len=6,
+        kv_tap=tap,
+    )
+    gate_layer = tap.snapshot().layers[0]
+
+    assert torch.equal(
+        condition_layer.current_frame_video.key,
+        gate_layer.current_frame_video.key,
+    )
+    assert torch.equal(
+        condition_layer.current_frame_video.value,
+        gate_layer.current_frame_video.value,
+    )
+    assert torch.equal(condition_layer.context.key, gate_layer.context.key)
+    assert torch.equal(condition_layer.context.value, gate_layer.context.value)
+    assert torch.equal(condition_layer.context.valid_mask, context_mask)
+    assert not condition_layer.current_frame_video.key.requires_grad
+    assert not condition_layer.context.key.requires_grad
+    assert not hasattr(condition_layer, "action")
+
+
+def test_condition_reader_excludes_future_video_and_requires_provenance() -> None:
+    mot = _mot()
+    generator = torch.Generator().manual_seed(31)
+    current_key = torch.randn(1, 2, 8, generator=generator)
+    current_value = torch.randn(1, 2, 8, generator=generator)
+
+    def cache(future: float, *, provenanced: bool) -> list[dict]:
+        result = []
+        for _ in range(2):
+            layer = {
+                "k": torch.cat((current_key, torch.full((1, 4, 8), future)), dim=1),
+                "v": torch.cat((current_value, torch.full((1, 4, 8), -future)), dim=1),
+            }
+            if provenanced:
+                layer["_gate_current_frame_video_tokens"] = 2
+            result.append(layer)
+        return result
+
+    kwargs = {
+        "layer_index": 1,
+        "current_frame_video_tokens": 2,
+        "context": torch.randn(1, 3, 8, generator=generator),
+        "context_mask": torch.ones(1, 3, dtype=torch.bool),
+    }
+    first = mot.read_condition_layer_kv(
+        video_kv_cache=cache(100.0, provenanced=True), **kwargs
+    )
+    second = mot.read_condition_layer_kv(
+        video_kv_cache=cache(-100.0, provenanced=True), **kwargs
+    )
+
+    assert torch.equal(first.current_frame_video.key, second.current_frame_video.key)
+    assert torch.equal(
+        first.current_frame_video.value, second.current_frame_video.value
+    )
+    with pytest.raises(ValueError, match="provenance"):
+        mot.read_condition_layer_kv(
+            video_kv_cache=cache(0.0, provenanced=False), **kwargs
+        )
+
+
+def test_current_only_prefill_matches_causal_full_video_prefix(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda _message: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    mot = _mot()
+    generator = torch.Generator().manual_seed(37)
+    video_tokens = torch.randn(2, 6, 8, generator=generator)
+    full_mask = torch.ones(6, 6, dtype=torch.bool)
+    full_mask[:2, 2:] = False
+    current_mask = torch.ones(2, 2, dtype=torch.bool)
+    video_t_mod = torch.zeros(2, 6, 8)
+    video_context = torch.randn(2, 5, 8, generator=generator)
+
+    full_cache = mot.prefill_video_cache(
+        video_tokens=video_tokens,
+        video_freqs=_freqs(6),
+        video_t_mod=video_t_mod,
+        video_context_payload={
+            "context": video_context,
+            "mask": torch.ones(2, 6, 5, dtype=torch.bool),
+        },
+        video_attention_mask=full_mask,
+        gate_current_frame_video_tokens=2,
+    )
+    current_cache = mot.prefill_video_cache(
+        video_tokens=video_tokens[:, :2],
+        video_freqs=_freqs(2),
+        video_t_mod=video_t_mod,
+        video_context_payload={
+            "context": video_context,
+            "mask": torch.ones(2, 2, 5, dtype=torch.bool),
+        },
+        video_attention_mask=current_mask,
+        gate_current_frame_video_tokens=2,
+    )
+
+    for full_layer, current_layer in zip(full_cache, current_cache, strict=True):
+        torch.testing.assert_close(full_layer["k"][:, :2], current_layer["k"])
+        torch.testing.assert_close(full_layer["v"][:, :2], current_layer["v"])
+
+
 def test_tap_rejects_direct_future_video_leak_after_layer_zero() -> None:
     mot = _mot()
     inputs = _joint_inputs()

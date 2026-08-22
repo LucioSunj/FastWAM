@@ -11,6 +11,7 @@ from torch.cuda import nvtx
 
 from fastwam.utils.logging_config import get_logger
 
+from .condition_kv import ConditionLayerKV
 from .kv_tap import (
     GateKVTapRequest,
     GateLayerKV,
@@ -185,6 +186,125 @@ class MoT(nn.Module):
                 "Gate capture after layer 0 requires video K/V cache provenance "
                 f"for exactly {expected} causal current-frame tokens."
             )
+
+    def _validate_condition_cache_provenance(
+        self,
+        *,
+        layer_index: int,
+        layer_cache: dict[str, Any],
+        current_frame_video_tokens: int,
+    ) -> None:
+        """Validate that a later-layer current prefix is causally reusable."""
+
+        if layer_index == 0:
+            return
+        observed = layer_cache.get(_GATE_CURRENT_FRAME_PROVENANCE_KEY)
+        if observed != current_frame_video_tokens:
+            raise ValueError(
+                "Condition K/V capture after layer 0 requires video-cache "
+                "provenance for exactly "
+                f"{current_frame_video_tokens} causal current-frame tokens."
+            )
+
+    @staticmethod
+    def _project_context_bank(
+        *,
+        action_block: nn.Module,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None,
+    ) -> KeyValueBank:
+        """Project one ActionDiT layer's prompt/state context K/V."""
+
+        valid_mask = context_token_mask(context_mask, context=context)
+        with torch.no_grad():
+            context_k = action_block.cross_attn.norm_k(
+                action_block.cross_attn.k(context)
+            )
+            context_v = action_block.cross_attn.v(context)
+        return KeyValueBank(
+            source=KVSource.TEXT_STATE_CONTEXT,
+            key=context_k.detach(),
+            value=context_v.detach(),
+            valid_mask=valid_mask.detach(),
+        )
+
+    def read_condition_layer_kv(
+        self,
+        *,
+        layer_index: int,
+        video_kv_cache: list[dict[str, Any]],
+        current_frame_video_tokens: int,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None,
+    ) -> ConditionLayerKV:
+        """Read detached current-video and prompt/state K/V at one MoT layer.
+
+        ``context`` must already use the same frozen ActionDiT text projection
+        as normal action cross-attention. This method runs no video or action
+        block and never reads action/future/timestep state.
+        """
+
+        if isinstance(layer_index, bool) or not isinstance(layer_index, int):
+            raise TypeError("`layer_index` must be an integer.")
+        if layer_index < 0 or layer_index >= self.num_layers:
+            raise ValueError(
+                f"Layer index {layer_index} is outside a {self.num_layers}-layer MoT."
+            )
+        if len(video_kv_cache) != self.num_layers:
+            raise ValueError(
+                "`video_kv_cache` must contain every MoT layer, got "
+                f"{len(video_kv_cache)} for {self.num_layers}."
+            )
+        layer_cache = video_kv_cache[layer_index]
+        if "k" not in layer_cache or "v" not in layer_cache:
+            raise ValueError(
+                f"`video_kv_cache[{layer_index}]` must contain `k` and `v`."
+            )
+        video_k = layer_cache["k"]
+        video_v = layer_cache["v"]
+        if video_k.ndim != 3 or video_k.shape != video_v.shape:
+            raise ValueError(
+                "Cached video K/V must have matching [B, S, D] shapes, got "
+                f"{tuple(video_k.shape)} and {tuple(video_v.shape)}."
+            )
+        current_length = int(current_frame_video_tokens)
+        if current_length < 1 or current_length > video_k.shape[1]:
+            raise ValueError(
+                "`current_frame_video_tokens` must lie in the cached sequence, "
+                f"got {current_length} for {video_k.shape[1]} tokens."
+            )
+        if context.ndim != 3 or context.shape[0] != video_k.shape[0]:
+            raise ValueError(
+                "Projected context must be [B, L, D] with the video-cache batch, "
+                f"got {tuple(context.shape)} for batch {video_k.shape[0]}."
+            )
+        self._validate_condition_cache_provenance(
+            layer_index=layer_index,
+            layer_cache=layer_cache,
+            current_frame_video_tokens=current_length,
+        )
+        batch_size = int(video_k.shape[0])
+        video_bank = KeyValueBank(
+            source=KVSource.CURRENT_FRAME_VIDEO,
+            key=video_k[:, :current_length].detach(),
+            value=video_v[:, :current_length].detach(),
+            valid_mask=torch.ones(
+                (batch_size, current_length),
+                dtype=torch.bool,
+                device=video_k.device,
+            ),
+            contains_generated_future_video=False,
+        )
+        context_bank = self._project_context_bank(
+            action_block=self.mixtures["action"].blocks[layer_index],
+            context=context,
+            context_mask=context_mask,
+        )
+        return ConditionLayerKV(
+            layer_index=layer_index,
+            current_frame_video=video_bank,
+            context=context_bank,
+        ).detached()
 
     @staticmethod
     def _apply_expert_post_block(
@@ -639,15 +759,11 @@ class MoT(nn.Module):
         ):
             raise ValueError("Gate K/V capture requires the action text/state context.")
         context = action_context_payload["context"]
-        context_mask = context_token_mask(
-            action_context_payload.get("mask"),
+        context_bank = self._project_context_bank(
+            action_block=action_block,
             context=context,
+            context_mask=action_context_payload.get("mask"),
         )
-        with torch.no_grad():
-            context_k = action_block.cross_attn.norm_k(
-                action_block.cross_attn.k(context)
-            )
-            context_v = action_block.cross_attn.v(context)
 
         batch_size = action_k.shape[0]
         timestep = kv_tap.normalized_timestep(
@@ -682,12 +798,7 @@ class MoT(nn.Module):
                         device=action_k.device,
                     ),
                 ),
-                context=KeyValueBank(
-                    source=KVSource.TEXT_STATE_CONTEXT,
-                    key=context_k,
-                    value=context_v,
-                    valid_mask=context_mask,
-                ),
+                context=context_bank,
                 actor_version=kv_tap.actor_version,
             )
         )
