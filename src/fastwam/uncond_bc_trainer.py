@@ -463,6 +463,9 @@ def _build_loaders(
     }
     if int(cfg.data.num_workers) > 0:
         common["prefetch_factor"] = int(cfg.data.prefetch_factor)
+        multiprocessing_context = cfg.data.get("multiprocessing_context")
+        if multiprocessing_context is not None:
+            common["multiprocessing_context"] = str(multiprocessing_context)
     train_generator = torch.Generator().manual_seed(int(cfg.seed))
     validation_generator = torch.Generator().manual_seed(int(cfg.validation.seed))
     train_loader = DataLoader(
