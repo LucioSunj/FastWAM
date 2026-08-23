@@ -1,0 +1,19 @@
+# @package _global_
+
+defaults:
+  - libero_causal_dual_mode
+  - _self_
+
+# Operational path overlay only. Scientific hashes, data identities, and
+# optimization settings remain inherited from libero_causal_dual_mode.
+parent:
+  checkpoint: /data0/Checkpoints/fastwam-idm/libero-wan-robot/fastwam-idm-libero-wan-robot-init-step_021700.pt
+  statistics: /data0/Checkpoints/fastwam-idm/uncond-lora-bc/dataset_stats.json
+
+provenance:
+  dataset_paths:
+    - /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+    - /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_object_no_noops_lerobot
+    - /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_goal_no_noops_lerobot
+    - /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_10_no_noops_lerobot
+  text_cache_path: /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/repo-runs-performance-assets/text_embeds_cache/libero

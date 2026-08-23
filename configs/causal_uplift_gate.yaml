@@ -1,0 +1,52 @@
+# @package _global_
+
+schema: causal-uplift-gate-v1
+seed: 42
+
+model:
+  hidden_size: 256
+  query_tokens: 4
+  blocks: 4
+  attention_heads: 8
+  current_kv_layers: all_30
+  history_chunks: 4
+  proprio_dim: 8
+  detach_inputs: true
+  modes: [c0_current, c2_full]
+  proposal_variants: [one_proposal, two_proposal]
+
+loss:
+  bce: 1.0
+  uplift_huber: 0.5
+  ranking: 0.2
+  uncertainty_nll: 0.1
+  brier: 0.1
+  huber_delta: 0.5
+  ranking_minimum_empirical_uplift_gap: 0.5
+
+training:
+  optimizer: adamw
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  batch_size: 256
+  maximum_epochs: 200
+  patience: 15
+  checkpoint_primary: validation_50pct_budget_policy_value
+  checkpoint_tiebreak: validation_brier
+  calibration_tasks: fold_validation_only
+  temperature_per_outcome_head: true
+
+routing:
+  beta_candidates: [0.0, 0.5, 1.0]
+  switching_penalty: 0.0
+  budgets_percent: [0, 25, 50, 75, 100]
+  cost_source: measured_critical_path_latency
+  fastest_mode_cost: 0.0
+  route_timing: before_current_chunk
+  first_chunk_forced_mode: null
+  exhausted_budget_mode: c0_current
+
+selection:
+  proposal_value_difference_choose_one_below: 0.01
+  held_out_oracle_gap_closed_minimum: 0.25
+  simple_rule_gap_switch_threshold: 0.01

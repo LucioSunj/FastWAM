@@ -1,0 +1,21 @@
+# @package _global_
+
+defaults:
+  - libero_uncond_lora_bc
+  - _self_
+
+data:
+  multiprocessing_context: spawn
+  # TorchCodec is importable in the pinned environment but cannot load its
+  # FFmpeg libraries. Select the existing PyAV backend before workers start.
+  video_backend: pyav
+
+causal_contract:
+  checkpoint_schema: fastwam-shared-causal-policy-v1
+  parent_checkpoint_sha256: e979511a2d7a1310009496c6b2f06957171bba28b96aac0d513992c6ed21ca5a
+  statistics_sha256: 30f81ad7d5076e97323e3328bce003e01a04cb21327b5bacd21bb72846768638
+  source_episodes: 1712
+  source_transitions: 277713
+  current_mode_zero_video_denoise_calls: true
+  current_prefix_exact_acceptance: true
+  no_read_exact_negative_control: true

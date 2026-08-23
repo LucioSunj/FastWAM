@@ -1,0 +1,18 @@
+# @package _global_
+
+defaults:
+  - causal_dual_mode
+  - _self_
+
+runner:
+  stage: adapter_exposure_diagnostic
+  output_dir: ${oc.env:FASTWAM_CAUSAL_CURRENT_OUTPUT_DIR,./runs/causal_prediction_current/${now:%Y-%m-%d}_${now:%H-%M-%S}}
+
+training:
+  exposure: current_only
+  samples_per_optimizer_step:
+    c0_current: 128
+
+selection:
+  attempt: current_only_diagnostic
+  distillation_weight: 1.0

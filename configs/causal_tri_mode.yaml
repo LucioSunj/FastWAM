@@ -1,0 +1,28 @@
+# @package _global_
+
+defaults:
+  - causal_dual_mode
+  - _self_
+
+runner:
+  stage: conditional_c1
+  output_dir: ${oc.env:FASTWAM_CAUSAL_TRI_OUTPUT_DIR,./runs/causal_prediction_tri/${now:%Y-%m-%d}_${now:%H-%M-%S}}
+
+training:
+  exposure: tri_mode
+  samples_per_optimizer_step:
+    step_0: [43, 43, 42]
+    step_1: [42, 43, 43]
+    step_2: [43, 42, 43]
+
+selection:
+  attempt: tri_mode
+
+causal_policy:
+  modes: [c0_current, c1_one_pass, c2_full]
+
+c1_one_pass:
+  video_timestep: 1.0
+  layer_stride: 4
+  selected_layers: [0, 4, 8, 12, 16, 20, 24, 28]
+  expected_layers: 30
