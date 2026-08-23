@@ -154,11 +154,21 @@ class RegimeLoRAConfig:
         object.__setattr__(self, "target_groups", groups)
 
 
+# Trainable LoRA factors are kept in FP32 regardless of the frozen base dtype.
+# A BF16 parameter silently discards any optimizer update smaller than half its
+# unit-in-last-place, and the Adam step for these factors is one to two orders
+# of magnitude below that threshold, so a BF16 adapter never leaves its
+# initialization. See `docs/BF16_PARAMETER_UPDATE_LOSS.md`.
+LORA_MASTER_DTYPE = torch.float32
+
+
 class RegimeLoRALinear(nn.Linear):
     """An additive LoRA projection that is active only in UNCOND.
 
     The original ``weight`` and ``bias`` Parameter objects are retained, so base
-    checkpoint key names do not change after injection.
+    checkpoint key names do not change after injection. The LoRA factors are
+    FP32 master weights and are cast to the base dtype at use, so the delta is
+    computed in the frozen base precision while the optimizer writes FP32.
     """
 
     def __init__(
@@ -197,7 +207,7 @@ class RegimeLoRALinear(nn.Linear):
                 self.rank,
                 self.in_features,
                 device=self.weight.device,
-                dtype=self.weight.dtype,
+                dtype=LORA_MASTER_DTYPE,
             )
         )
         self.lora_B = nn.Parameter(
@@ -205,7 +215,7 @@ class RegimeLoRALinear(nn.Linear):
                 self.out_features,
                 self.rank,
                 device=self.weight.device,
-                dtype=self.weight.dtype,
+                dtype=LORA_MASTER_DTYPE,
             )
         )
         self.reset_lora_parameters()
@@ -223,8 +233,11 @@ class RegimeLoRALinear(nn.Linear):
         output = F.linear(input, self.weight, self.bias)
         if self.regime_context.current is not PolicyRegime.UNCOND:
             return output
-        hidden = F.linear(self.lora_dropout(input), self.lora_A)
-        delta = F.linear(hidden, self.lora_B)
+        # Cast the FP32 master factors down at use. The delta therefore keeps
+        # the numerics of a fully base-dtype adapter while gradients still
+        # accumulate into the FP32 leaves the optimizer owns.
+        hidden = F.linear(self.lora_dropout(input), self.lora_A.to(dtype=input.dtype))
+        delta = F.linear(hidden, self.lora_B.to(dtype=input.dtype))
         return output + delta * self.scaling
 
 

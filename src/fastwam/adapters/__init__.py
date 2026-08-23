@@ -2,6 +2,7 @@
 
 from .regime_lora import (
     DEFAULT_ACTION_DIT_LORA_TARGETS,
+    LORA_MASTER_DTYPE,
     REGIME_LORA_SIDECAR_SCHEMA,
     ActionDiTLoRAAdapter,
     ActionLoRATargetGroup,
@@ -17,6 +18,7 @@ from .regime_lora import (
 
 __all__ = [
     "DEFAULT_ACTION_DIT_LORA_TARGETS",
+    "LORA_MASTER_DTYPE",
     "REGIME_LORA_SIDECAR_SCHEMA",
     "ActionDiTLoRAAdapter",
     "ActionLoRATargetGroup",

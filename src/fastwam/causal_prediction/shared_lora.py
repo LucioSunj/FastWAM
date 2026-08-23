@@ -26,6 +26,7 @@ from fastwam.adapters.regime_lora import (
     ActionLoRATargetGroup,
     BaseFreezeAudit,
     RegimeLoRAConfig,
+    LORA_MASTER_DTYPE,
     discover_action_dit_lora_targets,
 )
 
@@ -69,7 +70,12 @@ class SharedLoRAContext:
 
 
 class SharedLoRALinear(nn.Linear):
-    """An additive LoRA projection active in all causal compute modes."""
+    """An additive LoRA projection active in all causal compute modes.
+
+    The LoRA factors are FP32 master weights cast to the base dtype at use. A
+    reduced-precision factor would discard every optimizer step below half its
+    unit-in-last-place; see `docs/BF16_PARAMETER_UPDATE_LOSS.md`.
+    """
 
     def __init__(
         self,
@@ -103,7 +109,7 @@ class SharedLoRALinear(nn.Linear):
                 self.rank,
                 self.in_features,
                 device=self.weight.device,
-                dtype=self.weight.dtype,
+                dtype=LORA_MASTER_DTYPE,
             )
         )
         self.lora_B = nn.Parameter(
@@ -111,7 +117,7 @@ class SharedLoRALinear(nn.Linear):
                 self.out_features,
                 self.rank,
                 device=self.weight.device,
-                dtype=self.weight.dtype,
+                dtype=LORA_MASTER_DTYPE,
             )
         )
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
@@ -124,8 +130,13 @@ class SharedLoRALinear(nn.Linear):
         output = F.linear(input, self.weight, self.bias)
         if not self.shared_context.enabled:
             return output
-        hidden = F.linear(self.lora_dropout(input), self.lora_A)
-        return output + F.linear(hidden, self.lora_B) * self.scaling
+        # Cast the FP32 master factors down at use so the delta keeps the
+        # numerics of a base-dtype adapter while gradients accumulate in FP32.
+        hidden = F.linear(self.lora_dropout(input), self.lora_A.to(dtype=input.dtype))
+        return (
+            output
+            + F.linear(hidden, self.lora_B.to(dtype=input.dtype)) * self.scaling
+        )
 
 
 @dataclass(frozen=True)

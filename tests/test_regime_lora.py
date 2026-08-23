@@ -3,6 +3,7 @@ import copy
 import pytest
 import torch
 from fastwam.adapters import (
+    LORA_MASTER_DTYPE,
     ActionLoRATargetGroup,
     PolicyRegime,
     RegimeContext,
@@ -338,3 +339,65 @@ def test_behavior_replay_reference_restores_live_lora_after_scope() -> None:
     with pytest.raises(ValueError, match="actor version mismatch"):
         with adapter.use_replay_reference(actor_version=5):
             pass
+
+
+def test_lora_factors_are_fp32_master_weights_under_a_bf16_base():
+    """A BF16 factor would discard every optimizer step below half its ULP."""
+
+    base = nn.Linear(256, 128, dtype=torch.bfloat16)
+    for parameter in base.parameters():
+        parameter.requires_grad_(False)
+    adapted = RegimeLoRALinear(
+        base,
+        regime_context=RegimeContext(),
+        rank=16,
+        alpha=16,
+    )
+
+    assert adapted.weight.dtype is torch.bfloat16
+    assert adapted.lora_A.dtype is LORA_MASTER_DTYPE
+    assert adapted.lora_B.dtype is LORA_MASTER_DTYPE
+
+
+def test_lora_delta_is_computed_in_the_frozen_base_dtype():
+    """FP32 storage must not change the adapter's arithmetic precision."""
+
+    base = nn.Linear(256, 128, dtype=torch.bfloat16)
+    for parameter in base.parameters():
+        parameter.requires_grad_(False)
+    context = RegimeContext()
+    adapted = RegimeLoRALinear(base, regime_context=context, rank=16, alpha=16)
+    inputs = torch.randn(2, 4, 256, dtype=torch.bfloat16)
+
+    with context.use(PolicyRegime.UNCOND):
+        uncond = adapted(inputs)
+    with context.use(PolicyRegime.IDM):
+        idm = adapted(inputs)
+
+    assert uncond.dtype is torch.bfloat16
+    # `lora_B` is zero-initialized, so the adapter is an exact no-op at step 0.
+    assert torch.equal(uncond, idm)
+
+
+def test_small_optimizer_step_moves_every_lora_parameter():
+    """The defect this guards: a BF16 factor never left its initialization."""
+
+    base = nn.Linear(3072, 1024, dtype=torch.bfloat16)
+    for parameter in base.parameters():
+        parameter.requires_grad_(False)
+    context = RegimeContext()
+    adapted = RegimeLoRALinear(base, regime_context=context, rank=16, alpha=16)
+    optimizer = torch.optim.AdamW(
+        [adapted.lora_A, adapted.lora_B],
+        lr=1e-5,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
+    inputs = torch.randn(2, 8, 3072, dtype=torch.bfloat16)
+    before = adapted.lora_A.detach().clone()
+
+    with context.use(PolicyRegime.UNCOND):
+        adapted(inputs).float().square().mean().backward()
+    optimizer.step()
+
+    assert torch.all(adapted.lora_A != before)
