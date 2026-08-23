@@ -23,10 +23,10 @@ from torch import nn
 
 from fastwam.adapters.regime_lora import (
     DEFAULT_ACTION_DIT_LORA_TARGETS,
+    LORA_MASTER_DTYPE,
     ActionLoRATargetGroup,
     BaseFreezeAudit,
     RegimeLoRAConfig,
-    LORA_MASTER_DTYPE,
     discover_action_dit_lora_targets,
 )
 
@@ -134,8 +134,7 @@ class SharedLoRALinear(nn.Linear):
         # numerics of a base-dtype adapter while gradients accumulate in FP32.
         hidden = F.linear(self.lora_dropout(input), self.lora_A.to(dtype=input.dtype))
         return (
-            output
-            + F.linear(hidden, self.lora_B.to(dtype=input.dtype)) * self.scaling
+            output + F.linear(hidden, self.lora_B.to(dtype=input.dtype)) * self.scaling
         )
 
 

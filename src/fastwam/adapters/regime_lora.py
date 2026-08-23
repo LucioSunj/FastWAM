@@ -181,7 +181,7 @@ class RegimeLoRALinear(nn.Linear):
         dropout: float = 0.0,
     ) -> None:
         if isinstance(base, RegimeLoRALinear):
-            raise ValueError("Refusing to wrap an already adapted linear layer.")
+            raise TypeError("Refusing to wrap an already adapted linear layer.")
         if rank <= 0:
             raise ValueError(f"`rank` must be positive, got {rank}")
         if alpha <= 0:
@@ -431,7 +431,7 @@ class ActionDiTLoRAAdapter:
         trainable_lora: list[str] = []
         frozen_lora: list[str] = []
         for name, parameter in self.action_dit.named_parameters():
-            is_lora = name.endswith(".lora_A") or name.endswith(".lora_B")
+            is_lora = name.endswith((".lora_A", ".lora_B"))
             if is_lora and parameter.requires_grad:
                 trainable_lora.append(name)
             elif is_lora:
@@ -579,11 +579,11 @@ class ActionDiTLoRAAdapter:
         except TypeError:
             payload = torch.load(path, map_location="cpu")
         if not isinstance(payload, dict):
-            raise ValueError(f"Invalid LoRA sidecar payload type: {type(payload)}")
+            raise TypeError(f"Invalid LoRA sidecar payload type: {type(payload)}")
         metadata = payload.get("metadata")
         state_dict = payload.get("state_dict")
         if not isinstance(metadata, dict) or not isinstance(state_dict, dict):
-            raise ValueError(
+            raise TypeError(
                 "LoRA sidecar requires dict `metadata` and `state_dict` fields."
             )
         if metadata.get("schema") != REGIME_LORA_SIDECAR_SCHEMA:

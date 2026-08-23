@@ -2,6 +2,8 @@ import copy
 
 import pytest
 import torch
+from torch import nn
+
 from fastwam.adapters import (
     LORA_MASTER_DTYPE,
     ActionLoRATargetGroup,
@@ -13,7 +15,6 @@ from fastwam.adapters import (
     inject_action_dit_lora,
     sha256_file,
 )
-from torch import nn
 
 
 class TinyAttention(nn.Module):
@@ -90,9 +91,11 @@ def test_regime_context_is_nested_instance_scoped_and_exception_safe() -> None:
         assert context.current is PolicyRegime.UNCOND
     assert context.current is PolicyRegime.IDM
 
-    with pytest.raises(RuntimeError, match="forward failed"):
-        with context.use(PolicyRegime.UNCOND):
-            raise RuntimeError("forward failed")
+    with (
+        pytest.raises(RuntimeError, match="forward failed"),
+        context.use(PolicyRegime.UNCOND),
+    ):
+        raise RuntimeError("forward failed")
     assert context.current is PolicyRegime.IDM
 
 
@@ -336,9 +339,11 @@ def test_behavior_replay_reference_restores_live_lora_after_scope() -> None:
         torch.equal(adapter.lora_state_dict()[name], value)
         for name, value in live_state.items()
     )
-    with pytest.raises(ValueError, match="actor version mismatch"):
-        with adapter.use_replay_reference(actor_version=5):
-            pass
+    with (
+        pytest.raises(ValueError, match="actor version mismatch"),
+        adapter.use_replay_reference(actor_version=5),
+    ):
+        pass
 
 
 def test_lora_factors_are_fp32_master_weights_under_a_bf16_base():
