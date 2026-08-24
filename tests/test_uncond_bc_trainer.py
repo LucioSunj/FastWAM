@@ -93,9 +93,9 @@ def test_training_config_enforces_4gpu_capacity_ladder_and_allows_bc0() -> None:
 def test_rank32_training_requires_8gpu_capacity_ladder() -> None:
     cfg = _compose_config()
     cfg.lora.rank = 32
-    cfg.data.num_workers = 2
+    cfg.data.num_workers = 0
     cfg.data.prefetch_factor = 1
-    cfg.data.multiprocessing_context = "spawn"
+    cfg.data.multiprocessing_context = None
 
     for microbatch, accumulation in ((1, 16), (2, 8), (4, 4), (8, 2)):
         candidate = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
@@ -117,7 +117,7 @@ def test_rank32_training_requires_8gpu_capacity_ladder() -> None:
     unsafe_loader.data.num_workers = 8
     unsafe_loader.data.prefetch_factor = 2
     unsafe_loader.data.multiprocessing_context = None
-    with pytest.raises(ValueError, match="two spawned DataLoader workers"):
+    with pytest.raises(ValueError, match="zero extra DataLoader workers"):
         _validate_training_config(unsafe_loader, world_size=8)
 
 
@@ -276,9 +276,9 @@ def test_training_phases_are_explicit_and_world_size_bound() -> None:
     rank32.lora.rank = 32
     rank32.training.microbatch_size = 8
     rank32.training.gradient_accumulation_steps = 2
-    rank32.data.num_workers = 2
+    rank32.data.num_workers = 0
     rank32.data.prefetch_factor = 1
-    rank32.data.multiprocessing_context = "spawn"
+    rank32.data.multiprocessing_context = None
     _validate_training_config(rank32, world_size=8)
     with pytest.raises(ValueError, match="exactly 8 GPUs"):
         _validate_training_config(rank32, world_size=4)
