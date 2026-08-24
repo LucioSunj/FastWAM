@@ -920,6 +920,15 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
             raise ValueError(
                 "The approved UNCOND BC experiment requires global batch 128."
             )
+        if lora_rank == 32 and (
+            int(cfg.data.num_workers) != 2
+            or int(cfg.data.prefetch_factor) != 1
+            or str(cfg.data.multiprocessing_context) != "spawn"
+        ):
+            raise ValueError(
+                "Rank-32 eight-GPU BC requires two spawned DataLoader workers "
+                "per rank and prefetch factor one."
+            )
     if stage == "bc1" and not bool(cfg.runner.single_gpu_diagnostic):
         raise ValueError("BC1 requires runner.single_gpu_diagnostic=true.")
     if stage != "bc1" and bool(cfg.runner.single_gpu_diagnostic):
