@@ -885,21 +885,30 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
     ):
         raise ValueError("UNCOND BC requires the 30-layer parent architecture.")
 
-    expected_accumulation = {1: 32, 2: 16, 4: 8, 8: 4}
+    lora_rank = int(cfg.lora.rank)
+    expected_world_size = 8 if lora_rank == 32 else 4
+    expected_accumulation = {
+        microbatch: 128 // (expected_world_size * microbatch)
+        for microbatch in (1, 2, 4, 8)
+    }
     microbatch = int(cfg.training.microbatch_size)
     if microbatch not in expected_accumulation:
         raise ValueError("BC microbatch must be one of 1, 2, 4, or 8 per GPU.")
     if stage in {"bc0", "bc1"}:
         if world_size != 1:
             raise ValueError(f"{stage} must run on exactly one GPU.")
-    elif world_size != 4:
-        raise ValueError(f"{stage} must run on exactly four GPUs.")
+    elif world_size != expected_world_size:
+        raise ValueError(
+            f"{stage} with LoRA rank {lora_rank} must run on exactly "
+            f"{expected_world_size} GPUs."
+        )
     if stage in {"bc2", "pilot", "formal"}:
         expected = expected_accumulation[microbatch]
         actual_accumulation = int(cfg.training.gradient_accumulation_steps)
         if actual_accumulation != expected:
             raise ValueError(
-                f"4-GPU microbatch {microbatch} requires accumulation {expected}."
+                f"{expected_world_size}-GPU microbatch {microbatch} requires "
+                f"accumulation {expected}."
             )
         actual_global_batch = microbatch * world_size * actual_accumulation
         if int(cfg.training.global_batch_size) != actual_global_batch:

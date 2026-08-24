@@ -4,6 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
+from torch import nn
+
 from fastwam.uncond_bc_trainer import (
     DistributedEvalSampler,
     _canonical_config,
@@ -20,9 +24,6 @@ from fastwam.uncond_bc_trainer import (
     load_strict_fastwam_parent,
     record_uncond_bc_failure,
 )
-from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
-from torch import nn
 
 
 def _compose_config():
@@ -87,6 +88,26 @@ def test_training_config_enforces_4gpu_capacity_ladder_and_allows_bc0() -> None:
     bc0 = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
     bc0.runner.stage = "bc0"
     _validate_training_config(bc0, world_size=1)
+
+
+def test_rank32_training_requires_8gpu_capacity_ladder() -> None:
+    cfg = _compose_config()
+    cfg.lora.rank = 32
+
+    for microbatch, accumulation in ((1, 16), (2, 8), (4, 4), (8, 2)):
+        candidate = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        candidate.training.microbatch_size = microbatch
+        candidate.training.gradient_accumulation_steps = accumulation
+        _validate_training_config(candidate, world_size=8)
+
+    with pytest.raises(ValueError, match="exactly 8 GPUs"):
+        _validate_training_config(cfg, world_size=4)
+
+    invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    invalid.training.microbatch_size = 8
+    invalid.training.gradient_accumulation_steps = 4
+    with pytest.raises(ValueError, match="requires accumulation 2"):
+        _validate_training_config(invalid, world_size=8)
 
 
 def test_distributed_context_binds_local_cuda_device_before_nccl(
@@ -242,7 +263,11 @@ def test_training_phases_are_explicit_and_world_size_bound() -> None:
 
     rank32 = _resolved_copy(base)
     rank32.lora.rank = 32
-    _validate_training_config(rank32, world_size=4)
+    rank32.training.microbatch_size = 8
+    rank32.training.gradient_accumulation_steps = 2
+    _validate_training_config(rank32, world_size=8)
+    with pytest.raises(ValueError, match="exactly 8 GPUs"):
+        _validate_training_config(rank32, world_size=4)
 
     malformed = _resolved_copy(base)
     malformed.lora.rank = 8
