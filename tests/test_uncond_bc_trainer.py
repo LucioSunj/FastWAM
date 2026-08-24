@@ -9,6 +9,7 @@ from fastwam.uncond_bc_trainer import (
     _canonical_config,
     _dataset_summary,
     _distributed_context,
+    _git_state,
     _instantiate_bc_dataset,
     _prune_training_checkpoints,
     _save_checkpoint,
@@ -109,6 +110,30 @@ def test_distributed_context_binds_local_cuda_device_before_nccl(
     assert (rank, world_size, local_rank) == (2, 4, 2)
     assert device == torch.device("cuda", 2)
     assert calls == [device, {"backend": "nccl", "device_id": device}]
+
+
+def test_revision_report_ignores_untracked_files(monkeypatch, tmp_path) -> None:
+    calls = []
+
+    def check_output(command, *, text):
+        assert text is True
+        calls.append(command)
+        if command[-2:] == ["rev-parse", "HEAD"]:
+            return "a" * 40 + "\n"
+        if command[-2:] == ["branch", "--show-current"]:
+            return "test-branch\n"
+        if command[-3:] == ["status", "--short", "--untracked-files=no"]:
+            return ""
+        raise AssertionError(command)
+
+    monkeypatch.setattr("subprocess.check_output", check_output)
+
+    assert _git_state(tmp_path) == {
+        "head": "a" * 40,
+        "branch": "test-branch",
+        "dirty": False,
+    }
+    assert any("--untracked-files=no" in command for command in calls)
 
 
 def test_resume_path_is_excluded_from_strict_training_contract_hash() -> None:

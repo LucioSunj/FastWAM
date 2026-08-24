@@ -208,7 +208,7 @@ def _git_state(path: Path) -> dict[str, Any]:
         return {
             "head": run("rev-parse", "HEAD"),
             "branch": run("branch", "--show-current") or "DETACHED",
-            "dirty": bool(run("status", "--short")),
+            "dirty": bool(run("status", "--short", "--untracked-files=no")),
         }
     except (OSError, subprocess.CalledProcessError) as error:
         return {"error": repr(error)}
