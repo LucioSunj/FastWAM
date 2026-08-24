@@ -857,7 +857,7 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         "ffn",
     ]
     if (
-        int(cfg.lora.rank) != 16
+        int(cfg.lora.rank) not in {16, 32}
         or float(cfg.lora.alpha) != 16.0
         or float(cfg.lora.dropout) != 0.0
         or list(cfg.lora.target_groups) != expected_targets

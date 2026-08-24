@@ -128,6 +128,15 @@ def _validate_adapter_payload(
     state_dict = payload["state_dict"]
     if not isinstance(metadata, Mapping) or not isinstance(state_dict, Mapping):
         raise TypeError("BC adapter metadata and state_dict must be mappings.")
+    non_fp32 = sorted(
+        name
+        for name, value in state_dict.items()
+        if not isinstance(value, torch.Tensor) or value.dtype != torch.float32
+    )
+    if non_fp32:
+        raise ValueError(
+            f"BC adapter must contain FP32 LoRA master tensors: {non_fp32[:16]}."
+        )
     expected_metadata = adapter.sidecar_metadata(
         parent_checkpoint_sha256=expected_parent_checkpoint_sha256,
         extra_metadata=metadata.get("extra", {}),
@@ -385,6 +394,28 @@ def inspect_uncond_bc_checkpoint(path: str | os.PathLike[str]) -> dict[str, Any]
     lora_tensors = [
         value for value in state_dict.values() if isinstance(value, torch.Tensor)
     ]
+    non_fp32_lora = sorted(
+        name
+        for name, value in state_dict.items()
+        if isinstance(value, torch.Tensor) and value.dtype != torch.float32
+    )
+    if non_fp32_lora:
+        raise ValueError(
+            f"BC checkpoint LoRA master tensors are not FP32: {non_fp32_lora[:16]}."
+        )
+    optimizer_tensors = [
+        (name, value)
+        for name, value in tensor_entries
+        if name.startswith("optimizer.") and torch.is_floating_point(value)
+    ]
+    non_fp32_optimizer = sorted(
+        name for name, value in optimizer_tensors if value.dtype != torch.float32
+    )
+    if non_fp32_optimizer:
+        raise ValueError(
+            "BC checkpoint optimizer floating-point state is not FP32: "
+            f"{non_fp32_optimizer[:16]}."
+        )
     lora_bytes = sum(value.numel() * value.element_size() for value in lora_tensors)
     return {
         "schema": payload["schema"],
@@ -400,9 +431,11 @@ def inspect_uncond_bc_checkpoint(path: str | os.PathLike[str]) -> dict[str, Any]
         "adapter_target_names": list(metadata["target_names"]),
         "lora_tensor_count": len(lora_tensors),
         "lora_bytes": int(lora_bytes),
+        "lora_master_dtype": "torch.float32",
         "optimizer_tensor_count": sum(
             1 for name, _ in tensor_entries if name.startswith("optimizer.")
         ),
+        "optimizer_floating_state_dtype": "torch.float32",
         "rng_rank_count": len(payload["rng_by_rank"]),
         "forbidden_tensor_paths": [],
         "contains_frozen_fastwam_tensors": False,

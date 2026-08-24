@@ -4,8 +4,6 @@ import random
 import numpy as np
 import pytest
 import torch
-from torch import nn
-
 from fastwam.adapters import (
     ActionLoRATargetGroup,
     PolicyRegime,
@@ -20,6 +18,7 @@ from fastwam.uncond_bc_checkpoint import (
     restore_rng_state,
     save_uncond_bc_checkpoint,
 )
+from torch import nn
 
 
 class _Block(nn.Module):
@@ -144,6 +143,8 @@ def test_bc_checkpoint_strict_round_trip_and_inspector(tmp_path) -> None:
     }
     assert report["lora_tensor_count"] == 8
     assert report["optimizer_tensor_count"] > 0
+    assert report["lora_master_dtype"] == "torch.float32"
+    assert report["optimizer_floating_state_dtype"] == "torch.float32"
     assert report["contains_frozen_fastwam_tensors"] is False
     assert report["contains_gate_tensors"] is False
     assert report["contains_value_head_tensors"] is False
@@ -210,6 +211,47 @@ def test_bc_checkpoint_rejects_parent_and_config_mismatch(tmp_path) -> None:
             adapter=adapter,
             expected_parent_checkpoint_sha256="5" * 64,
             expected_contract={"resolved_config_sha256": "7" * 64},
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            grad_scaler=scaler,
+        )
+    del model
+
+
+def test_bc_checkpoint_rejects_bf16_lora_master_tensor(tmp_path) -> None:
+    model, adapter, optimizer, scheduler, scaler = _components()
+    checkpoint = tmp_path / "state.pt"
+    contract = {"resolved_config_sha256": "4" * 64}
+    save_uncond_bc_checkpoint(
+        checkpoint,
+        adapter=adapter,
+        parent_checkpoint_sha256="5" * 64,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
+        grad_scaler=scaler,
+        global_step=0,
+        epoch=0,
+        sampler_offset=0,
+        rng_by_rank=[capture_rng_state()],
+        contract=contract,
+        provenance={},
+    )
+    payload = torch.load(checkpoint, weights_only=False)
+    name = next(iter(payload["adapter"]["state_dict"]))
+    payload["adapter"]["state_dict"][name] = payload["adapter"]["state_dict"][name].to(
+        torch.bfloat16
+    )
+    malformed = tmp_path / "bf16.pt"
+    torch.save(payload, malformed)
+
+    with pytest.raises(ValueError, match="LoRA master tensors are not FP32"):
+        inspect_uncond_bc_checkpoint(malformed)
+    with pytest.raises(ValueError, match="FP32 LoRA master tensors"):
+        load_uncond_bc_checkpoint(
+            malformed,
+            adapter=adapter,
+            expected_parent_checkpoint_sha256="5" * 64,
+            expected_contract=contract,
             optimizer=optimizer,
             lr_scheduler=scheduler,
             grad_scaler=scaler,

@@ -4,10 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
-from torch import nn
-
 from fastwam.uncond_bc_trainer import (
     DistributedEvalSampler,
     _canonical_config,
@@ -23,6 +19,9 @@ from fastwam.uncond_bc_trainer import (
     load_strict_fastwam_parent,
     record_uncond_bc_failure,
 )
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
+from torch import nn
 
 
 def _compose_config():
@@ -215,6 +214,10 @@ def test_training_phases_are_explicit_and_world_size_bound() -> None:
     pilot.runner.stage = "pilot"
     pilot.training.max_steps = 1000
     _validate_training_config(pilot, world_size=4)
+
+    rank32 = _resolved_copy(base)
+    rank32.lora.rank = 32
+    _validate_training_config(rank32, world_size=4)
 
     malformed = _resolved_copy(base)
     malformed.lora.rank = 8
