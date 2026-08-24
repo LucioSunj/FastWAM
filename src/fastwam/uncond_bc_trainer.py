@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import gc
 import hashlib
 import inspect
 import json
@@ -49,6 +51,9 @@ from fastwam.uncond_bc_checkpoint import (
 from fastwam.utils import misc
 
 BC_OUTPUT_MARKER = ".fastwam-uncond-bc-output-v1"
+_LIBC = ctypes.CDLL(None)
+_LIBC.malloc_trim.argtypes = [ctypes.c_size_t]
+_LIBC.malloc_trim.restype = ctypes.c_int
 
 
 class DistributedEvalSampler(Sampler[int]):
@@ -491,6 +496,13 @@ def _all_reduce(value: torch.Tensor, *, world_size: int) -> torch.Tensor:
     return value
 
 
+def _release_validation_host_memory() -> None:
+    """Return unreachable PyAV/torchvision batch storage to the host."""
+
+    gc.collect()
+    _LIBC.malloc_trim(0)
+
+
 @torch.no_grad()
 def _validate(
     model: nn.Module,
@@ -536,6 +548,9 @@ def _validate(
             output["mse_by_timestep_bin"].float() * bin_counts
         )
         accum[bin_start + bin_count :] += bin_counts
+        torch.cuda.synchronize(device)
+        del output, timestep, noise, action, identities, batch
+        _release_validation_host_memory()
     accum = _all_reduce(accum, world_size=world_size)
     sample_count = accum[1].clamp(min=1)
     valid_count = accum[2].clamp(min=1)

@@ -1,3 +1,4 @@
+import contextlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from torch import nn
 
+from fastwam import uncond_bc_trainer
 from fastwam.uncond_bc_trainer import (
     DistributedEvalSampler,
     _canonical_config,
@@ -243,6 +245,83 @@ def test_distributed_validation_sampler_has_no_padding_or_duplicates() -> None:
 
     assert sorted(flattened) == list(range(11))
     assert len(flattened) == len(set(flattened))
+
+
+def test_validation_releases_host_memory_after_every_batch(monkeypatch) -> None:
+    releases = []
+    synchronizations = []
+    monkeypatch.setattr(
+        uncond_bc_trainer,
+        "stateless_validation_flow_inputs",
+        lambda **kwargs: (
+            torch.zeros(kwargs["action_shape"][0]),
+            torch.zeros(kwargs["action_shape"]),
+        ),
+    )
+    monkeypatch.setattr(
+        uncond_bc_trainer.torch,
+        "autocast",
+        lambda **_kwargs: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        uncond_bc_trainer.torch.cuda,
+        "synchronize",
+        lambda device: synchronizations.append(device),
+    )
+    monkeypatch.setattr(
+        uncond_bc_trainer,
+        "_release_validation_host_memory",
+        lambda: releases.append(True),
+    )
+
+    class _Model:
+        def eval(self) -> None:
+            return None
+
+        def train(self) -> None:
+            return None
+
+        def __call__(self, batch, *, timestep, noise):
+            del batch, timestep, noise
+            return {
+                "loss_action_bc": torch.tensor(1.0),
+                "valid_action_count": torch.tensor(4),
+                "mse_per_dimension": torch.tensor([0.5, 1.0]),
+                "mse_by_timestep_bin": torch.tensor([0.2, 0.3, 0.0]),
+                "timestep_bin_count": torch.tensor([2, 2, 0]),
+            }
+
+    class _Loader:
+        generator = torch.Generator()
+
+        def __iter__(self):
+            for index in range(3):
+                yield {
+                    "sample_identity": [f"validation:{index}"],
+                    "action": torch.zeros(1, 4, 2),
+                }
+
+    policy = SimpleNamespace(
+        actor=SimpleNamespace(train_action_scheduler=object()),
+        config=SimpleNamespace(
+            action_dim=2,
+            timestep_bins=3,
+            gripper_dimension=1,
+        ),
+        dtype=torch.float32,
+    )
+    result = uncond_bc_trainer._validate(
+        _Model(),
+        policy,
+        _Loader(),
+        cfg=SimpleNamespace(validation=SimpleNamespace(seed=42)),
+        world_size=1,
+        device=torch.device("cpu"),
+    )
+
+    assert result["sample_count"] == 3
+    assert len(synchronizations) == 3
+    assert releases == [True, True, True]
 
 
 def _resolved_copy(cfg):
