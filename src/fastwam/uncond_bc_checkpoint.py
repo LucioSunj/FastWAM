@@ -313,6 +313,51 @@ def load_uncond_bc_checkpoint(
     return payload
 
 
+def load_uncond_bc_adapter_checkpoint(
+    path: str | os.PathLike[str],
+    *,
+    adapter: ActionDiTLoRAAdapter,
+    expected_parent_checkpoint_sha256: str,
+) -> dict[str, Any]:
+    """Strictly load only the LoRA state from a complete trainer checkpoint."""
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or set(payload) != _TRAINING_CHECKPOINT_KEYS:
+        keys = sorted(payload) if isinstance(payload, dict) else type(payload)
+        raise ValueError(f"BC training checkpoint keys changed: {keys}.")
+    if payload.get("schema") != UNCOND_BC_TRAINING_SCHEMA:
+        raise ValueError(f"Unsupported BC checkpoint schema {payload.get('schema')!r}.")
+    expected_parent = str(expected_parent_checkpoint_sha256).lower()
+    if payload.get("parent_checkpoint_sha256") != expected_parent:
+        raise ValueError(
+            "BC checkpoint parent hash mismatch: "
+            f"expected {expected_parent}, got {payload.get('parent_checkpoint_sha256')}."
+        )
+    global_step = int(payload["global_step"])
+    trainer_state = _validate_trainer_state(
+        payload["trainer_state"],
+        global_step=global_step,
+    )
+    metadata = _validate_adapter_payload(
+        adapter,
+        payload["adapter"],
+        expected_parent_checkpoint_sha256=expected_parent,
+    )
+    if metadata.get("extra", {}).get("bc_step") != global_step:
+        raise ValueError("BC sidecar step does not match its training checkpoint.")
+    return {
+        "schema": payload["schema"],
+        "global_step": global_step,
+        "epoch": int(payload["epoch"]),
+        "sampler_offset": int(payload["sampler_offset"]),
+        "parent_checkpoint_sha256": expected_parent,
+        "adapter_metadata": metadata,
+        "contract": dict(payload["contract"]),
+        "provenance": dict(payload["provenance"]),
+        "trainer_state": trainer_state,
+    }
+
+
 def _walk_tensors(value: Any, *, prefix: str = ""):
     if isinstance(value, torch.Tensor):
         yield prefix, value

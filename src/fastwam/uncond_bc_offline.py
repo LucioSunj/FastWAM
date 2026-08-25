@@ -17,8 +17,9 @@ from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
-from fastwam.adapters import RegimeLoRAConfig
+from fastwam.adapters import RegimeLoRAConfig, sha256_file
 from fastwam.uncond_bc import FastWAMUncondBCConfig, FastWAMUncondBCPolicy
+from fastwam.uncond_bc_checkpoint import load_uncond_bc_adapter_checkpoint
 from fastwam.uncond_bc_trainer import (
     _assert_frozen_versions,
     _atomic_json,
@@ -64,12 +65,18 @@ def claim_uncond_bc_offline_output(cfg: DictConfig) -> Path:
 def _validate_offline_config(cfg: DictConfig, *, world_size: int) -> None:
     if str(cfg.runner.stage) != "offline_validation":
         raise ValueError("BC offline runner.stage must be offline_validation.")
-    if world_size != 4:
-        raise ValueError("Full BC offline validation requires exactly four GPU ranks.")
+    expected_world_size = 6 if int(cfg.lora.rank) == 32 else 4
+    if world_size != expected_world_size:
+        raise ValueError(
+            "Full BC offline validation requires exactly "
+            f"{expected_world_size} GPU ranks for LoRA rank {cfg.lora.rank}."
+        )
     if int(cfg.seed) != 42 or int(cfg.validation.seed) != 42:
         raise ValueError("BC offline split and validation seed must be 42.")
     if str(cfg.precision).lower() != "bf16" or bool(cfg.get("compile", False)):
         raise ValueError("BC offline validation requires eager BF16.")
+    if int(cfg.distributed.collective_timeout_seconds) != 7200:
+        raise ValueError("BC offline collective timeout must be 7200 seconds.")
     if int(cfg.training.microbatch_size) != 8:
         raise ValueError(
             "BC offline validation uses the selected microbatch 8 profile."
@@ -113,6 +120,12 @@ def _validate_offline_config(cfg: DictConfig, *, world_size: int) -> None:
             or str(split.processor.norm_default_mode) != "min/max"
         ):
             raise ValueError("BC offline normalization contract changed.")
+        if not bool(split.current_frame_image_only) or (
+            int(split.processor.num_image_obs_steps) != 1
+        ):
+            raise ValueError(
+                "BC offline validation must decode only the current image."
+            )
     if not bool(cfg.data.train.is_training_set) or bool(
         cfg.data.validation.is_training_set
     ):
@@ -138,7 +151,7 @@ def _validate_offline_config(cfg: DictConfig, *, world_size: int) -> None:
     if observed_shape != expected_shape:
         raise ValueError("BC offline action/observation shape contract changed.")
     if (
-        int(cfg.lora.rank) != 16
+        int(cfg.lora.rank) not in {16, 32}
         or float(cfg.lora.alpha) != 16.0
         or float(cfg.lora.dropout) != 0.0
         or list(cfg.lora.target_groups)
@@ -148,16 +161,45 @@ def _validate_offline_config(cfg: DictConfig, *, world_size: int) -> None:
     ):
         raise ValueError("BC offline LoRA structure differs from training.")
     policy = str(cfg.runner.policy)
-    if policy not in {"zero_lora", "bc_lora"}:
-        raise ValueError("BC offline policy must be zero_lora or bc_lora.")
+    if policy not in {"zero_lora", "bc_lora", "bc_training_checkpoint"}:
+        raise ValueError(
+            "BC offline policy must be zero_lora, bc_lora, or bc_training_checkpoint."
+        )
     sidecar = cfg.runner.get("sidecar")
     sidecar_hash = cfg.runner.get("sidecar_sha256")
     has_sidecar = sidecar is not None and bool(str(sidecar).strip())
     has_hash = sidecar_hash is not None and bool(str(sidecar_hash).strip())
-    if policy == "zero_lora" and (has_sidecar or has_hash):
-        raise ValueError("zero_lora offline validation forbids a sidecar.")
-    if policy == "bc_lora" and not (has_sidecar and has_hash):
-        raise ValueError("bc_lora offline validation requires sidecar and SHA256.")
+    checkpoint = cfg.runner.get("training_checkpoint")
+    checkpoint_hash = cfg.runner.get("training_checkpoint_sha256")
+    checkpoint_step = cfg.runner.get("training_checkpoint_step")
+    has_checkpoint = checkpoint is not None and bool(str(checkpoint).strip())
+    has_checkpoint_hash = checkpoint_hash is not None and bool(
+        str(checkpoint_hash).strip()
+    )
+    if policy == "zero_lora" and (
+        has_sidecar or has_hash or has_checkpoint or has_checkpoint_hash
+    ):
+        raise ValueError("zero_lora offline validation forbids trained artifacts.")
+    if policy == "bc_lora":
+        if not (has_sidecar and has_hash):
+            raise ValueError("bc_lora offline validation requires sidecar and SHA256.")
+        if has_checkpoint or has_checkpoint_hash:
+            raise ValueError("bc_lora offline validation forbids a trainer checkpoint.")
+    if policy == "bc_training_checkpoint":
+        if has_sidecar or has_hash:
+            raise ValueError(
+                "bc_training_checkpoint offline validation forbids a sidecar."
+            )
+        if not (has_checkpoint and has_checkpoint_hash):
+            raise ValueError("bc_training_checkpoint requires a checkpoint and SHA256.")
+        if (
+            isinstance(checkpoint_step, bool)
+            or not isinstance(checkpoint_step, int)
+            or checkpoint_step <= 0
+        ):
+            raise ValueError(
+                "bc_training_checkpoint requires a positive expected step."
+            )
 
 
 def _validate_sidecar_extra(
@@ -267,7 +309,10 @@ def run_uncond_bc_offline(cfg: DictConfig) -> dict[str, Any]:
     """Evaluate zero or trained UNCOND LoRA on every held-out BC window."""
 
     distributed_backend = str(cfg.training.get("distributed_backend", "nccl"))
-    rank, world_size, local_rank, device = _distributed_context(distributed_backend)
+    rank, world_size, local_rank, device = _distributed_context(
+        distributed_backend,
+        collective_timeout_seconds=int(cfg.distributed.collective_timeout_seconds),
+    )
     _validate_offline_config(cfg, world_size=world_size)
     _set_seed(int(cfg.seed), rank=rank, deterministic=True)
     output = Path(str(cfg.runner.output_dir)).expanduser().resolve()
@@ -333,6 +378,7 @@ def run_uncond_bc_offline(cfg: DictConfig) -> dict[str, Any]:
     frozen_versions = _frozen_versions(policy)
 
     sidecar_report = None
+    training_checkpoint_report = None
     if str(cfg.runner.policy) == "bc_lora":
         sidecar_path = str(cfg.runner.sidecar)
         sidecar_sha = _verify_sha256(
@@ -357,6 +403,58 @@ def run_uncond_bc_offline(cfg: DictConfig) -> dict[str, Any]:
         }
         if _zero_lora(policy):
             raise ValueError("Trained BC sidecar unexpectedly leaves LoRA at zero.")
+    elif str(cfg.runner.policy) == "bc_training_checkpoint":
+        checkpoint_path = str(cfg.runner.training_checkpoint)
+        checkpoint_sha = _verify_sha256(
+            checkpoint_path,
+            str(cfg.runner.training_checkpoint_sha256),
+            label="BC trainer checkpoint",
+        )
+        loaded = load_uncond_bc_adapter_checkpoint(
+            checkpoint_path,
+            adapter=policy.lora_adapter,
+            expected_parent_checkpoint_sha256=parent_sha,
+        )
+        expected_step = int(cfg.runner.training_checkpoint_step)
+        if int(loaded["global_step"]) != expected_step:
+            raise ValueError(
+                "BC trainer checkpoint step mismatch: "
+                f"expected {expected_step}, got {loaded['global_step']}."
+            )
+        if int(loaded["trainer_state"]["nonzero_update_count"]) != expected_step:
+            raise ValueError(
+                "BC trainer checkpoint does not record one nonzero LoRA update "
+                "per completed optimizer step."
+            )
+        checkpoint_contract = loaded["contract"]
+        comparable_contract_keys = {
+            "world_size",
+            "parent_checkpoint_sha256",
+            "statistics_sha256",
+            "dataset_sha256",
+            "text_cache_sha256",
+            "lora",
+            "bc_policy",
+        }
+        mismatches = {
+            key: {
+                "expected": contract.get(key),
+                "observed": checkpoint_contract.get(key),
+            }
+            for key in sorted(comparable_contract_keys)
+            if checkpoint_contract.get(key) != contract.get(key)
+        }
+        if mismatches:
+            raise ValueError(
+                f"BC trainer checkpoint scientific contract mismatch: {mismatches}."
+            )
+        if _zero_lora(policy):
+            raise ValueError("BC trainer checkpoint unexpectedly leaves LoRA at zero.")
+        training_checkpoint_report = {
+            "path": str(Path(checkpoint_path).expanduser().resolve()),
+            "sha256": checkpoint_sha,
+            **loaded,
+        }
     elif not _zero_lora(policy):
         raise RuntimeError("zero_lora offline baseline did not start at zero.")
 
@@ -394,6 +492,7 @@ def run_uncond_bc_offline(cfg: DictConfig) -> dict[str, Any]:
         cfg=cfg,
         world_size=world_size,
         device=device,
+        expected_sample_count=len(validation_dataset),
     )
     _assert_frozen_versions(policy, frozen_versions)
     gradients_absent = all(
@@ -405,6 +504,57 @@ def run_uncond_bc_offline(cfg: DictConfig) -> dict[str, Any]:
         and future_prediction_calls["count"] == 0
         and gradients_absent
     )
+    validated_sidecar_report = None
+    if passed and str(cfg.runner.policy) == "bc_training_checkpoint" and rank == 0:
+        checkpoint_extra = training_checkpoint_report["adapter_metadata"].get(
+            "extra", {}
+        )
+        training_config_sha256 = str(
+            checkpoint_extra.get("bc_config_sha256", "")
+        ).lower()
+        if len(training_config_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in training_config_sha256
+        ):
+            raise ValueError("BC trainer checkpoint config hash is malformed.")
+        validated_sidecar_path = output / "validated_uncond_lora.pt"
+        validated_extra = {
+            "bc_step": int(training_checkpoint_report["global_step"]),
+            "bc_config_sha256": training_config_sha256,
+            "validation_loss_action_bc": float(validation["loss_action_bc"]),
+            "statistics_sha256": contract["statistics_sha256"],
+            "dataset_sha256": contract["dataset_sha256"],
+            "text_cache_sha256": contract["text_cache_sha256"],
+        }
+        before_reload = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in policy.lora_adapter.lora_state_dict().items()
+        }
+        policy.lora_adapter.save_sidecar(
+            validated_sidecar_path,
+            parent_checkpoint_sha256=parent_sha,
+            extra_metadata=validated_extra,
+        )
+        reloaded_metadata = policy.lora_adapter.load_sidecar(
+            validated_sidecar_path,
+            expected_parent_checkpoint_sha256=parent_sha,
+            strict=True,
+        )
+        reloaded_state = policy.lora_adapter.lora_state_dict()
+        if set(reloaded_state) != set(before_reload) or any(
+            not torch.equal(before_reload[name], reloaded_state[name].detach().cpu())
+            for name in before_reload
+        ):
+            raise RuntimeError("Validated BC sidecar strict reload changed LoRA state.")
+        if reloaded_metadata.get("extra") != validated_extra:
+            raise RuntimeError(
+                "Validated BC sidecar metadata changed on strict reload."
+            )
+        validated_sidecar_report = {
+            "path": str(validated_sidecar_path),
+            "sha256": sha256_file(validated_sidecar_path),
+            "strict_reload_exact": True,
+            "extra": validated_extra,
+        }
     manifest = {
         "schema": OFFLINE_EVAL_SCHEMA,
         "status": "PASS" if passed else "FAIL",
@@ -414,6 +564,8 @@ def run_uncond_bc_offline(cfg: DictConfig) -> dict[str, Any]:
         "provenance": provenance,
         "parent_load": parent_load,
         "sidecar": sidecar_report,
+        "training_checkpoint": training_checkpoint_report,
+        "validated_sidecar": validated_sidecar_report,
         "train_dataset": train_summary,
         "validation_dataset": validation_summary,
         "validation": validation,

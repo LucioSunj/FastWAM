@@ -1,5 +1,6 @@
 import contextlib
 import json
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -81,9 +82,11 @@ def test_hostb_fast_preset_loads_only_the_consumed_current_frame() -> None:
 
     assert cfg.data.train.current_frame_only is True
     assert cfg.data.validation.current_frame_only is True
+    assert cfg.data.train.current_frame_image_only is False
+    assert cfg.data.validation.current_frame_image_only is False
     assert cfg.data.train.strict_sample_loading is True
     assert cfg.data.validation.strict_sample_loading is True
-    assert cfg.data.train.processor.num_image_steps == 1
+    assert cfg.data.train.processor.num_image_obs_steps == 1
     assert cfg.bc_policy.expected_video_frames == 1
     assert cfg.data.num_workers == 4
     assert cfg.data.persistent_workers is False
@@ -228,7 +231,14 @@ def test_distributed_context_binds_local_cuda_device_before_nccl(
 
     assert (rank, world_size, local_rank) == (2, 4, 2)
     assert device == torch.device("cuda", 2)
-    assert calls == [device, {"backend": "nccl", "device_id": device}]
+    assert calls == [
+        device,
+        {
+            "backend": "nccl",
+            "device_id": device,
+            "timeout": timedelta(seconds=7200),
+        },
+    ]
 
 
 def test_revision_report_ignores_untracked_files(monkeypatch, tmp_path) -> None:
@@ -416,7 +426,7 @@ def test_validation_releases_host_memory_at_configured_cadence(monkeypatch) -> N
                 "valid_action_count": torch.tensor(4),
                 "mse_per_dimension": torch.tensor([0.5, 1.0]),
                 "mse_by_timestep_bin": torch.tensor([0.2, 0.3, 0.0]),
-                "timestep_bin_count": torch.tensor([2, 2, 0]),
+                "timestep_bin_count": torch.tensor([1, 0, 0]),
             }
 
     class _Loader:
@@ -432,6 +442,7 @@ def test_validation_releases_host_memory_at_configured_cadence(monkeypatch) -> N
     policy = SimpleNamespace(
         actor=SimpleNamespace(train_action_scheduler=object()),
         config=SimpleNamespace(
+            action_horizon=4,
             action_dim=2,
             timestep_bins=3,
             gripper_dimension=1,
@@ -450,12 +461,48 @@ def test_validation_releases_host_memory_at_configured_cadence(monkeypatch) -> N
         ),
         world_size=1,
         device=torch.device("cpu"),
+        expected_sample_count=3,
     )
 
     assert result["sample_count"] == 3
     assert len(synchronizations) == 2
     assert releases == [True, True]
     assert result["host_cleanup_interval_batches"] == 2
+
+
+def test_validation_accumulator_rejects_partial_or_corrupt_reduction() -> None:
+    # loss, samples, valid steps, batches, two dimension sums,
+    # three timestep-bin sums, and three timestep-bin counts.
+    valid = torch.tensor([3.0, 3.0, 12.0, 3.0, 2.0, 4.0, 0.2, 0.3, 0.0, 1.0, 2.0, 0.0])
+    uncond_bc_trainer._validate_reduced_validation_accumulator(
+        valid,
+        expected_sample_count=3,
+        action_horizon=4,
+        dimension_count=2,
+        bin_count=3,
+    )
+
+    partial = valid.clone()
+    partial[1] = 1
+    with pytest.raises(RuntimeError, match="sample reduction is incomplete"):
+        uncond_bc_trainer._validate_reduced_validation_accumulator(
+            partial,
+            expected_sample_count=3,
+            action_horizon=4,
+            dimension_count=2,
+            bin_count=3,
+        )
+
+    corrupt = valid.clone()
+    corrupt[2] = 1e30
+    with pytest.raises(RuntimeError, match="valid-action count"):
+        uncond_bc_trainer._validate_reduced_validation_accumulator(
+            corrupt,
+            expected_sample_count=3,
+            action_horizon=4,
+            dimension_count=2,
+            bin_count=3,
+        )
 
 
 def _resolved_copy(cfg):

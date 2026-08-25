@@ -39,5 +39,7 @@ def test_text_context_is_loaded_once_per_dataset_process(tmp_path) -> None:
 
     assert first[0] is second[0]
     assert first[1] is second[1]
-    assert torch.equal(first[0], context)
-    assert torch.equal(first[1], mask)
+    expected_context = context.clone()
+    expected_context[~mask] = 0.0
+    assert torch.equal(first[0], expected_context)
+    assert torch.equal(first[1], torch.ones_like(mask))

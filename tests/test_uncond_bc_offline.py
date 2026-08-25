@@ -31,8 +31,25 @@ def test_offline_preset_is_isolated_and_requires_four_gpu_profile() -> None:
     assert "gate" not in resolved
     assert "critic" not in resolved
     assert "value_head" not in resolved
-    with pytest.raises(ValueError, match="exactly four"):
+    with pytest.raises(ValueError, match="exactly 4"):
         _validate_offline_config(cfg, world_size=1)
+
+
+def test_hostb_offline_preset_uses_gloo_without_loader_children() -> None:
+    config_dir = Path(__file__).resolve().parents[1] / "configs"
+    with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
+        cfg = compose(
+            config_name="uncond_bc_eval",
+            overrides=["task=libero_uncond_lora_bc_hostb_offline"],
+        )
+
+    _validate_offline_config(cfg, world_size=4)
+
+    assert cfg.training.distributed_backend == "gloo_manual"
+    assert cfg.data.num_workers == 0
+    assert cfg.data.prefetch_factor == 1
+    assert cfg.data.multiprocessing_context is None
+    assert cfg.data.persistent_workers is False
 
 
 def test_offline_policy_and_sidecar_pair_fail_closed() -> None:
@@ -48,6 +65,24 @@ def test_offline_policy_and_sidecar_pair_fail_closed() -> None:
     cfg.runner.policy = "zero_lora"
     with pytest.raises(ValueError, match="forbids"):
         _validate_offline_config(cfg, world_size=4)
+
+
+def test_offline_rank32_training_checkpoint_uses_six_gpus_and_zero_training() -> None:
+    cfg = _config()
+    cfg.lora.rank = 32
+    cfg.runner.policy = "bc_training_checkpoint"
+    cfg.runner.training_checkpoint = "/tmp/step_001000.pt"
+    cfg.runner.training_checkpoint_sha256 = "b" * 64
+    cfg.runner.training_checkpoint_step = 1000
+
+    _validate_offline_config(cfg, world_size=6)
+    with pytest.raises(ValueError, match="exactly 6"):
+        _validate_offline_config(cfg, world_size=4)
+
+    cfg.runner.sidecar = "/tmp/rejected.pt"
+    cfg.runner.sidecar_sha256 = "c" * 64
+    with pytest.raises(ValueError, match="forbids a sidecar"):
+        _validate_offline_config(cfg, world_size=6)
 
 
 def test_offline_asset_and_normalization_contracts_fail_closed() -> None:

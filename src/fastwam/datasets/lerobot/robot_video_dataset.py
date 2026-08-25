@@ -42,10 +42,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        current_frame_image_only: bool = False,
         current_frame_only: bool = False,
         strict_sample_loading: bool = False,
     ):
+        self.current_frame_image_only = bool(current_frame_image_only)
         self.current_frame_only = bool(current_frame_only)
+        if self.current_frame_image_only and self.current_frame_only:
+            raise ValueError(
+                "current_frame_image_only and current_frame_only are mutually exclusive."
+            )
         self.strict_sample_loading = bool(strict_sample_loading)
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -55,7 +61,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
-            image_obs_size=1 if self.current_frame_only else num_frames,
+            image_obs_size=(
+                1
+                if self.current_frame_image_only or self.current_frame_only
+                else num_frames
+            ),
             strict_sample_loading=self.strict_sample_loading,
         )
     
@@ -153,13 +163,34 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
         num_cameras = 1
         if video.ndim == 5:
-            video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+            if self.current_frame_image_only or self.current_frame_only:
+                if video.shape[1] != 1:
+                    raise ValueError(
+                        "current-frame image loading expected one decoded frame, "
+                        f"got {tuple(video.shape)}."
+                    )
+            else:
+                video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
             num_cameras, T_video, C, H, W = video.shape
         else:
             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+            if self.current_frame_image_only or self.current_frame_only:
+                if video.shape[0] != 1:
+                    raise ValueError(
+                        "current-frame image loading expected one decoded frame, "
+                        f"got {tuple(video.shape)}."
+                    )
+            else:
+                video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
             T_video, C, H, W = video.shape
-        image_is_pad = image_is_pad[self.video_sample_indices]
+        if self.current_frame_image_only or self.current_frame_only:
+            if image_is_pad.shape != (1,):
+                raise ValueError(
+                    "current-frame image padding must have shape (1,), got "
+                    f"{tuple(image_is_pad.shape)}."
+                )
+        else:
+            image_is_pad = image_is_pad[self.video_sample_indices]
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
         if self.concat_multi_camera == "robotwin":
@@ -205,6 +236,17 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video = self.crop_transform(video)
         video = self.normalize_transform(video)  # [T_video, C, H, W]
 
+        if self.current_frame_image_only:
+            output_frames = len(self.video_sample_indices)
+            video = video.repeat(output_frames, 1, 1, 1)
+            proprio_is_pad = sample["proprio_is_pad"]
+            if proprio_is_pad.shape != (self.num_frames,):
+                raise ValueError(
+                    "current-frame image loading requires the full proprio padding "
+                    f"horizon, got {tuple(proprio_is_pad.shape)}."
+                )
+            image_is_pad = proprio_is_pad[self.video_sample_indices].clone()
+
         video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
 
         # Proxy (from lerobot): 
@@ -232,9 +274,6 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         instruction = DEFAULT_PROMPT.format(task=task)
 
         context, context_mask = self._get_cached_text_context(instruction)
-        # NOTE: to keep consistent with wan2.2's behavior
-        context[~context_mask] = 0.0
-        context_mask = torch.ones_like(context_mask)
         
         data = {
             "video": video,
@@ -284,8 +323,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 f"Cached mask_len mismatch: expected {self.context_len}, got {context_mask.shape[0]} in {cache_path}"
             )
 
-        self._text_context_cache[cache_path] = (context, context_mask)
-        return context, context_mask
+        context = context.clone()
+        context_mask = context_mask.clone()
+        # Keep the existing Wan2.2 condition semantics while avoiding repeated
+        # deserialization for the same instruction.
+        context[~context_mask] = 0.0
+        context_mask = torch.ones_like(context_mask)
+        cached = (context, context_mask)
+        self._text_context_cache[cache_path] = cached
+        return cached
 
     def __getitem__(self, idx):
         try:

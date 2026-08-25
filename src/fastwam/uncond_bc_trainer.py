@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -163,6 +164,8 @@ def sha256_artifact(path: str | os.PathLike[str]) -> str:
 
 def _distributed_context(
     distributed_backend: str = "nccl",
+    *,
+    collective_timeout_seconds: int = 7200,
 ) -> tuple[int, int, int, torch.device]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -172,10 +175,20 @@ def _distributed_context(
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if world_size > 1 and not dist.is_initialized():
+        timeout_seconds = int(collective_timeout_seconds)
+        if timeout_seconds <= 0:
+            raise ValueError("collective_timeout_seconds must be positive.")
         if distributed_backend == "nccl":
-            dist.init_process_group(backend="nccl", device_id=device)
+            dist.init_process_group(
+                backend="nccl",
+                device_id=device,
+                timeout=timedelta(seconds=timeout_seconds),
+            )
         elif distributed_backend == "gloo_manual":
-            dist.init_process_group(backend="gloo")
+            dist.init_process_group(
+                backend="gloo",
+                timeout=timedelta(seconds=timeout_seconds),
+            )
         else:
             raise ValueError(
                 f"Unsupported BC distributed backend: {distributed_backend}."
@@ -561,6 +574,51 @@ def _release_validation_host_memory() -> None:
     _LIBC.malloc_trim(0)
 
 
+def _validate_reduced_validation_accumulator(
+    accum: torch.Tensor,
+    *,
+    expected_sample_count: int,
+    action_horizon: int,
+    dimension_count: int,
+    bin_count: int,
+) -> None:
+    """Reject partial or corrupted distributed validation reductions."""
+
+    expected_shape = (4 + dimension_count + 2 * bin_count,)
+    if tuple(accum.shape) != expected_shape:
+        raise RuntimeError(
+            "Validation accumulator shape changed: "
+            f"expected {expected_shape}, got {tuple(accum.shape)}."
+        )
+    if not bool(torch.isfinite(accum).all().item()):
+        raise RuntimeError("Validation accumulator contains non-finite values.")
+    sample_count = int(accum[1].item())
+    if sample_count != int(expected_sample_count):
+        raise RuntimeError(
+            "Distributed validation sample reduction is incomplete: "
+            f"expected {expected_sample_count}, got {sample_count}."
+        )
+    if int(accum[3].item()) <= 0:
+        raise RuntimeError("Distributed validation reduced zero batches.")
+    valid_steps = int(accum[2].item())
+    maximum_valid_steps = int(expected_sample_count) * int(action_horizon)
+    if not 0 <= valid_steps <= maximum_valid_steps:
+        raise RuntimeError(
+            "Distributed validation valid-action count is outside its exact "
+            f"bounds: {valid_steps} not in [0, {maximum_valid_steps}]."
+        )
+    bin_start = 4 + dimension_count
+    bin_counts = accum[bin_start + bin_count :]
+    reduced_bin_count = int(bin_counts.sum().item())
+    if reduced_bin_count != int(expected_sample_count):
+        raise RuntimeError(
+            "Distributed validation timestep-bin count is incomplete: "
+            f"expected {expected_sample_count}, got {reduced_bin_count}."
+        )
+    if bool((accum < 0).any().item()):
+        raise RuntimeError("Validation accumulator contains negative sums or counts.")
+
+
 @torch.no_grad()
 def _validate(
     model: nn.Module,
@@ -570,6 +628,7 @@ def _validate(
     cfg: DictConfig,
     world_size: int,
     device: torch.device,
+    expected_sample_count: int | None = None,
     max_batches: int | None = None,
 ) -> dict[str, Any]:
     model.eval()
@@ -620,6 +679,14 @@ def _validate(
         torch.cuda.synchronize(device)
         _release_validation_host_memory()
     accum = _all_reduce(accum, world_size=world_size)
+    if expected_sample_count is not None:
+        _validate_reduced_validation_accumulator(
+            accum,
+            expected_sample_count=expected_sample_count,
+            action_horizon=policy.config.action_horizon,
+            dimension_count=dimension_count,
+            bin_count=bin_count,
+        )
     sample_count = accum[1].clamp(min=1)
     valid_count = accum[2].clamp(min=1)
     dimensions = accum[4 : 4 + dimension_count] / valid_count
@@ -961,6 +1028,8 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         raise ValueError("UNCOND BC requires stateless per-sample flow inputs.")
     if bool(cfg.get("compile", False)):
         raise ValueError("UNCOND BC calibration/training is eager-only.")
+    if int(cfg.distributed.collective_timeout_seconds) != 7200:
+        raise ValueError("UNCOND BC collective timeout must be 7200 seconds.")
     distributed_backend = str(cfg.training.get("distributed_backend", "nccl"))
     if distributed_backend not in {"nccl", "gloo_manual"}:
         raise ValueError("UNCOND BC distributed backend must be nccl or gloo_manual.")
@@ -1013,6 +1082,14 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
             str(split.processor.norm_default_mode) != "min/max"
         ):
             raise ValueError("BC action/state normalization contract changed.")
+        repeats_current_frame = bool(split.get("current_frame_image_only", False))
+        returns_current_frame = bool(split.get("current_frame_only", False))
+        if repeats_current_frame == returns_current_frame:
+            raise ValueError(
+                "UNCOND BC must select exactly one current-frame loading mode."
+            )
+        if int(split.processor.num_image_obs_steps) != 1:
+            raise ValueError("UNCOND BC processor must decode one image step.")
     if not bool(cfg.data.train.is_training_set) or bool(
         cfg.data.validation.is_training_set
     ):
@@ -1046,10 +1123,6 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
             if not bool(split.get("strict_sample_loading", False)):
                 raise ValueError(
                     "Current-frame-only BC must fail closed on sample errors."
-                )
-            if int(split.processor.get("num_image_steps", -1)) != 1:
-                raise ValueError(
-                    "Current-frame-only BC processor must use one image step."
                 )
     expected_bc_shape = {
         "action_horizon": 32,
@@ -1335,7 +1408,10 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
     """Run BC0 or the isolated action-only DDP training loop."""
 
     distributed_backend = str(cfg.training.get("distributed_backend", "nccl"))
-    rank, world_size, local_rank, device = _distributed_context(distributed_backend)
+    rank, world_size, local_rank, device = _distributed_context(
+        distributed_backend,
+        collective_timeout_seconds=int(cfg.distributed.collective_timeout_seconds)
+    )
     _validate_training_config(cfg, world_size=world_size)
     _set_seed(
         int(cfg.seed),
@@ -1800,6 +1876,7 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             cfg=cfg,
             world_size=world_size,
             device=device,
+            expected_sample_count=len(validation_dataset),
         )
         improved = validation["loss_action_bc"] < best_validation
         if improved:

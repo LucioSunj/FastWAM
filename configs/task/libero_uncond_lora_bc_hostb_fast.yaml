@@ -18,11 +18,13 @@ data:
   multiprocessing_context: null
   persistent_workers: false
   train:
+    current_frame_image_only: false
     current_frame_only: true
     strict_sample_loading: true
     processor:
-      num_image_steps: 1
+      num_image_obs_steps: 1
   validation:
+    current_frame_image_only: false
     current_frame_only: true
     strict_sample_loading: true
 
