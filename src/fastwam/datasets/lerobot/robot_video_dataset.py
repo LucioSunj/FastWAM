@@ -43,17 +43,30 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
         current_frame_image_only: bool = False,
+        current_frame_only: bool = False,
+        strict_sample_loading: bool = False,
     ):
         self.current_frame_image_only = bool(current_frame_image_only)
+        self.current_frame_only = bool(current_frame_only)
+        if self.current_frame_image_only and self.current_frame_only:
+            raise ValueError(
+                "current_frame_image_only and current_frame_only are mutually exclusive."
+            )
+        self.strict_sample_loading = bool(strict_sample_loading)
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
             obs_size=num_frames,
             action_size=num_frames - 1,
-            image_obs_size=1 if self.current_frame_image_only else num_frames,
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
+            image_obs_size=(
+                1
+                if self.current_frame_image_only or self.current_frame_only
+                else num_frames
+            ),
+            strict_sample_loading=self.strict_sample_loading,
         )
     
         self.num_frames = num_frames
@@ -63,7 +76,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
         assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
             f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
-        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+        self.video_sample_indices = (
+            [0]
+            if self.current_frame_only
+            else list(range(0, num_frames, self.action_video_freq_ratio))
+        )
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -146,7 +163,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
         num_cameras = 1
         if video.ndim == 5:
-            if self.current_frame_image_only:
+            if self.current_frame_image_only or self.current_frame_only:
                 if video.shape[1] != 1:
                     raise ValueError(
                         "current-frame image loading expected one decoded frame, "
@@ -157,7 +174,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             num_cameras, T_video, C, H, W = video.shape
         else:
             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            if self.current_frame_image_only:
+            if self.current_frame_image_only or self.current_frame_only:
                 if video.shape[0] != 1:
                     raise ValueError(
                         "current-frame image loading expected one decoded frame, "
@@ -166,7 +183,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             else:
                 video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
             T_video, C, H, W = video.shape
-        if self.current_frame_image_only:
+        if self.current_frame_image_only or self.current_frame_only:
             if image_is_pad.shape != (1,):
                 raise ValueError(
                     "current-frame image padding must have shape (1,), got "
@@ -237,9 +254,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
         action = sample["action"] # [T-1, action_dim]
         proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
-        if video.shape[1] <= 1:
+        if self.current_frame_only and video.shape[1] != 1:
+            raise ValueError(
+                "Current-frame-only dataset must return exactly one video frame, "
+                f"got shape {tuple(video.shape)}"
+            )
+        if not self.current_frame_only and video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
-        if action.shape[0] % (video.shape[1] - 1) != 0:
+        if not self.current_frame_only and action.shape[0] % (video.shape[1] - 1) != 0:
             raise ValueError(
                 f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
             )
@@ -281,7 +303,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 f"Missing text embedding cache: {cache_path}. "
                 "Run scripts/precompute_text_embeds.py first."
             )
-        payload = torch.load(cache_path, map_location="cpu")
+        payload = torch.load(cache_path, map_location="cpu", weights_only=True)
         context = payload["context"]
         context_mask = payload["mask"].bool()
         if context.ndim != 2:
@@ -315,6 +337,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         try:
             data = self._get(idx)
         except Exception as e:
+            if self.strict_sample_loading:
+                raise
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
             # trace back
             print(traceback.format_exc())

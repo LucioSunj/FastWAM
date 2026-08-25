@@ -13,13 +13,17 @@ from torch import nn
 from fastwam import uncond_bc_trainer
 from fastwam.uncond_bc_trainer import (
     DistributedEvalSampler,
+    _average_trainable_gradients,
     _canonical_config,
     _dataset_summary,
     _distributed_context,
     _git_state,
     _instantiate_bc_dataset,
+    _load_verified_artifact_digests,
+    _lora_update_norm,
     _prune_training_checkpoints,
     _save_checkpoint,
+    _snapshot_lora,
     _validate_training_config,
     _write_resolved_config,
     _write_run_manifest,
@@ -29,10 +33,11 @@ from fastwam.uncond_bc_trainer import (
 )
 
 
-def _compose_config():
+def _compose_config(*, task: str | None = None):
     config_dir = Path(__file__).resolve().parents[1] / "configs"
     with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
-        return compose(config_name="uncond_bc")
+        overrides = [] if task is None else [f"task={task}"]
+        return compose(config_name="uncond_bc", overrides=overrides)
 
 
 def test_uncond_bc_hydra_preset_is_isolated_and_parent_bound() -> None:
@@ -72,11 +77,88 @@ def test_uncond_bc_hydra_preset_is_isolated_and_parent_bound() -> None:
     assert "loss_video" not in resolved
 
 
+def test_hostb_fast_preset_loads_only_the_consumed_current_frame() -> None:
+    cfg = _compose_config(task="libero_uncond_lora_bc_hostb_fast")
+
+    assert cfg.data.train.current_frame_only is True
+    assert cfg.data.validation.current_frame_only is True
+    assert cfg.data.train.current_frame_image_only is False
+    assert cfg.data.validation.current_frame_image_only is False
+    assert cfg.data.train.strict_sample_loading is True
+    assert cfg.data.validation.strict_sample_loading is True
+    assert cfg.data.train.processor.num_image_obs_steps == 1
+    assert cfg.bc_policy.expected_video_frames == 1
+    assert cfg.data.num_workers == 4
+    assert cfg.data.persistent_workers is False
+    assert cfg.validation.host_cleanup_interval_batches == 16
+    assert cfg.training.ddp_static_graph is True
+    assert cfg.training.ddp_gradient_as_bucket_view is True
+    assert cfg.training.distributed_backend == "gloo_manual"
+    assert cfg.provenance.verified_manifest is None
+    _validate_training_config(cfg, world_size=4)
+
+
+def test_verified_pass_manifest_reuses_only_matching_artifact_digests(tmp_path) -> None:
+    cfg = _compose_config(task="libero_uncond_lora_bc_hostb_fast")
+    dataset_hashes = {
+        str(path): f"digest-{index}"
+        for index, path in enumerate(cfg.provenance.dataset_paths)
+    }
+    manifest = tmp_path / "run_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "contract": {"dataset_sha256": dataset_hashes},
+                "provenance": {
+                    "resolved_config": {
+                        "provenance": {
+                            "dataset_paths": list(cfg.provenance.dataset_paths),
+                            "text_cache_path": str(cfg.provenance.text_cache_path),
+                        }
+                    },
+                    "parent_checkpoint": {
+                        "path": str(cfg.parent.checkpoint),
+                        "sha256": str(cfg.parent.checkpoint_sha256),
+                    },
+                    "statistics": {
+                        "path": str(cfg.parent.statistics),
+                        "sha256": str(cfg.parent.statistics_sha256),
+                    },
+                    "text_cache": {
+                        "path": str(cfg.provenance.text_cache_path),
+                        "sha256": "text-digest",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg.provenance.verified_manifest = str(manifest)
+
+    reused = _load_verified_artifact_digests(cfg)
+
+    assert reused == {
+        "source_manifest": str(manifest),
+        "parent_sha256": str(cfg.parent.checkpoint_sha256),
+        "statistics_sha256": str(cfg.parent.statistics_sha256),
+        "dataset_sha256": dataset_hashes,
+        "text_cache_sha256": "text-digest",
+    }
+
+
 def test_training_config_enforces_4gpu_capacity_ladder_and_allows_bc0() -> None:
     cfg = _compose_config()
     _validate_training_config(cfg, world_size=4)
 
-    for microbatch, accumulation in ((1, 32), (2, 16), (4, 8), (8, 4)):
+    for microbatch, accumulation in (
+        (1, 32),
+        (2, 16),
+        (4, 8),
+        (8, 4),
+        (16, 2),
+        (32, 1),
+    ):
         candidate = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
         candidate.training.microbatch_size = microbatch
         candidate.training.gradient_accumulation_steps = accumulation
@@ -260,7 +342,50 @@ def test_distributed_validation_sampler_has_no_padding_or_duplicates() -> None:
     assert len(flattened) == len(set(flattened))
 
 
-def test_validation_releases_host_memory_after_every_batch(monkeypatch) -> None:
+def test_vectorized_lora_snapshot_preserves_exact_update_norm() -> None:
+    parameters = [
+        nn.Parameter(torch.tensor([1.0, 2.0])),
+        nn.Parameter(torch.tensor([[3.0], [4.0]])),
+    ]
+    adapter = SimpleNamespace(lora_parameters=lambda: iter(parameters))
+    policy = SimpleNamespace(lora_adapter=adapter)
+
+    before = _snapshot_lora(policy)
+    with torch.no_grad():
+        parameters[0].add_(torch.tensor([0.5, -0.5]))
+        parameters[1].add_(torch.tensor([[1.0], [-1.0]]))
+
+    assert torch.equal(before, torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    assert torch.equal(
+        _lora_update_norm(policy, before),
+        torch.sqrt(torch.tensor(2.5)),
+    )
+
+
+def test_manual_gradient_average_matches_ddp_mean(monkeypatch) -> None:
+    parameters = [
+        nn.Parameter(torch.tensor([1.0, 2.0])),
+        nn.Parameter(torch.tensor([3.0])),
+    ]
+    parameters[0].grad = torch.tensor([2.0, 4.0])
+    parameters[1].grad = torch.tensor([6.0])
+
+    def all_reduce(value, op):
+        del op
+        value.mul_(2.0)
+
+    monkeypatch.setattr("fastwam.uncond_bc_trainer.dist.all_reduce", all_reduce)
+    _average_trainable_gradients(
+        parameters,
+        world_size=4,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(parameters[0].grad, torch.tensor([1.0, 2.0]))
+    assert torch.equal(parameters[1].grad, torch.tensor([3.0]))
+
+
+def test_validation_releases_host_memory_at_configured_cadence(monkeypatch) -> None:
     releases = []
     synchronizations = []
     monkeypatch.setattr(
@@ -328,15 +453,21 @@ def test_validation_releases_host_memory_after_every_batch(monkeypatch) -> None:
         _Model(),
         policy,
         _Loader(),
-        cfg=SimpleNamespace(validation=SimpleNamespace(seed=42)),
+        cfg=SimpleNamespace(
+            validation=SimpleNamespace(
+                seed=42,
+                host_cleanup_interval_batches=2,
+            )
+        ),
         world_size=1,
         device=torch.device("cpu"),
         expected_sample_count=3,
     )
 
     assert result["sample_count"] == 3
-    assert len(synchronizations) == 3
-    assert releases == [True, True, True]
+    assert len(synchronizations) == 2
+    assert releases == [True, True]
+    assert result["host_cleanup_interval_batches"] == 2
 
 
 def test_validation_accumulator_rejects_partial_or_corrupt_reduction() -> None:

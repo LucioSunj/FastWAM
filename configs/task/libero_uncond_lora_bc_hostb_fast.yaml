@@ -1,0 +1,43 @@
+# @package _global_
+
+defaults:
+  - libero_uncond_lora_bc
+  - _self_
+
+# Host-B rank-16 systems overlay. The model still receives the exact current
+# frame used by the base preset, while unused future image timestamps never
+# enter decode, resize, collation, or host-to-device transfer.
+provenance:
+  # Later launches may reuse digests from one immutable PASS manifest instead
+  # of rereading the same pinned parent and 4.5-GB dataset tree.
+  verified_manifest: null
+
+data:
+  num_workers: 4
+  prefetch_factor: 1
+  multiprocessing_context: null
+  persistent_workers: false
+  train:
+    current_frame_image_only: false
+    current_frame_only: true
+    strict_sample_loading: true
+    processor:
+      num_image_obs_steps: 1
+  validation:
+    current_frame_image_only: false
+    current_frame_only: true
+    strict_sample_loading: true
+
+training:
+  # Host B has four MIGs across only three physical GPUs. NCCL rejects the two
+  # sibling MIGs in one communicator, so synchronize the FP32 LoRA gradients
+  # through host memory while all model compute stays on the four MIGs.
+  distributed_backend: gloo_manual
+  ddp_static_graph: true
+  ddp_gradient_as_bucket_view: true
+
+validation:
+  host_cleanup_interval_batches: 16
+
+bc_policy:
+  expected_video_frames: 1

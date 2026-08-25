@@ -28,6 +28,7 @@ class _SampleSource:
 def _dataset(sample, *, current_frame_image_only: bool) -> RobotVideoDataset:
     dataset = RobotVideoDataset.__new__(RobotVideoDataset)
     dataset.current_frame_image_only = current_frame_image_only
+    dataset.current_frame_only = False
     dataset.num_frames = 33
     dataset.lerobot_dataset = _SampleSource(sample)
     dataset.max_padding_retry = 0

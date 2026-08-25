@@ -17,10 +17,12 @@ runner:
   output_dir: ${oc.env:FASTWAM_BC_OUTPUT_DIR,./runs/uncond_lora_action_bc/${now:%Y-%m-%d}_${now:%H-%M-%S}}
   resume: null
   stop_after_steps: null
+  diagnostic_validation_batches: null
 
 training:
   deterministic_algorithms: true
   stateless_flow_inputs: true
+  distributed_backend: nccl
   microbatch_size: 1
   gradient_accumulation_steps: 32
   global_batch_size: 128
@@ -42,6 +44,7 @@ optimizer:
 
 validation:
   seed: 42
+  host_cleanup_interval_batches: 1
 
 lora:
   rank: 16
