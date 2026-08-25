@@ -19,6 +19,7 @@ runner:
 training:
   deterministic_algorithms: true
   stateless_flow_inputs: true
+  distributed_backend: nccl
   microbatch_size: 1
   gradient_accumulation_steps: 32
   global_batch_size: 128

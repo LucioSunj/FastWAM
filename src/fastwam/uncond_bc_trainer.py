@@ -161,7 +161,9 @@ def sha256_artifact(path: str | os.PathLike[str]) -> str:
     return digest.hexdigest()
 
 
-def _distributed_context() -> tuple[int, int, int, torch.device]:
+def _distributed_context(
+    distributed_backend: str = "nccl",
+) -> tuple[int, int, int, torch.device]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -170,7 +172,14 @@ def _distributed_context() -> tuple[int, int, int, torch.device]:
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl", device_id=device)
+        if distributed_backend == "nccl":
+            dist.init_process_group(backend="nccl", device_id=device)
+        elif distributed_backend == "gloo_manual":
+            dist.init_process_group(backend="gloo")
+        else:
+            raise ValueError(
+                f"Unsupported BC distributed backend: {distributed_backend}."
+            )
     return rank, world_size, local_rank, device
 
 
@@ -492,8 +501,57 @@ def _build_loaders(
 
 def _all_reduce(value: torch.Tensor, *, world_size: int) -> torch.Tensor:
     if world_size > 1:
-        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        if dist.get_backend() == "gloo" and value.device.type != "cpu":
+            reduced = value.detach().cpu()
+            dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+            value.copy_(reduced.to(device=value.device))
+        else:
+            dist.all_reduce(value, op=dist.ReduceOp.SUM)
     return value
+
+
+@torch.no_grad()
+def _broadcast_trainable_parameters(
+    parameters: list[nn.Parameter],
+    *,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    if world_size == 1:
+        return
+    flat = torch.nn.utils.parameters_to_vector(
+        [parameter.detach() for parameter in parameters]
+    ).cpu()
+    dist.broadcast(flat, src=0)
+    torch.nn.utils.vector_to_parameters(flat.to(device=device), parameters)
+
+
+@torch.no_grad()
+def _average_trainable_gradients(
+    parameters: list[nn.Parameter],
+    *,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    if world_size == 1:
+        return
+    missing = [
+        index for index, parameter in enumerate(parameters) if parameter.grad is None
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Manual BC gradient synchronization found missing gradients: {missing[:16]}."
+        )
+    flat = torch.nn.utils.parameters_to_vector(
+        [parameter.grad.detach() for parameter in parameters]
+    ).cpu()
+    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+    flat.div_(world_size)
+    gradient_vector = flat.to(device=device)
+    torch.nn.utils.vector_to_parameters(
+        gradient_vector,
+        [parameter.grad for parameter in parameters],
+    )
 
 
 def _release_validation_host_memory() -> None:
@@ -838,6 +896,13 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         raise ValueError("UNCOND BC requires stateless per-sample flow inputs.")
     if bool(cfg.get("compile", False)):
         raise ValueError("UNCOND BC calibration/training is eager-only.")
+    distributed_backend = str(cfg.training.get("distributed_backend", "nccl"))
+    if distributed_backend not in {"nccl", "gloo_manual"}:
+        raise ValueError("UNCOND BC distributed backend must be nccl or gloo_manual.")
+    if distributed_backend == "gloo_manual" and int(cfg.lora.rank) != 16:
+        raise ValueError(
+            "Manual Gloo synchronization is reserved for Host-B rank-16 BC."
+        )
 
     expected_parent = (
         "/XYFS02/HDD_POOL/nju_shklu/nju_shklu_1/"
@@ -1204,7 +1269,8 @@ def _bc0_parity_and_action_report(
 def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
     """Run BC0 or the isolated action-only DDP training loop."""
 
-    rank, world_size, local_rank, device = _distributed_context()
+    distributed_backend = str(cfg.training.get("distributed_backend", "nccl"))
+    rank, world_size, local_rank, device = _distributed_context(distributed_backend)
     _validate_training_config(cfg, world_size=world_size)
     _set_seed(
         int(cfg.seed),
@@ -1273,6 +1339,13 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
         lora_config=RegimeLoRAConfig(**lora_payload),
         config=FastWAMUncondBCConfig(**bc_payload),
     ).to(device)
+    parameters = list(policy.lora_adapter.lora_parameters())
+    if distributed_backend == "gloo_manual":
+        _broadcast_trainable_parameters(
+            parameters,
+            world_size=world_size,
+            device=device,
+        )
     future_prediction_calls = {"count": 0}
 
     def forbidden_future_prediction(*args, **kwargs):
@@ -1317,7 +1390,7 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
         world_size=world_size,
     )
 
-    if world_size > 1:
+    if world_size > 1 and distributed_backend == "nccl":
         model: nn.Module = DistributedDataParallel(
             policy,
             device_ids=[local_rank],
@@ -1418,7 +1491,6 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             raise RuntimeError("BC0 numerical, parity, or isolation acceptance failed.")
         return manifest
 
-    parameters = list(policy.lora_adapter.lora_parameters())
     optimizer = torch.optim.AdamW(
         parameters,
         lr=float(cfg.optimizer.learning_rate),
@@ -1520,7 +1592,9 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             )
             sync_context = (
                 contextlib.nullcontext()
-                if sync_update or world_size == 1
+                if sync_update
+                or world_size == 1
+                or distributed_backend == "gloo_manual"
                 else model.no_sync()
             )
             training_identities = [
@@ -1561,6 +1635,12 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
                 continue
             if not torch.isfinite(output["loss_action_bc"]):
                 raise FloatingPointError("Non-finite UNCOND action BC loss.")
+            if distributed_backend == "gloo_manual":
+                _average_trainable_gradients(
+                    parameters,
+                    world_size=world_size,
+                    device=device,
+                )
             gradient_norm = torch.nn.utils.clip_grad_norm_(
                 parameters,
                 max_norm=float(cfg.optimizer.gradient_clip),

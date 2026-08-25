@@ -12,6 +12,7 @@ from torch import nn
 from fastwam import uncond_bc_trainer
 from fastwam.uncond_bc_trainer import (
     DistributedEvalSampler,
+    _average_trainable_gradients,
     _canonical_config,
     _dataset_summary,
     _distributed_context,
@@ -88,6 +89,7 @@ def test_hostb_fast_preset_loads_only_the_consumed_current_frame() -> None:
     assert cfg.validation.host_cleanup_interval_batches == 16
     assert cfg.training.ddp_static_graph is True
     assert cfg.training.ddp_gradient_as_bucket_view is True
+    assert cfg.training.distributed_backend == "gloo_manual"
     _validate_training_config(cfg, world_size=4)
 
 
@@ -297,6 +299,29 @@ def test_vectorized_lora_snapshot_preserves_exact_update_norm() -> None:
         _lora_update_norm(policy, before),
         torch.sqrt(torch.tensor(2.5)),
     )
+
+
+def test_manual_gradient_average_matches_ddp_mean(monkeypatch) -> None:
+    parameters = [
+        nn.Parameter(torch.tensor([1.0, 2.0])),
+        nn.Parameter(torch.tensor([3.0])),
+    ]
+    parameters[0].grad = torch.tensor([2.0, 4.0])
+    parameters[1].grad = torch.tensor([6.0])
+
+    def all_reduce(value, op):
+        del op
+        value.mul_(2.0)
+
+    monkeypatch.setattr("fastwam.uncond_bc_trainer.dist.all_reduce", all_reduce)
+    _average_trainable_gradients(
+        parameters,
+        world_size=4,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(parameters[0].grad, torch.tensor([1.0, 2.0]))
+    assert torch.equal(parameters[1].grad, torch.tensor([3.0]))
 
 
 def test_validation_releases_host_memory_at_configured_cadence(monkeypatch) -> None:

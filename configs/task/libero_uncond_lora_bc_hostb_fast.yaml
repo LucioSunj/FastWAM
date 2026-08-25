@@ -22,6 +22,10 @@ data:
     strict_sample_loading: true
 
 training:
+  # Host B has four MIGs across only three physical GPUs. NCCL rejects the two
+  # sibling MIGs in one communicator, so synchronize the FP32 LoRA gradients
+  # through host memory while all model compute stays on the four MIGs.
+  distributed_backend: gloo_manual
   ddp_static_graph: true
   ddp_gradient_as_bucket_view: true
 
