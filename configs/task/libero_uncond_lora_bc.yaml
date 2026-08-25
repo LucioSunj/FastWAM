@@ -43,6 +43,7 @@ data:
     split_seed: ${seed}
     skip_padding_as_possible: false
     concat_multi_camera: horizontal
+    current_frame_image_only: true
     text_embedding_cache_dir: ${provenance.text_cache_path}
     context_len: 128
     pretrained_norm_stats: ${parent.statistics}
@@ -50,6 +51,7 @@ data:
       _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
       shape_meta: ${data.train.shape_meta}
       num_obs_steps: 33
+      num_image_obs_steps: 1
       num_output_cameras: 2
       action_output_dim: 7
       proprio_output_dim: 8
@@ -83,6 +85,7 @@ data:
     split_seed: ${seed}
     skip_padding_as_possible: false
     concat_multi_camera: horizontal
+    current_frame_image_only: true
     text_embedding_cache_dir: ${provenance.text_cache_path}
     context_len: 128
     pretrained_norm_stats: ${parent.statistics}

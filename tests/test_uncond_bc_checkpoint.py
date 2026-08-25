@@ -4,6 +4,8 @@ import random
 import numpy as np
 import pytest
 import torch
+from torch import nn
+
 from fastwam.adapters import (
     ActionLoRATargetGroup,
     PolicyRegime,
@@ -14,11 +16,11 @@ from fastwam.uncond_bc_checkpoint import (
     capture_rng_state,
     compare_uncond_bc_checkpoints,
     inspect_uncond_bc_checkpoint,
+    load_uncond_bc_adapter_checkpoint,
     load_uncond_bc_checkpoint,
     restore_rng_state,
     save_uncond_bc_checkpoint,
 )
-from torch import nn
 
 
 class _Block(nn.Module):
@@ -174,6 +176,19 @@ def test_bc_checkpoint_strict_round_trip_and_inspector(tmp_path) -> None:
     assert restored_scaler.value == 7
     assert payload["sampler_offset"] == 11
     assert payload["trainer_state"] == report["trainer_state"]
+
+    adapter_only_model, adapter_only, *_ = _components(parent)
+    adapter_only_report = load_uncond_bc_adapter_checkpoint(
+        checkpoint,
+        adapter=adapter_only,
+        expected_parent_checkpoint_sha256="2" * 64,
+    )
+    del adapter_only_model
+    assert adapter_only_report["global_step"] == 1
+    assert adapter_only_report["contract"] == contract
+    assert adapter_only_report["trainer_state"] == report["trainer_state"]
+    for name, value in adapter.lora_state_dict().items():
+        assert torch.equal(adapter_only.lora_state_dict()[name], value)
 
 
 def test_bc_checkpoint_rejects_parent_and_config_mismatch(tmp_path) -> None:

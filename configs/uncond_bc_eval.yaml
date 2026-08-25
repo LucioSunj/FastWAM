@@ -8,12 +8,18 @@ precision: bf16
 compile: false
 seed: 42
 
+distributed:
+  collective_timeout_seconds: 7200
+
 runner:
   stage: offline_validation
   policy: zero_lora
   output_dir: ${oc.env:FASTWAM_BC_EVAL_OUTPUT_DIR,./runs/uncond_lora_action_bc_eval/${now:%Y-%m-%d}_${now:%H-%M-%S}}
   sidecar: null
   sidecar_sha256: null
+  training_checkpoint: null
+  training_checkpoint_sha256: null
+  training_checkpoint_step: null
 
 training:
   microbatch_size: 8

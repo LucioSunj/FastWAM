@@ -25,6 +25,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         past_action_size: int = 0, # Excludes the current frame
         obs_size: int = 1, # should be 
         past_obs_size: int = 0,
+        image_obs_size: Optional[int] = None,
 
         # train vs val
         val_set_proportion: float = 0.05, 
@@ -44,6 +45,14 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         self.action_size = action_size
         self.past_action_size = past_action_size
         self.obs_size = obs_size
+        self.image_obs_size = (
+            int(obs_size) if image_obs_size is None else int(image_obs_size)
+        )
+        if self.image_obs_size <= 0 or self.image_obs_size > int(obs_size):
+            raise ValueError(
+                "image_obs_size must lie in [1, obs_size], got "
+                f"{self.image_obs_size} for obs_size={obs_size}."
+            )
         self.processor = None  # Will be set externally
         metas = []
         for ds_dir in dataset_dirs:
@@ -70,7 +79,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             key = meta["key"]
             meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
             delta_timestamps[meta["lerobot_key"]] = [
-                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
+                (t * global_sample_stride) / fps
+                for t in range(
+                    -past_obs_size,
+                    -past_obs_size + self.image_obs_size,
+                )
             ]
         
         for meta in self.state_meta:

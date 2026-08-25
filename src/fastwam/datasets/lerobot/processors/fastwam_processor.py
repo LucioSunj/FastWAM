@@ -34,6 +34,8 @@ class FastWAMProcessor(BaseProcessor):
         train_transforms: Dict[str, List[Any]] | None,
         val_transforms: Dict[str, List[Any]] | None, 
 
+        num_image_obs_steps: Optional[int] = None,
+
         # instruction transform
         drop_high_level_prob: float = 1.0,
         use_zh_instruction: bool = False,
@@ -43,6 +45,13 @@ class FastWAMProcessor(BaseProcessor):
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
+        self.num_image_obs_steps = (
+            int(num_obs_steps)
+            if num_image_obs_steps is None
+            else int(num_image_obs_steps)
+        )
+        if self.num_image_obs_steps <= 0:
+            raise ValueError("num_image_obs_steps must be positive.")
         self.num_output_cameras = num_output_cameras
         self.action_output_dim = action_output_dim
         self.proprio_output_dim = proprio_output_dim
@@ -224,7 +233,7 @@ class FastWAMProcessor(BaseProcessor):
             for trans in current_transforms:
                 image = trans(image)
             
-            meta_shape = [self.num_obs_steps] + shape
+            meta_shape = [self.num_image_obs_steps] + shape
             assert image.shape == meta_shape, \
                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
 

@@ -8,6 +8,9 @@ precision: bf16
 compile: false
 seed: 42
 
+distributed:
+  collective_timeout_seconds: 7200
+
 runner:
   stage: formal
   single_gpu_diagnostic: false
