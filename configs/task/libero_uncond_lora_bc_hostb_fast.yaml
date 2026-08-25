@@ -7,6 +7,11 @@ defaults:
 # Host-B rank-16 systems overlay. The model still receives the exact current
 # frame used by the base preset, while unused future image timestamps never
 # enter decode, resize, collation, or host-to-device transfer.
+provenance:
+  # Later launches may reuse digests from one immutable PASS manifest instead
+  # of rereading the same pinned parent and 4.5-GB dataset tree.
+  verified_manifest: null
+
 data:
   num_workers: 4
   prefetch_factor: 1

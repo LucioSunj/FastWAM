@@ -809,6 +809,58 @@ def _assert_frozen_versions(
         )
 
 
+def _load_verified_artifact_digests(cfg: DictConfig) -> dict[str, Any] | None:
+    manifest_value = cfg.provenance.get("verified_manifest")
+    if manifest_value is None:
+        return None
+    manifest_path = Path(str(manifest_value)).expanduser()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Verified BC provenance manifest does not exist: {manifest_path}"
+        )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if payload.get("status") != "PASS":
+        raise ValueError("Only a completed PASS manifest may supply BC digests.")
+
+    source_provenance = payload["provenance"]
+    source_config = source_provenance["resolved_config"]
+    current_dataset_paths = [str(path) for path in cfg.provenance.dataset_paths]
+    if list(source_config["provenance"]["dataset_paths"]) != current_dataset_paths:
+        raise ValueError("Verified manifest dataset paths differ from this launch.")
+    current_text_cache = str(cfg.provenance.text_cache_path)
+    if source_config["provenance"]["text_cache_path"] != current_text_cache:
+        raise ValueError("Verified manifest text-cache path differs from this launch.")
+
+    parent = source_provenance["parent_checkpoint"]
+    statistics = source_provenance["statistics"]
+    if parent != {
+        "path": str(cfg.parent.checkpoint),
+        "sha256": str(cfg.parent.checkpoint_sha256),
+    }:
+        raise ValueError(
+            "Verified manifest parent checkpoint differs from this launch."
+        )
+    if statistics != {
+        "path": str(cfg.parent.statistics),
+        "sha256": str(cfg.parent.statistics_sha256),
+    }:
+        raise ValueError("Verified manifest statistics differ from this launch.")
+
+    dataset_hashes = payload["contract"]["dataset_sha256"]
+    if set(dataset_hashes) != set(current_dataset_paths):
+        raise ValueError("Verified manifest dataset digest keys are incomplete.")
+    text_cache = source_provenance["text_cache"]
+    if text_cache["path"] != current_text_cache:
+        raise ValueError("Verified manifest text-cache provenance differs.")
+    return {
+        "source_manifest": str(manifest_path),
+        "parent_sha256": parent["sha256"],
+        "statistics_sha256": statistics["sha256"],
+        "dataset_sha256": dict(dataset_hashes),
+        "text_cache_sha256": text_cache["sha256"],
+    }
+
+
 def _build_provenance(
     cfg: DictConfig,
     *,
@@ -819,12 +871,17 @@ def _build_provenance(
     stats_sha256: str,
     rank: int,
     world_size: int,
+    reused_artifacts: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     dataset_paths = [str(path) for path in cfg.provenance.dataset_paths]
     text_cache = str(cfg.provenance.text_cache_path)
     if rank == 0:
-        dataset_hashes = {path: sha256_artifact(path) for path in dataset_paths}
-        text_cache_hash = sha256_artifact(text_cache)
+        if reused_artifacts is None:
+            dataset_hashes = {path: sha256_artifact(path) for path in dataset_paths}
+            text_cache_hash = sha256_artifact(text_cache)
+        else:
+            dataset_hashes = dict(reused_artifacts["dataset_sha256"])
+            text_cache_hash = str(reused_artifacts["text_cache_sha256"])
     else:
         dataset_hashes = None
         text_cache_hash = None
@@ -872,6 +929,14 @@ def _build_provenance(
         "eager": True,
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+        "artifact_digest_source": (
+            {"mode": "computed"}
+            if reused_artifacts is None
+            else {
+                "mode": "reused_verified_manifest",
+                "path": str(reused_artifacts["source_manifest"]),
+            }
+        ),
     }
     return contract, provenance
 
@@ -1295,24 +1360,29 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             launch_hash=launch_hash,
             value=OmegaConf.to_yaml(cfg, resolve=True),
         )
-    parent_sha256 = (
-        _verify_sha256(
-            str(cfg.parent.checkpoint),
-            str(cfg.parent.checkpoint_sha256),
-            label="FastWAM parent",
-        )
-        if rank == 0
-        else None
+    reused_artifacts = _load_verified_artifact_digests(cfg) if rank == 0 else None
+    reused_artifacts = _broadcast_object(
+        reused_artifacts,
+        rank=rank,
+        world_size=world_size,
     )
-    stats_sha256 = (
-        _verify_sha256(
-            str(cfg.parent.statistics),
-            str(cfg.parent.statistics_sha256),
-            label="FastWAM statistics",
-        )
-        if rank == 0
-        else None
-    )
+    parent_sha256 = None
+    stats_sha256 = None
+    if rank == 0:
+        if reused_artifacts is None:
+            parent_sha256 = _verify_sha256(
+                str(cfg.parent.checkpoint),
+                str(cfg.parent.checkpoint_sha256),
+                label="FastWAM parent",
+            )
+            stats_sha256 = _verify_sha256(
+                str(cfg.parent.statistics),
+                str(cfg.parent.statistics_sha256),
+                label="FastWAM statistics",
+            )
+        else:
+            parent_sha256 = str(reused_artifacts["parent_sha256"])
+            stats_sha256 = str(reused_artifacts["statistics_sha256"])
     parent_sha256 = _broadcast_object(parent_sha256, rank=rank, world_size=world_size)
     stats_sha256 = _broadcast_object(stats_sha256, rank=rank, world_size=world_size)
     contract, provenance = _build_provenance(
@@ -1324,6 +1394,7 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
         stats_sha256=stats_sha256,
         rank=rank,
         world_size=world_size,
+        reused_artifacts=reused_artifacts,
     )
 
     actor = instantiate(

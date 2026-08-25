@@ -18,6 +18,7 @@ from fastwam.uncond_bc_trainer import (
     _distributed_context,
     _git_state,
     _instantiate_bc_dataset,
+    _load_verified_artifact_digests,
     _lora_update_norm,
     _prune_training_checkpoints,
     _save_checkpoint,
@@ -90,7 +91,57 @@ def test_hostb_fast_preset_loads_only_the_consumed_current_frame() -> None:
     assert cfg.training.ddp_static_graph is True
     assert cfg.training.ddp_gradient_as_bucket_view is True
     assert cfg.training.distributed_backend == "gloo_manual"
+    assert cfg.provenance.verified_manifest is None
     _validate_training_config(cfg, world_size=4)
+
+
+def test_verified_pass_manifest_reuses_only_matching_artifact_digests(tmp_path) -> None:
+    cfg = _compose_config(task="libero_uncond_lora_bc_hostb_fast")
+    dataset_hashes = {
+        str(path): f"digest-{index}"
+        for index, path in enumerate(cfg.provenance.dataset_paths)
+    }
+    manifest = tmp_path / "run_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "contract": {"dataset_sha256": dataset_hashes},
+                "provenance": {
+                    "resolved_config": {
+                        "provenance": {
+                            "dataset_paths": list(cfg.provenance.dataset_paths),
+                            "text_cache_path": str(cfg.provenance.text_cache_path),
+                        }
+                    },
+                    "parent_checkpoint": {
+                        "path": str(cfg.parent.checkpoint),
+                        "sha256": str(cfg.parent.checkpoint_sha256),
+                    },
+                    "statistics": {
+                        "path": str(cfg.parent.statistics),
+                        "sha256": str(cfg.parent.statistics_sha256),
+                    },
+                    "text_cache": {
+                        "path": str(cfg.provenance.text_cache_path),
+                        "sha256": "text-digest",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg.provenance.verified_manifest = str(manifest)
+
+    reused = _load_verified_artifact_digests(cfg)
+
+    assert reused == {
+        "source_manifest": str(manifest),
+        "parent_sha256": str(cfg.parent.checkpoint_sha256),
+        "statistics_sha256": str(cfg.parent.statistics_sha256),
+        "dataset_sha256": dataset_hashes,
+        "text_cache_sha256": "text-digest",
+    }
 
 
 def test_training_config_enforces_4gpu_capacity_ladder_and_allows_bc0() -> None:
