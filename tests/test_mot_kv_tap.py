@@ -61,6 +61,34 @@ def _freqs(sequence_length: int) -> torch.Tensor:
     return torch.ones(sequence_length, 1, 2, dtype=torch.complex128)
 
 
+def test_mixed_attention_skips_checkpoint_when_gradients_are_disabled(
+    monkeypatch,
+) -> None:
+    mot = _mot().train()
+    mot.mot_checkpoint_mixed_attn = True
+    checkpoint_calls = []
+
+    monkeypatch.setattr(
+        "fastwam.models.wan22.mot.flash_attention",
+        lambda *, q, k, v, num_heads, ctx_mask: q + k + v,
+    )
+
+    def checkpoint(function, *args, **kwargs):
+        checkpoint_calls.append(True)
+        return function(*args)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", checkpoint)
+    q = torch.randn(1, 2, 8)
+    mask = torch.ones(2, 2, dtype=torch.bool)
+
+    with torch.no_grad():
+        mot._mixed_attention(q, q, q, mask)
+    assert checkpoint_calls == []
+
+    mot._mixed_attention(q, q, q, mask)
+    assert checkpoint_calls == [True]
+
+
 class _TinyCachedActionExpert(_TinyExpert):
     def __init__(self) -> None:
         super().__init__(num_layers=1)

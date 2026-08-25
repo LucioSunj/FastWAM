@@ -42,7 +42,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        current_frame_only: bool = False,
+        strict_sample_loading: bool = False,
     ):
+        self.current_frame_only = bool(current_frame_only)
+        self.strict_sample_loading = bool(strict_sample_loading)
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
@@ -51,6 +55,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
+            image_obs_size=1 if self.current_frame_only else num_frames,
+            strict_sample_loading=self.strict_sample_loading,
         )
     
         self.num_frames = num_frames
@@ -60,7 +66,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
         assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
             f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
-        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+        self.video_sample_indices = (
+            [0]
+            if self.current_frame_only
+            else list(range(0, num_frames, self.action_video_freq_ratio))
+        )
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -72,6 +82,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self._text_context_cache = {}
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -201,9 +212,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
         action = sample["action"] # [T-1, action_dim]
         proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
-        if video.shape[1] <= 1:
+        if self.current_frame_only and video.shape[1] != 1:
+            raise ValueError(
+                "Current-frame-only dataset must return exactly one video frame, "
+                f"got shape {tuple(video.shape)}"
+            )
+        if not self.current_frame_only and video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
-        if action.shape[0] % (video.shape[1] - 1) != 0:
+        if not self.current_frame_only and action.shape[0] % (video.shape[1] - 1) != 0:
             raise ValueError(
                 f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
             )
@@ -240,12 +256,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         os.makedirs(cache_dir, exist_ok=True)
         hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         cache_path = os.path.join(cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt")
+        cached = self._text_context_cache.get(cache_path)
+        if cached is not None:
+            return cached
         if not os.path.exists(cache_path):
             raise FileNotFoundError(
                 f"Missing text embedding cache: {cache_path}. "
                 "Run scripts/precompute_text_embeds.py first."
             )
-        payload = torch.load(cache_path, map_location="cpu")
+        payload = torch.load(cache_path, map_location="cpu", weights_only=True)
         context = payload["context"]
         context_mask = payload["mask"].bool()
         if context.ndim != 2:
@@ -265,12 +284,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 f"Cached mask_len mismatch: expected {self.context_len}, got {context_mask.shape[0]} in {cache_path}"
             )
 
+        self._text_context_cache[cache_path] = (context, context_mask)
         return context, context_mask
 
     def __getitem__(self, idx):
         try:
             data = self._get(idx)
         except Exception as e:
+            if self.strict_sample_loading:
+                raise
             print(f"Error processing sample idx {idx}: {e}. Returning a random sample instead.")
             # trace back
             print(traceback.format_exc())

@@ -37,8 +37,6 @@ from fastwam.uncond_bc import (
     FastWAMUncondBCPolicy,
     SampleIdentityDataset,
     cosine_warmup_multiplier,
-    lora_gradient_norm,
-    lora_update_norm,
     stateless_validation_flow_inputs,
 )
 from fastwam.uncond_bc_checkpoint import (
@@ -464,7 +462,9 @@ def _build_loaders(
         "batch_size": int(cfg.training.microbatch_size),
         "num_workers": int(cfg.data.num_workers),
         "pin_memory": True,
-        "persistent_workers": bool(cfg.data.num_workers > 0),
+        "persistent_workers": bool(
+            cfg.data.num_workers > 0 and cfg.data.get("persistent_workers", True)
+        ),
     }
     if int(cfg.data.num_workers) > 0:
         common["prefetch_factor"] = int(cfg.data.prefetch_factor)
@@ -512,6 +512,7 @@ def _validate(
     cfg: DictConfig,
     world_size: int,
     device: torch.device,
+    max_batches: int | None = None,
 ) -> dict[str, Any]:
     model.eval()
     dimension_count = policy.config.action_dim
@@ -520,7 +521,11 @@ def _validate(
     # Layout: loss_sum, sample_count, valid_steps, batches, dimension sums,
     # bin mse sums, bin counts.
     loader.generator.manual_seed(int(cfg.validation.seed))
-    for batch in loader:
+    cleanup_interval = int(getattr(cfg.validation, "host_cleanup_interval_batches", 1))
+    processed_batches = 0
+    for batch_index, batch in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
         identities = list(batch["sample_identity"])
         action = batch["action"]
         timestep, noise = stateless_validation_flow_inputs(
@@ -548,8 +553,13 @@ def _validate(
             output["mse_by_timestep_bin"].float() * bin_counts
         )
         accum[bin_start + bin_count :] += bin_counts
-        torch.cuda.synchronize(device)
         del output, timestep, noise, action, identities, batch
+        processed_batches += 1
+        if processed_batches % cleanup_interval == 0:
+            torch.cuda.synchronize(device)
+            _release_validation_host_memory()
+    if processed_batches and processed_batches % cleanup_interval:
+        torch.cuda.synchronize(device)
         _release_validation_host_memory()
     accum = _all_reduce(accum, world_size=world_size)
     sample_count = accum[1].clamp(min=1)
@@ -574,6 +584,7 @@ def _validate(
         "valid_action_count": int(accum[2].item()),
         "sample_count": int(accum[1].item()),
         "batch_count": int(accum[3].item()),
+        "host_cleanup_interval_batches": cleanup_interval,
     }
     model.train()
     return result
@@ -699,11 +710,22 @@ def _save_checkpoint(
     return report
 
 
-def _snapshot_lora(policy: FastWAMUncondBCPolicy) -> dict[str, torch.Tensor]:
-    return {
-        name: parameter.detach().clone()
-        for name, parameter in policy.lora_adapter.named_lora_parameters()
-    }
+def _snapshot_lora(policy: FastWAMUncondBCPolicy) -> torch.Tensor:
+    return torch.nn.utils.parameters_to_vector(
+        [parameter.detach() for parameter in policy.lora_adapter.lora_parameters()]
+    )
+
+
+def _lora_update_norm(
+    policy: FastWAMUncondBCPolicy,
+    before: torch.Tensor,
+) -> torch.Tensor:
+    current = torch.nn.utils.parameters_to_vector(
+        [parameter.detach() for parameter in policy.lora_adapter.lora_parameters()]
+    )
+    if current.shape != before.shape:
+        raise ValueError("LoRA update snapshot shape changed during optimization.")
+    return torch.linalg.vector_norm((current - before).float())
 
 
 def _frozen_versions(policy: FastWAMUncondBCPolicy) -> dict[str, int]:
@@ -880,11 +902,30 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         or not bool(cfg.lora.strict_target_discovery)
     ):
         raise ValueError("UNCOND BC LoRA structure differs from the approved contract.")
+    current_frame_flags = [
+        bool(split.get("current_frame_only", False))
+        for split in (cfg.data.train, cfg.data.validation)
+    ]
+    if current_frame_flags[0] != current_frame_flags[1]:
+        raise ValueError(
+            "BC train and validation must agree on current-frame-only loading."
+        )
+    expected_video_frames = 1 if current_frame_flags[0] else 9
+    if current_frame_flags[0]:
+        for split in (cfg.data.train, cfg.data.validation):
+            if not bool(split.get("strict_sample_loading", False)):
+                raise ValueError(
+                    "Current-frame-only BC must fail closed on sample errors."
+                )
+            if int(split.processor.get("num_image_steps", -1)) != 1:
+                raise ValueError(
+                    "Current-frame-only BC processor must use one image step."
+                )
     expected_bc_shape = {
         "action_horizon": 32,
         "action_dim": 7,
         "proprio_dim": 8,
-        "expected_video_frames": 9,
+        "expected_video_frames": expected_video_frames,
         "expected_video_height": 224,
         "expected_video_width": 448,
         "gripper_dimension": 6,
@@ -903,13 +944,16 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
     lora_rank = int(cfg.lora.rank)
     expected_world_size = 6 if lora_rank == 32 else 4
     expected_global_batch = 96 if lora_rank == 32 else 128
+    allowed_microbatches = (1, 2, 4, 8, 16, 32) if lora_rank == 16 else (1, 2, 4, 8)
     expected_accumulation = {
         microbatch: expected_global_batch // (expected_world_size * microbatch)
-        for microbatch in (1, 2, 4, 8)
+        for microbatch in allowed_microbatches
     }
     microbatch = int(cfg.training.microbatch_size)
     if microbatch not in expected_accumulation:
-        raise ValueError("BC microbatch must be one of 1, 2, 4, or 8 per GPU.")
+        raise ValueError(
+            "BC microbatch is outside the approved rank-specific capacity ladder."
+        )
     if stage in {"bc0", "bc1"}:
         if world_size != 1:
             raise ValueError(f"{stage} must run on exactly one GPU.")
@@ -950,6 +994,14 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         raise ValueError("BC1 requires runner.single_gpu_diagnostic=true.")
     if stage != "bc1" and bool(cfg.runner.single_gpu_diagnostic):
         raise ValueError("single_gpu_diagnostic is reserved for BC1.")
+    diagnostic_validation_batches = cfg.runner.get("diagnostic_validation_batches")
+    if diagnostic_validation_batches is not None and (
+        stage != "bc2" or int(diagnostic_validation_batches) < 1
+    ):
+        raise ValueError("diagnostic_validation_batches is a positive BC2-only probe.")
+    cleanup_interval = int(cfg.validation.get("host_cleanup_interval_batches", 1))
+    if cleanup_interval < 1:
+        raise ValueError("Validation host cleanup interval must be positive.")
 
     if tuple(float(value) for value in cfg.optimizer.betas) != (0.9, 0.95):
         raise ValueError("UNCOND BC AdamW betas must be (0.9, 0.95).")
@@ -1272,6 +1324,10 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             output_device=local_rank,
             broadcast_buffers=False,
             find_unused_parameters=False,
+            static_graph=bool(cfg.training.get("ddp_static_graph", False)),
+            gradient_as_bucket_view=bool(
+                cfg.training.get("ddp_gradient_as_bucket_view", False)
+            ),
         )
     else:
         model = policy
@@ -1505,25 +1561,29 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
                 continue
             if not torch.isfinite(output["loss_action_bc"]):
                 raise FloatingPointError("Non-finite UNCOND action BC loss.")
-            gradient_norm = lora_gradient_norm(policy.lora_adapter)
-            if not torch.isfinite(gradient_norm):
-                raise FloatingPointError("Non-finite UNCOND LoRA gradient norm.")
-            before = _snapshot_lora(policy)
-            torch.nn.utils.clip_grad_norm_(
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
                 parameters,
                 max_norm=float(cfg.optimizer.gradient_clip),
             )
+            if not torch.isfinite(gradient_norm):
+                raise FloatingPointError("Non-finite UNCOND LoRA gradient norm.")
+            before = _snapshot_lora(policy)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            update_norm = lora_update_norm(policy.lora_adapter, before)
+            update_norm = _lora_update_norm(policy, before)
             if not torch.isfinite(update_norm):
                 raise FloatingPointError("Non-finite UNCOND LoRA update norm.")
             update_norm_value = float(update_norm.item())
             if update_norm_value > 0.0:
                 nonzero_update_count += 1
             global_step += 1
-            _assert_frozen_versions(policy, frozen_versions)
+            checkpoint_due = (
+                global_step % int(cfg.training.save_every_steps) == 0
+                or global_step >= stop_after_steps
+            )
+            if global_step == 1 or checkpoint_due:
+                _assert_frozen_versions(policy, frozen_versions)
             record = {
                 "global_step": global_step,
                 "epoch": epoch,
@@ -1553,9 +1613,7 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             identity_digest = hashlib.sha256()
             timestep_digest = hashlib.sha256()
             noise_digest = hashlib.sha256()
-            if global_step % int(cfg.training.save_every_steps) == 0 or (
-                global_step >= stop_after_steps
-            ):
+            if checkpoint_due:
                 last_checkpoint_report = _save_checkpoint(
                     checkpoints_dir / f"step_{global_step:06d}.pt",
                     policy=policy,
@@ -1654,8 +1712,26 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
         ):
             break
 
-    _assert_frozen_versions(policy, frozen_versions)
     stage = str(cfg.runner.stage)
+    diagnostic_validation = None
+    diagnostic_validation_batches = cfg.runner.get("diagnostic_validation_batches")
+    if stage == "bc2" and diagnostic_validation_batches is not None:
+        diagnostic_validation = _validate(
+            model,
+            policy,
+            validation_loader,
+            cfg=cfg,
+            world_size=world_size,
+            device=device,
+            max_batches=int(diagnostic_validation_batches),
+        )
+        expected_batch_count = int(diagnostic_validation_batches) * world_size
+        if diagnostic_validation["batch_count"] != expected_batch_count:
+            raise RuntimeError(
+                "Bounded BC2 validation did not complete the requested batches: "
+                f"{diagnostic_validation['batch_count']} != {expected_batch_count}."
+            )
+    _assert_frozen_versions(policy, frozen_versions)
     best_validation_value = (
         float(best_validation) if math.isfinite(best_validation) else None
     )
@@ -1717,6 +1793,7 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             "elapsed_seconds": time.time() - started_at,
             "peak_cuda_bytes": int(torch.cuda.max_memory_allocated(device)),
             "best_sidecar": best_sidecar_report,
+            "diagnostic_validation": diagnostic_validation,
         }
     )
     if rank == 0:

@@ -25,6 +25,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         past_action_size: int = 0, # Excludes the current frame
         obs_size: int = 1, # should be 
         past_obs_size: int = 0,
+        image_obs_size: int | None = None,
 
         # train vs val
         val_set_proportion: float = 0.05, 
@@ -33,6 +34,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # sampling
         global_sample_stride: int = 1,
+        strict_sample_loading: bool = False,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -44,6 +46,15 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         self.action_size = action_size
         self.past_action_size = past_action_size
         self.obs_size = obs_size
+        self.image_obs_size = (
+            obs_size if image_obs_size is None else int(image_obs_size)
+        )
+        if not 1 <= self.image_obs_size <= obs_size:
+            raise ValueError(
+                "image_obs_size must lie in [1, obs_size], got "
+                f"{self.image_obs_size} for obs_size={obs_size}."
+            )
+        self.strict_sample_loading = bool(strict_sample_loading)
         self.processor = None  # Will be set externally
         metas = []
         for ds_dir in dataset_dirs:
@@ -70,7 +81,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             key = meta["key"]
             meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
             delta_timestamps[meta["lerobot_key"]] = [
-                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
+                (t * global_sample_stride) / fps
+                for t in range(
+                    -past_obs_size,
+                    -past_obs_size + self.image_obs_size,
+                )
             ]
         
         for meta in self.state_meta:
@@ -190,6 +205,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 lerobot_sample = self._split_lerobot_sample(lerobot_sample)
                 break
             except Exception as err:
+                if self.strict_sample_loading:
+                    raise RuntimeError(
+                        f"Strict sample loading failed for index {idx}."
+                    ) from err
                 attempt += 1
                 last_exception = err
                 logger.warning(

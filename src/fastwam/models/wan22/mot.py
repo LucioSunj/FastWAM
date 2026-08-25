@@ -116,7 +116,7 @@ class MoT(nn.Module):
                 q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=attn_mask
             )
 
-        if self.mot_checkpoint_mixed_attn and self.training:
+        if self.mot_checkpoint_mixed_attn and self.training and torch.is_grad_enabled():
             return torch.utils.checkpoint.checkpoint(
                 _forward,
                 q_cat,
@@ -452,7 +452,7 @@ class MoT(nn.Module):
                 context_payload=_context_payload,
             )
 
-        if use_gradient_checkpointing and self.training:
+        if use_gradient_checkpointing and self.training and torch.is_grad_enabled():
             checkpoint_kwargs: dict[str, Any] = {}
             if checkpoint_context_fn is not None:
                 checkpoint_kwargs["context_fn"] = checkpoint_context_fn
