@@ -1,9 +1,11 @@
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
+import fastwam.uncond_bc_offline as offline
 from fastwam.uncond_bc_offline import (
     _validate_offline_config,
     _validate_sidecar_extra,
@@ -98,3 +100,18 @@ def test_offline_output_claim_refuses_existing_content(tmp_path) -> None:
     (occupied / "user-file").write_text("preserve")
     with pytest.raises(FileExistsError, match="not empty"):
         claim_uncond_bc_offline_output(cfg)
+
+
+def test_gloo_offline_validation_skips_cuda_ddp_parameter_sync(monkeypatch) -> None:
+    policy = Mock()
+    ddp = Mock()
+    monkeypatch.setattr(offline, "DistributedDataParallel", ddp)
+
+    observed = offline._offline_evaluation_model(
+        policy,
+        local_rank=0,
+        distributed_backend="gloo_manual",
+    )
+
+    assert observed is policy
+    ddp.assert_not_called()

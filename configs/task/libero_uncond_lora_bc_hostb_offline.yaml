@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  - libero_uncond_lora_bc
+  - _self_
+
+# Host B exposes four MIGs across three physical GPUs. Offline validation has
+# no gradients, so Gloo is used only for barriers and metric reductions while
+# every model forward remains on its assigned MIG.
+training:
+  distributed_backend: gloo_manual
+
+# Decode in the four rank processes themselves. This retains the exact
+# nine-frame/29,052-window validation contract without forked PyAV retention.
+data:
+  num_workers: 0
+  prefetch_factor: 1
+  multiprocessing_context: null
+  persistent_workers: false
+
+validation:
+  host_cleanup_interval_batches: 16

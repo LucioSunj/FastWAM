@@ -242,10 +242,32 @@ def record_uncond_bc_offline_failure(
     return path
 
 
+def _offline_evaluation_model(
+    policy: nn.Module,
+    *,
+    local_rank: int,
+    distributed_backend: str,
+) -> nn.Module:
+    """Wrap only when the backend can synchronize CUDA parameters."""
+
+    if distributed_backend == "gloo_manual":
+        return policy
+    if distributed_backend != "nccl":
+        raise ValueError(f"Unsupported BC distributed backend: {distributed_backend}.")
+    return DistributedDataParallel(
+        policy,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        broadcast_buffers=False,
+        find_unused_parameters=False,
+    )
+
+
 def run_uncond_bc_offline(cfg: DictConfig) -> dict[str, Any]:
     """Evaluate zero or trained UNCOND LoRA on every held-out BC window."""
 
-    rank, world_size, local_rank, device = _distributed_context()
+    distributed_backend = str(cfg.training.get("distributed_backend", "nccl"))
+    rank, world_size, local_rank, device = _distributed_context(distributed_backend)
     _validate_offline_config(cfg, world_size=world_size)
     _set_seed(int(cfg.seed), rank=rank, deterministic=True)
     output = Path(str(cfg.runner.output_dir)).expanduser().resolve()
@@ -355,12 +377,14 @@ def run_uncond_bc_offline(cfg: DictConfig) -> dict[str, Any]:
         rank=rank,
         world_size=world_size,
     )
-    model: nn.Module = DistributedDataParallel(
+    # Validation has no gradients to synchronize.  The Host-B MIG topology uses
+    # CPU/Gloo collectives for metric reduction because two ranks are sibling MIGs
+    # on one physical GPU; wrapping CUDA parameters in Gloo DDP would perform an
+    # unsupported parameter broadcast without changing evaluation math.
+    model = _offline_evaluation_model(
         policy,
-        device_ids=[local_rank],
-        output_device=local_rank,
-        broadcast_buffers=False,
-        find_unused_parameters=False,
+        local_rank=local_rank,
+        distributed_backend=distributed_backend,
     )
     started = time.time()
     validation = _validate(
