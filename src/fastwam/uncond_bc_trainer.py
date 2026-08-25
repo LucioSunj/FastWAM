@@ -901,9 +901,10 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         raise ValueError("UNCOND BC requires the 30-layer parent architecture.")
 
     lora_rank = int(cfg.lora.rank)
-    expected_world_size = 8 if lora_rank == 32 else 4
+    expected_world_size = 6 if lora_rank == 32 else 4
+    expected_global_batch = 96 if lora_rank == 32 else 128
     expected_accumulation = {
-        microbatch: 128 // (expected_world_size * microbatch)
+        microbatch: expected_global_batch // (expected_world_size * microbatch)
         for microbatch in (1, 2, 4, 8)
     }
     microbatch = int(cfg.training.microbatch_size)
@@ -931,9 +932,10 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
                 "Effective global batch mismatch: expected "
                 f"{cfg.training.global_batch_size}, got {actual_global_batch}."
             )
-        if int(cfg.training.global_batch_size) != 128:
+        if int(cfg.training.global_batch_size) != expected_global_batch:
             raise ValueError(
-                "The approved UNCOND BC experiment requires global batch 128."
+                "The approved UNCOND BC experiment requires global batch "
+                f"{expected_global_batch} for LoRA rank {lora_rank}."
             )
         if lora_rank == 32 and (
             int(cfg.data.num_workers) != 0
@@ -941,7 +943,7 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
             or cfg.data.multiprocessing_context is not None
         ):
             raise ValueError(
-                "Rank-32 eight-GPU BC requires zero extra DataLoader workers "
+                "Rank-32 six-GPU BC requires zero extra DataLoader workers "
                 "per rank and prefetch factor one."
             )
     if stage == "bc1" and not bool(cfg.runner.single_gpu_diagnostic):

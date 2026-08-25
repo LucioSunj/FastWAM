@@ -92,7 +92,7 @@ def test_training_config_enforces_4gpu_capacity_ladder_and_allows_bc0() -> None:
     _validate_training_config(bc0, world_size=1)
 
 
-def test_rank32_training_requires_8gpu_capacity_ladder() -> None:
+def test_rank32_training_requires_6gpu_capacity_ladder() -> None:
     cfg = _compose_config()
     cfg.lora.rank = 32
     cfg.data.num_workers = 0
@@ -103,24 +103,29 @@ def test_rank32_training_requires_8gpu_capacity_ladder() -> None:
         candidate = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
         candidate.training.microbatch_size = microbatch
         candidate.training.gradient_accumulation_steps = accumulation
-        _validate_training_config(candidate, world_size=8)
+        candidate.training.global_batch_size = 96
+        _validate_training_config(candidate, world_size=6)
 
-    with pytest.raises(ValueError, match="exactly 8 GPUs"):
+    with pytest.raises(ValueError, match="exactly 6 GPUs"):
         _validate_training_config(cfg, world_size=4)
+    with pytest.raises(ValueError, match="exactly 6 GPUs"):
+        _validate_training_config(cfg, world_size=8)
 
     invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
     invalid.training.microbatch_size = 8
     invalid.training.gradient_accumulation_steps = 4
+    invalid.training.global_batch_size = 96
     with pytest.raises(ValueError, match="requires accumulation 2"):
-        _validate_training_config(invalid, world_size=8)
+        _validate_training_config(invalid, world_size=6)
 
     unsafe_loader = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
     unsafe_loader.training.gradient_accumulation_steps = 16
+    unsafe_loader.training.global_batch_size = 96
     unsafe_loader.data.num_workers = 8
     unsafe_loader.data.prefetch_factor = 2
     unsafe_loader.data.multiprocessing_context = None
     with pytest.raises(ValueError, match="zero extra DataLoader workers"):
-        _validate_training_config(unsafe_loader, world_size=8)
+        _validate_training_config(unsafe_loader, world_size=6)
 
 
 def test_distributed_context_binds_local_cuda_device_before_nccl(
@@ -355,12 +360,15 @@ def test_training_phases_are_explicit_and_world_size_bound() -> None:
     rank32.lora.rank = 32
     rank32.training.microbatch_size = 8
     rank32.training.gradient_accumulation_steps = 2
+    rank32.training.global_batch_size = 96
     rank32.data.num_workers = 0
     rank32.data.prefetch_factor = 1
     rank32.data.multiprocessing_context = None
-    _validate_training_config(rank32, world_size=8)
-    with pytest.raises(ValueError, match="exactly 8 GPUs"):
+    _validate_training_config(rank32, world_size=6)
+    with pytest.raises(ValueError, match="exactly 6 GPUs"):
         _validate_training_config(rank32, world_size=4)
+    with pytest.raises(ValueError, match="exactly 6 GPUs"):
+        _validate_training_config(rank32, world_size=8)
 
     malformed = _resolved_copy(base)
     malformed.lora.rank = 8
