@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -77,15 +78,20 @@ def main() -> int:
             )
             processes.append(subprocess.Popen(command, env=environment))
 
-        first_failure = 0
-        for process in processes:
-            returncode = process.wait()
-            if returncode and not first_failure:
-                first_failure = returncode
+        while True:
+            returncodes = [process.poll() for process in processes]
+            failure = next(
+                (code for code in returncodes if code not in {None, 0}),
+                None,
+            )
+            if failure is not None:
                 for peer in processes:
                     if peer.poll() is None:
                         peer.send_signal(signal.SIGTERM)
-        return first_failure
+                return failure
+            if all(code == 0 for code in returncodes):
+                return 0
+            time.sleep(0.1)
     finally:
         for process in processes:
             if process.poll() is None:
