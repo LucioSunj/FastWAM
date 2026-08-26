@@ -137,6 +137,40 @@ def test_offline_output_claim_refuses_existing_content(tmp_path) -> None:
         claim_uncond_bc_offline_output(cfg)
 
 
+def test_offline_run_registers_claimed_output_as_work_dir(
+    monkeypatch, tmp_path
+) -> None:
+    cfg = _config()
+    cfg.runner.output_dir = str(tmp_path / "offline")
+    registered = []
+
+    class StopAfterOutputSetup(Exception):
+        pass
+
+    monkeypatch.setattr(
+        offline,
+        "_distributed_context",
+        lambda _backend: (0, 4, 0, "cpu"),
+    )
+    monkeypatch.setattr(offline, "_set_seed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(offline, "_barrier", lambda _world_size: None)
+    monkeypatch.setattr(
+        offline.misc,
+        "register_work_dir",
+        lambda output: registered.append(Path(output)),
+    )
+
+    def stop_after_output_setup(_cfg):
+        raise StopAfterOutputSetup
+
+    monkeypatch.setattr(offline, "_canonical_config", stop_after_output_setup)
+
+    with pytest.raises(StopAfterOutputSetup):
+        offline.run_uncond_bc_offline(cfg)
+
+    assert registered == [Path(cfg.runner.output_dir).resolve()]
+
+
 def test_gloo_offline_validation_skips_cuda_ddp_parameter_sync(monkeypatch) -> None:
     policy = Mock()
     ddp = Mock()

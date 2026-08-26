@@ -37,6 +37,7 @@ from fastwam.uncond_bc_trainer import (
     _zero_lora,
     load_strict_fastwam_parent,
 )
+from fastwam.utils import misc
 
 OFFLINE_EVAL_SCHEMA = "fastwam-uncond-bc-offline-eval-v1"
 OFFLINE_FAILURE_SCHEMA = "fastwam-uncond-bc-offline-failure-v1"
@@ -321,6 +322,7 @@ def run_uncond_bc_offline(cfg: DictConfig) -> dict[str, Any]:
     _barrier(world_size)
     if not (output / OFFLINE_OUTPUT_MARKER).is_file():
         raise FileNotFoundError("BC offline output marker was not synchronized.")
+    misc.register_work_dir(output)
 
     resolved, launch_hash, contract_hash = _canonical_config(cfg)
     parent_sha = (
