@@ -109,6 +109,124 @@ def test_gate_taps_keep_only_last_n_velocity_calls():
     assert rollout.gate_taps == tuple(seen[-2:])
 
 
+@pytest.mark.parametrize("gate_last_n", [1, 3, 10])
+def test_pre_fix_sampler_captures_every_step_before_retaining_last_n(gate_last_n):
+    """Pin the legacy all-step Gate capture that the next commit removes."""
+
+    selected_layer_count = 6
+    num_steps = 10
+    _, timesteps, deltas = _schedule(num_steps=num_steps)
+    calls = {"plain": 0, "tapped": 0}
+    captured_layer_payloads = 0
+
+    def tapped_velocity_fn(x_t, timestep):
+        nonlocal captured_layer_payloads
+        calls["tapped"] += 1
+        captured_layer_payloads += selected_layer_count
+        return VelocityOutput(
+            torch.zeros_like(x_t),
+            gate_tap={
+                "step": calls["tapped"] - 1,
+                "timestep": float(timestep.item()),
+                "layer_indices": tuple(range(selected_layer_count)),
+            },
+        )
+
+    rollout = sample_action_flow_sde(
+        torch.zeros(1, 2, 3),
+        velocity_fn=tapped_velocity_fn,
+        timesteps=timesteps,
+        scheduler_deltas=deltas,
+        num_train_timesteps=1000,
+        noise_level=0.5,
+        gate_last_n=gate_last_n,
+        stochastic=False,
+    )
+
+    retained_steps = tuple(tap["step"] for tap in rollout.gate_taps)
+    assert calls == {"plain": 0, "tapped": num_steps}
+    assert captured_layer_payloads == num_steps * selected_layer_count
+    assert retained_steps == tuple(range(num_steps - gate_last_n, num_steps))
+    assert calls["tapped"] - len(rollout.gate_taps) == num_steps - gate_last_n
+
+
+@pytest.mark.parametrize(
+    ("case", "stochastic", "explicit_denoise_indices"),
+    [
+        ("deterministic_idm", False, None),
+        ("deterministic_uncond", False, None),
+        ("stochastic_uncond_explicit", True, torch.tensor([2, 7])),
+        ("stochastic_uncond_sampled", True, None),
+    ],
+)
+def test_pre_fix_gate_capture_is_sampler_numerically_read_only(
+    case,
+    stochastic,
+    explicit_denoise_indices,
+):
+    """Show that constructing legacy taps does not alter Flow-SDE numerics or RNG."""
+
+    del case
+    num_steps = 10
+    _, timesteps, deltas = _schedule(num_steps=num_steps)
+    initial_generator = torch.Generator().manual_seed(17)
+    initial = torch.randn(2, 3, 4, generator=initial_generator)
+    tapped_calls = 0
+    plain_calls = 0
+
+    def velocity(x_t, timestep):
+        scale = timestep.view(-1, 1, 1).to(dtype=x_t.dtype) / 1000.0
+        return x_t * 0.125 + scale
+
+    def tapped_velocity_fn(x_t, timestep):
+        nonlocal tapped_calls
+        tapped_calls += 1
+        return VelocityOutput(
+            velocity(x_t, timestep),
+            gate_tap={"step": tapped_calls - 1},
+        )
+
+    def plain_velocity_fn(x_t, timestep):
+        nonlocal plain_calls
+        plain_calls += 1
+        return velocity(x_t, timestep)
+
+    tapped_generator = torch.Generator().manual_seed(123)
+    plain_generator = torch.Generator().manual_seed(123)
+    common = {
+        "timesteps": timesteps,
+        "scheduler_deltas": deltas,
+        "num_train_timesteps": 1000,
+        "noise_level": 0.5,
+        "denoise_indices": explicit_denoise_indices,
+        "gate_last_n": 3,
+        "stochastic": stochastic,
+    }
+    tapped = sample_action_flow_sde(
+        initial.clone(),
+        velocity_fn=tapped_velocity_fn,
+        generator=tapped_generator,
+        **common,
+    )
+    tapped_rng_state = tapped_generator.get_state().clone()
+    plain = sample_action_flow_sde(
+        initial.clone(),
+        velocity_fn=plain_velocity_fn,
+        generator=plain_generator,
+        **common,
+    )
+    plain_rng_state = plain_generator.get_state().clone()
+
+    assert tapped_calls == plain_calls == num_steps
+    assert len(tapped.gate_taps) == len(plain.gate_taps) == 3
+    assert all(tap is None for tap in plain.gate_taps)
+    assert torch.equal(tapped.actions, plain.actions)
+    assert torch.equal(tapped.chains, plain.chains)
+    assert torch.equal(tapped.denoise_indices, plain.denoise_indices)
+    assert torch.equal(tapped.old_log_probs, plain.old_log_probs)
+    assert torch.equal(tapped_rng_state, plain_rng_state)
+
+
 def test_eval_sampling_can_omit_replay_chain_and_log_probs():
     initial = torch.zeros(2, 3, 4)
     timesteps = torch.tensor([1000.0, 500.0])
