@@ -145,6 +145,7 @@ class _TinyMoT(nn.Module):
         video_seq_len: int,
         kv_tap,
         checkpoint_context_fn,
+        action_expert: nn.Module,
     ) -> torch.Tensor:
         del (
             action_freqs,
@@ -155,6 +156,7 @@ class _TinyMoT(nn.Module):
             kv_tap,
             checkpoint_context_fn,
         )
+        assert action_expert is self.action_expert
         x = action_tokens + video_kv_cache[0]["v"].mean(dim=1, keepdim=True)
         for block in self.action_expert.blocks:
             x = x + block.ffn(x)

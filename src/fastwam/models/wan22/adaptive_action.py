@@ -157,6 +157,7 @@ class CachedActionVelocity:
                 video_seq_len=self.condition.video_seq_len,
                 kv_tap=tap_request,
                 checkpoint_context_fn=self._checkpoint_regime_contexts,
+                action_expert=self.action_expert,
             )
             velocity = self.action_expert.post_dit(action_tokens, action_pre)
 
@@ -164,3 +165,53 @@ class CachedActionVelocity:
             tap_request.snapshot() if tap_request is not None else None
         )
         return VelocityOutput(velocity=velocity, gate_tap=snapshot)
+
+
+class StaticCachedActionVelocity(CachedActionVelocity):
+    """Cached velocity for one frozen plain route-specific ActionDiT."""
+
+    def __init__(
+        self,
+        *,
+        action_expert: nn.Module,
+        mot: nn.Module,
+        condition: CachedActionCondition,
+        regime: PolicyRegime | str,
+        gate_layer_indices: tuple[int, ...] | None = None,
+        capture_gate_kv: bool = False,
+        actor_version: int = 0,
+    ) -> None:
+        self.action_expert = action_expert
+        self.mot = mot
+        self.condition = condition
+        self.regime = PolicyRegime.parse(regime)
+        self.regime_context = None
+        self.gate_layer_indices = gate_layer_indices
+        self.capture_gate_kv = bool(capture_gate_kv)
+        self.actor_version = int(actor_version)
+        if self.actor_version < 0:
+            raise ValueError("`actor_version` must be non-negative.")
+        adapted_names = tuple(
+            name
+            for name, module in self.action_expert.named_modules()
+            if isinstance(module, RegimeLoRALinear)
+        )
+        if adapted_names:
+            raise ValueError(
+                "Static action velocity requires a plain ActionDiT without LoRA: "
+                f"{list(adapted_names)}."
+            )
+        trainable_names = tuple(
+            name
+            for name, parameter in self.action_expert.named_parameters()
+            if parameter.requires_grad
+        )
+        if trainable_names:
+            raise ValueError(
+                "Static action velocity requires a frozen action expert: "
+                f"{list(trainable_names)}."
+            )
+        if self.action_expert.training:
+            raise ValueError(
+                "Static action velocity requires an eval-mode action expert."
+            )

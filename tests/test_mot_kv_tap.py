@@ -35,6 +35,8 @@ from fastwam.models.wan22.wan_video_dit import DiTBlock
 class _TinyExpert(nn.Module):
     def __init__(self, num_layers: int = 2) -> None:
         super().__init__()
+        self.action_dim = 8
+        self.hidden_dim = 8
         self.num_heads = 2
         self.attn_head_dim = 4
         self.use_gradient_checkpointing = False
@@ -357,6 +359,99 @@ def test_condition_reader_matches_gate_video_and_context_banks() -> None:
     assert not condition_layer.current_frame_video.key.requires_grad
     assert not condition_layer.context.key.requires_grad
     assert not hasattr(condition_layer, "action")
+
+
+def test_cached_action_path_uses_explicit_expert_without_registry_mutation() -> None:
+    mot = _mot()
+    explicit = _TinyExpert()
+    explicit.load_state_dict(mot.mixtures["action"].state_dict(), strict=True)
+    with torch.no_grad():
+        explicit.blocks[0].self_attn.q.weight.add_(0.5)
+    registered_before = {
+        name: value.detach().clone()
+        for name, value in mot.mixtures["action"].state_dict().items()
+    }
+    kwargs = {
+        "action_tokens": torch.randn(2, 3, 8),
+        "action_freqs": _freqs(3),
+        "action_t_mod": torch.zeros(2, 6, 8),
+        "action_context_payload": {
+            "context": torch.randn(2, 5, 8),
+            "mask": torch.ones(2, 3, 5, dtype=torch.bool),
+        },
+        "video_kv_cache": [
+            {"k": torch.randn(2, 4, 8), "v": torch.randn(2, 4, 8)} for _ in range(2)
+        ],
+        "attention_mask": torch.ones(7, 7, dtype=torch.bool),
+        "video_seq_len": 4,
+    }
+
+    registered_output = mot.forward_action_with_video_cache(**kwargs)
+    explicit_output = mot.forward_action_with_video_cache(
+        **kwargs,
+        action_expert=explicit,
+    )
+
+    assert not torch.equal(explicit_output, registered_output)
+    assert mot.mixtures["action"] is not explicit
+    assert all(
+        torch.equal(value, registered_before[name])
+        for name, value in mot.mixtures["action"].state_dict().items()
+    )
+
+
+def test_cached_action_tokens_are_validated_against_hidden_not_action_dim() -> None:
+    mot = _mot()
+    mot.mixtures["action"].action_dim = 7
+    kwargs = {
+        "action_tokens": torch.randn(2, 3, 8),
+        "action_freqs": _freqs(3),
+        "action_t_mod": torch.zeros(2, 6, 8),
+        "action_context_payload": {
+            "context": torch.randn(2, 5, 8),
+            "mask": torch.ones(2, 3, 5, dtype=torch.bool),
+        },
+        "video_kv_cache": [
+            {"k": torch.randn(2, 4, 8), "v": torch.randn(2, 4, 8)} for _ in range(2)
+        ],
+        "attention_mask": torch.ones(7, 7, dtype=torch.bool),
+        "video_seq_len": 4,
+    }
+
+    output = mot.forward_action_with_video_cache(**kwargs)
+
+    assert output.shape == (2, 3, 8)
+
+
+def test_condition_reader_can_pin_the_canonical_action_expert() -> None:
+    mot = _mot()
+    canonical = _TinyExpert()
+    canonical.load_state_dict(mot.mixtures["action"].state_dict(), strict=True)
+    context = torch.randn(1, 3, 8)
+    video_cache = [
+        {
+            "k": torch.randn(1, 2, 8),
+            "v": torch.randn(1, 2, 8),
+            "_gate_current_frame_video_tokens": 2,
+        }
+        for _ in range(2)
+    ]
+    kwargs = {
+        "layer_index": 1,
+        "video_kv_cache": video_cache,
+        "current_frame_video_tokens": 2,
+        "context": context,
+        "context_mask": torch.ones(1, 3, dtype=torch.bool),
+        "action_expert": canonical,
+    }
+    before = mot.read_condition_layer_kv(**kwargs)
+    with torch.no_grad():
+        mot.mixtures["action"].blocks[1].cross_attn.k.weight.add_(10.0)
+        mot.mixtures["action"].blocks[1].cross_attn.v.weight.sub_(10.0)
+    after = mot.read_condition_layer_kv(**kwargs)
+
+    assert torch.equal(before.context.key, after.context.key)
+    assert torch.equal(before.context.value, after.context.value)
 
 
 def test_condition_reader_excludes_future_video_and_requires_provenance() -> None:

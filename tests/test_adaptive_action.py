@@ -4,7 +4,7 @@ import copy
 
 import pytest
 import torch
-import torch.nn as nn
+from torch import nn
 
 from fastwam.adapters import (
     ActionLoRATargetGroup,
@@ -16,6 +16,7 @@ from fastwam.adapters import (
 from fastwam.models.wan22.adaptive_action import (
     CachedActionCondition,
     CachedActionVelocity,
+    StaticCachedActionVelocity,
 )
 from fastwam.models.wan22.adaptive_sampler import (
     replay_action_flow_sde_log_prob,
@@ -48,8 +49,15 @@ class _ActionExpert(nn.Module):
 
 
 class _MoT(nn.Module):
-    def forward_action_with_video_cache(self, *, action_tokens, kv_tap, **_kwargs):
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_action_expert = None
+
+    def forward_action_with_video_cache(
+        self, *, action_tokens, kv_tap, action_expert, **_kwargs
+    ):
         assert kv_tap is None
+        self.last_action_expert = action_expert
         return action_tokens
 
 
@@ -129,6 +137,52 @@ def test_cached_action_velocity_keeps_gradient_and_restores_regime():
     assert any(parameter.grad is not None for parameter in adapter.lora_parameters())
     assert adapter.regime_context.current is PolicyRegime.IDM
     assert output.gate_tap is None
+
+
+def test_static_cached_action_velocity_uses_the_explicit_plain_expert() -> None:
+    action_expert = _ActionExpert().eval().requires_grad_(False)
+    mot = _MoT()
+    velocity = StaticCachedActionVelocity(
+        action_expert=action_expert,
+        mot=mot,
+        condition=_condition(),
+        regime=PolicyRegime.UNCOND,
+    )
+    action = torch.randn(2, 2, 3)
+
+    output = velocity(action, torch.tensor([900.0, 800.0]))
+
+    assert mot.last_action_expert is action_expert
+    assert torch.equal(output.velocity, action_expert.projection(action))
+    assert output.gate_tap is None
+
+
+def test_static_cached_action_velocity_rejects_trainable_or_dynamic_lora() -> None:
+    with pytest.raises(ValueError, match="frozen action expert"):
+        StaticCachedActionVelocity(
+            action_expert=_ActionExpert().eval(),
+            mot=_MoT(),
+            condition=_condition(),
+            regime=PolicyRegime.UNCOND,
+        )
+
+    lora_expert = _LoRAActionExpert()
+    inject_action_dit_lora(
+        lora_expert,
+        RegimeLoRAConfig(
+            rank=2,
+            alpha=2.0,
+            target_groups=(ActionLoRATargetGroup.SELF_ATTENTION_QKVO,),
+        ),
+    )
+    lora_expert.eval().requires_grad_(False)
+    with pytest.raises(ValueError, match="plain ActionDiT"):
+        StaticCachedActionVelocity(
+            action_expert=lora_expert,
+            mot=_MoT(),
+            condition=_condition(),
+            regime=PolicyRegime.UNCOND,
+        )
 
 
 def test_uncond_velocity_requires_the_adapter_regime_context():

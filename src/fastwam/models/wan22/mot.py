@@ -236,6 +236,7 @@ class MoT(nn.Module):
         current_frame_video_tokens: int,
         context: torch.Tensor,
         context_mask: torch.Tensor | None,
+        action_expert: nn.Module | None = None,
     ) -> ConditionLayerKV:
         """Read detached current-video and prompt/state K/V at one MoT layer.
 
@@ -295,8 +296,9 @@ class MoT(nn.Module):
             ),
             contains_generated_future_video=False,
         )
+        selected_expert = self._resolve_action_expert(action_expert)
         context_bank = self._project_context_bank(
-            action_block=self.mixtures["action"].blocks[layer_index],
+            action_block=selected_expert.blocks[layer_index],
             context=context,
             context_mask=context_mask,
         )
@@ -305,6 +307,79 @@ class MoT(nn.Module):
             current_frame_video=video_bank,
             context=context_bank,
         ).detached()
+
+    def _resolve_action_expert(
+        self,
+        action_expert: nn.Module | None,
+        *,
+        action_tokens: torch.Tensor | None = None,
+    ) -> nn.Module:
+        """Return one structurally compatible explicit or registered ActionDiT."""
+
+        registered = self.mixtures["action"]
+        selected = registered if action_expert is None else action_expert
+        blocks = getattr(selected, "blocks", None)
+        if not isinstance(blocks, nn.ModuleList):
+            raise TypeError(
+                "Selected action expert must expose `blocks` as ModuleList."
+            )
+        if len(blocks) != self.num_layers:
+            raise ValueError(
+                "Selected action expert layer count mismatch: "
+                f"expected {self.num_layers}, got {len(blocks)}."
+            )
+        for attribute, expected in (
+            ("num_heads", self.num_heads),
+            ("attn_head_dim", self.attn_head_dim),
+        ):
+            observed = getattr(selected, attribute, None)
+            if observed != expected:
+                raise ValueError(
+                    f"Selected action expert {attribute} mismatch: "
+                    f"expected {expected}, got {observed}."
+                )
+        registered_action_dim = getattr(registered, "action_dim", None)
+        selected_action_dim = getattr(selected, "action_dim", None)
+        if (
+            registered_action_dim is not None
+            and selected_action_dim != registered_action_dim
+        ):
+            raise ValueError(
+                "Selected action expert action_dim mismatch: "
+                f"expected {registered_action_dim}, got {selected_action_dim}."
+            )
+        registered_hidden_dim = getattr(registered, "hidden_dim", None)
+        selected_hidden_dim = getattr(selected, "hidden_dim", None)
+        if (
+            registered_hidden_dim is not None
+            and selected_hidden_dim != registered_hidden_dim
+        ):
+            raise ValueError(
+                "Selected action expert hidden_dim mismatch: "
+                f"expected {registered_hidden_dim}, got {selected_hidden_dim}."
+            )
+        if action_tokens is not None:
+            if (
+                selected_hidden_dim is not None
+                and action_tokens.shape[-1] != selected_hidden_dim
+            ):
+                raise ValueError(
+                    "Action token dimension does not match the selected expert: "
+                    f"expected {selected_hidden_dim}, got {action_tokens.shape[-1]}."
+                )
+            first_parameter = next(selected.parameters(), None)
+            if first_parameter is not None:
+                if first_parameter.device != action_tokens.device:
+                    raise ValueError(
+                        "Selected action expert device does not match action tokens: "
+                        f"{first_parameter.device} versus {action_tokens.device}."
+                    )
+                if first_parameter.dtype != action_tokens.dtype:
+                    raise ValueError(
+                        "Selected action expert dtype does not match action tokens: "
+                        f"{first_parameter.dtype} versus {action_tokens.dtype}."
+                    )
+        return selected
 
     @staticmethod
     def _apply_expert_post_block(
@@ -657,6 +732,7 @@ class MoT(nn.Module):
         action_attention_mask: torch.Tensor,
         kv_tap: GateKVTapRequest | None = None,
         checkpoint_context_fn: CheckpointContextFn | None = None,
+        action_expert: nn.Module | None = None,
     ) -> torch.Tensor:
         """Core loop of forward_action_with_video_cache without NVTX or validation.
 
@@ -681,7 +757,7 @@ class MoT(nn.Module):
         Returns:
             Updated action tokens after all layers, shape [B, Sa, D].
         """
-        expert = self.mixtures["action"]
+        expert = self._resolve_action_expert(action_expert, action_tokens=action_tokens)
         x = action_tokens
         for layer_idx in range(self.num_layers):
             block = expert.blocks[layer_idx]
@@ -814,6 +890,7 @@ class MoT(nn.Module):
         video_seq_len: int,
         kv_tap: GateKVTapRequest | None = None,
         checkpoint_context_fn: CheckpointContextFn | None = None,
+        action_expert: nn.Module | None = None,
     ) -> torch.Tensor:
         """Run action branch with cached video K/V instead of recomputing video tokens.
 
@@ -890,6 +967,10 @@ class MoT(nn.Module):
         # Extract flat lists for compile-friendly inner method
         video_cache_k = [layer_cache["k"] for layer_cache in video_kv_cache]
         video_cache_v = [layer_cache["v"] for layer_cache in video_kv_cache]
+        selected_expert = self._resolve_action_expert(
+            action_expert,
+            action_tokens=action_tokens,
+        )
 
         return self._forward_action_with_video_cache_inner(
             action_tokens=action_tokens,
@@ -901,6 +982,7 @@ class MoT(nn.Module):
             action_attention_mask=action_attention_mask,
             kv_tap=kv_tap,
             checkpoint_context_fn=checkpoint_context_fn,
+            action_expert=selected_expert,
         )
 
     def forward(
