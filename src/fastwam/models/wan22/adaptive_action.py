@@ -39,6 +39,49 @@ class CachedActionCondition:
         if self.context_mask.dtype != torch.bool:
             raise TypeError("`context_mask` must use bool dtype.")
 
+    def index_select(self, batch_indices: torch.Tensor) -> CachedActionCondition:
+        """Select batch rows while preserving the shared attention geometry."""
+
+        if not isinstance(batch_indices, torch.Tensor):
+            raise TypeError("`batch_indices` must be a tensor.")
+        if batch_indices.ndim != 1:
+            raise ValueError("`batch_indices` must be one-dimensional.")
+        if batch_indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError("`batch_indices` must use an integer dtype.")
+        if self.context.shape[0] != self.context_mask.shape[0]:
+            raise ValueError("Cached context and context mask batch sizes differ.")
+
+        def _select(value: torch.Tensor) -> torch.Tensor:
+            indices = batch_indices.to(device=value.device, dtype=torch.long)
+            return value.index_select(0, indices)
+
+        selected_cache: list[dict[str, Any]] = []
+        for layer_index, layer in enumerate(self.video_kv_cache):
+            selected_layer = dict(layer)
+            for bank_name in ("k", "v"):
+                bank = layer.get(bank_name)
+                if not isinstance(bank, torch.Tensor) or bank.ndim < 1:
+                    raise ValueError(
+                        "Cached video K/V must be batched tensors at "
+                        f"layer={layer_index}, bank={bank_name}."
+                    )
+                if bank.shape[0] != self.context.shape[0]:
+                    raise ValueError(
+                        "Cached video K/V batch size differs from context at "
+                        f"layer={layer_index}, bank={bank_name}."
+                    )
+                selected_layer[bank_name] = _select(bank)
+            selected_cache.append(selected_layer)
+
+        return CachedActionCondition(
+            context=_select(self.context),
+            context_mask=_select(self.context_mask),
+            video_kv_cache=selected_cache,
+            attention_mask=self.attention_mask,
+            video_seq_len=self.video_seq_len,
+            current_frame_video_tokens=self.current_frame_video_tokens,
+        )
+
 
 class CachedActionVelocity:
     """Bind FastWAM conditioning while leaving the action state differentiable."""

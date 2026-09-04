@@ -108,6 +108,7 @@ def sample_action_flow_sde(
     num_train_timesteps: int,
     noise_level: float,
     denoise_indices: torch.Tensor | None = None,
+    transition_noise: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
     gate_last_n: int = 1,
     ignore_last_transition: bool = False,
@@ -125,6 +126,9 @@ def sample_action_flow_sde(
         num_train_timesteps: Scheduler normalization constant.
         noise_level: pi-RL Flow-SDE diffusion level.
         denoise_indices: Optional selected step per batch item.
+        transition_noise: Optional pre-sampled noise for each batch item's
+            selected stochastic transition. It must exactly match
+            ``initial_noise`` in shape, device, and dtype.
         generator: Sampling generator.
         gate_last_n: Number of final velocity-call tap payloads to retain.
         ignore_last_transition: Exclude the final denoising transition from
@@ -154,6 +158,22 @@ def sample_action_flow_sde(
     batch_size = initial_noise.shape[0]
     device = initial_noise.device
     num_steps = timesteps.numel()
+    if transition_noise is not None:
+        if not stochastic:
+            raise ValueError("`transition_noise` requires stochastic sampling.")
+        if transition_noise.shape != initial_noise.shape:
+            raise ValueError(
+                "`transition_noise` must match `initial_noise` shape, got "
+                f"{tuple(transition_noise.shape)} vs {tuple(initial_noise.shape)}."
+            )
+        if transition_noise.device != initial_noise.device:
+            raise ValueError(
+                "`transition_noise` must be on the same device as `initial_noise`."
+            )
+        if transition_noise.dtype != initial_noise.dtype:
+            raise TypeError(
+                "`transition_noise` must use the same dtype as `initial_noise`."
+            )
     normalized_times = normalize_flow_time(
         timesteps,
         num_train_timesteps=num_train_timesteps,
@@ -227,12 +247,14 @@ def sample_action_flow_sde(
                 next_time=next_time,
                 noise_level=noise_level,
             )
-            noise = torch.randn(
-                x_t.shape,
-                generator=generator,
-                device=device,
-                dtype=x_t.dtype,
-            )
+            noise = transition_noise
+            if noise is None:
+                noise = torch.randn(
+                    x_t.shape,
+                    generator=generator,
+                    device=device,
+                    dtype=x_t.dtype,
+                )
             sde_next = mean + noise * std
             selected_mask = selected.view(batch_size, *([1] * (x_t.ndim - 1)))
             x_next = torch.where(selected_mask, sde_next, ode_next)

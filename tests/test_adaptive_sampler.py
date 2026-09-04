@@ -86,6 +86,105 @@ def test_sampler_uses_one_selected_transition_per_sample_and_replays_logprob():
     assert torch.isfinite(weight.grad)
 
 
+def test_explicit_transition_noise_matches_per_sample_serial_sampling() -> None:
+    _, timesteps, deltas = _schedule()
+    initial = torch.randn(3, 2, 4, generator=torch.Generator().manual_seed(3))
+    selected = torch.tensor([0, 2, 3])
+    transition_noise = torch.stack(
+        [
+            torch.randn(2, 4, generator=torch.Generator().manual_seed(seed))
+            for seed in (11, 12, 13)
+        ]
+    )
+
+    def velocity_fn(x_t, timestep):
+        scale = timestep.view(-1, 1, 1) / 1000.0
+        return x_t * 0.125 + scale
+
+    batched = sample_action_flow_sde(
+        initial,
+        velocity_fn=velocity_fn,
+        timesteps=timesteps,
+        scheduler_deltas=deltas,
+        num_train_timesteps=1000,
+        noise_level=0.5,
+        denoise_indices=selected,
+        transition_noise=transition_noise,
+    )
+    serial = [
+        sample_action_flow_sde(
+            initial[index : index + 1],
+            velocity_fn=velocity_fn,
+            timesteps=timesteps,
+            scheduler_deltas=deltas,
+            num_train_timesteps=1000,
+            noise_level=0.5,
+            denoise_indices=selected[index : index + 1],
+            transition_noise=transition_noise[index : index + 1],
+        )
+        for index in range(initial.shape[0])
+    ]
+
+    torch.testing.assert_close(
+        batched.actions,
+        torch.cat([rollout.actions for rollout in serial]),
+    )
+    torch.testing.assert_close(
+        batched.chains,
+        torch.cat([rollout.chains for rollout in serial]),
+    )
+    torch.testing.assert_close(
+        batched.old_log_probs,
+        torch.cat([rollout.old_log_probs for rollout in serial]),
+    )
+
+
+def test_explicit_transition_noise_does_not_advance_generator() -> None:
+    _, timesteps, deltas = _schedule()
+    generator = torch.Generator().manual_seed(19)
+    state_before = generator.get_state()
+
+    sample_action_flow_sde(
+        torch.zeros(2, 2, 3),
+        velocity_fn=lambda x_t, timestep: torch.zeros_like(x_t),
+        timesteps=timesteps,
+        scheduler_deltas=deltas,
+        num_train_timesteps=1000,
+        noise_level=0.5,
+        denoise_indices=torch.tensor([0, 2]),
+        transition_noise=torch.ones(2, 2, 3),
+        generator=generator,
+    )
+
+    assert torch.equal(generator.get_state(), state_before)
+
+
+def test_explicit_transition_noise_requires_matching_shape_and_dtype() -> None:
+    _, timesteps, deltas = _schedule()
+    initial = torch.zeros(2, 2, 3)
+    kwargs = {
+        "velocity_fn": lambda x_t, timestep: torch.zeros_like(x_t),
+        "timesteps": timesteps,
+        "scheduler_deltas": deltas,
+        "num_train_timesteps": 1000,
+        "noise_level": 0.5,
+        "denoise_indices": torch.tensor([0, 2]),
+    }
+
+    with pytest.raises(ValueError, match="must match `initial_noise` shape"):
+        sample_action_flow_sde(
+            initial,
+            transition_noise=torch.zeros(2, 3),
+            **kwargs,
+        )
+    with pytest.raises(TypeError, match="same dtype"):
+        sample_action_flow_sde(
+            initial,
+            transition_noise=torch.zeros(2, 2, 3, dtype=torch.float64),
+            **kwargs,
+        )
+
+
 def test_gate_taps_keep_only_last_n_velocity_calls():
     _, timesteps, deltas = _schedule(num_steps=5)
     initial = torch.zeros(1, 2, 3)
