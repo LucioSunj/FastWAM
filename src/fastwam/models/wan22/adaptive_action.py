@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,7 @@ from torch import nn
 from fastwam.adapters import PolicyRegime, RegimeContext, RegimeLoRALinear
 
 from .adaptive_sampler import VelocityOutput
+from .batch_linear import BatchLinearContext
 from .kv_tap import GateKVSnapshot, GateKVTapRequest
 
 
@@ -94,6 +96,7 @@ class CachedActionVelocity:
         condition: CachedActionCondition,
         regime: PolicyRegime | str,
         regime_context: RegimeContext | None = None,
+        batch_linear_context: BatchLinearContext | None = None,
         gate_layer_indices: tuple[int, ...] | None = None,
         capture_gate_kv: bool = False,
         actor_version: int = 0,
@@ -103,6 +106,7 @@ class CachedActionVelocity:
         self.condition = condition
         self.regime = PolicyRegime.parse(regime)
         self.regime_context = regime_context
+        self.batch_linear_context = batch_linear_context
         self.gate_layer_indices = gate_layer_indices
         self.capture_gate_kv = bool(capture_gate_kv)
         self.actor_version = int(actor_version)
@@ -117,6 +121,12 @@ class CachedActionVelocity:
             self.regime_context, RegimeContext
         ):
             raise TypeError("`regime_context` must be a RegimeContext instance.")
+        if self.batch_linear_context is not None and not isinstance(
+            self.batch_linear_context, BatchLinearContext
+        ):
+            raise TypeError(
+                "`batch_linear_context` must be a BatchLinearContext instance."
+            )
         if self.regime is PolicyRegime.UNCOND:
             adapted_layers = tuple(
                 module
@@ -141,6 +151,16 @@ class CachedActionVelocity:
             return nullcontext()
         return self.regime_context.use(self.regime)
 
+    def _batch_linear_scope(self) -> AbstractContextManager[None]:
+        if self.batch_linear_context is None:
+            return nullcontext()
+        return self.batch_linear_context.use(self.condition.context.shape[0])
+
+    @contextmanager
+    def _execution_scope(self) -> Iterator[None]:
+        with self._regime_scope(), self._batch_linear_scope():
+            yield
+
     def _checkpoint_regime_contexts(
         self,
     ) -> tuple[
@@ -149,7 +169,7 @@ class CachedActionVelocity:
     ]:
         """Bind the same route to checkpoint forward and backward recomputation."""
 
-        return self._regime_scope(), self._regime_scope()
+        return self._execution_scope(), self._execution_scope()
 
     def __call__(
         self,
@@ -180,7 +200,7 @@ class CachedActionVelocity:
                 actor_version=self.actor_version,
             )
 
-        with self._regime_scope():
+        with self._execution_scope():
             action_pre = self.action_expert.pre_dit(
                 action_tokens=latents_action,
                 timestep=timestep_action,
@@ -229,6 +249,7 @@ class StaticCachedActionVelocity(CachedActionVelocity):
         self.condition = condition
         self.regime = PolicyRegime.parse(regime)
         self.regime_context = None
+        self.batch_linear_context = None
         self.gate_layer_indices = gate_layer_indices
         self.capture_gate_kv = bool(capture_gate_kv)
         self.actor_version = int(actor_version)

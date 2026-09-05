@@ -24,6 +24,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from fastwam.models.wan22.batch_linear import BatchLinearContext, rowwise_linear
+
 REGIME_LORA_SIDECAR_SCHEMA = "fastwam-regime-lora-v1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -202,6 +204,7 @@ class RegimeLoRALinear(nn.Linear):
         self.scaling = self.alpha / self.rank
         self.regime_context = regime_context
         self.lora_dropout = nn.Dropout(float(dropout))
+        self.batch_linear_context: BatchLinearContext | None = None
         self.lora_A = nn.Parameter(
             torch.empty(
                 self.rank,
@@ -230,14 +233,43 @@ class RegimeLoRALinear(nn.Linear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Apply the frozen base projection and an UNCOND-only LoRA delta."""
 
-        output = F.linear(input, self.weight, self.bias)
+        batch_size = (
+            None
+            if self.batch_linear_context is None
+            else self.batch_linear_context.batch_size
+        )
+        output = (
+            F.linear(input, self.weight, self.bias)
+            if batch_size is None
+            else rowwise_linear(
+                input,
+                self.weight,
+                self.bias,
+                batch_size=batch_size,
+            )
+        )
         if self.regime_context.current is not PolicyRegime.UNCOND:
             return output
         # Cast the FP32 master factors down at use. The delta therefore keeps
         # the numerics of a fully base-dtype adapter while gradients still
         # accumulate into the FP32 leaves the optimizer owns.
-        hidden = F.linear(self.lora_dropout(input), self.lora_A.to(dtype=input.dtype))
-        delta = F.linear(hidden, self.lora_B.to(dtype=input.dtype))
+        dropped = self.lora_dropout(input)
+        if batch_size is None:
+            hidden = F.linear(dropped, self.lora_A.to(dtype=input.dtype))
+            delta = F.linear(hidden, self.lora_B.to(dtype=input.dtype))
+        else:
+            hidden = rowwise_linear(
+                dropped,
+                self.lora_A.to(dtype=input.dtype),
+                None,
+                batch_size=batch_size,
+            )
+            delta = rowwise_linear(
+                hidden,
+                self.lora_B.to(dtype=input.dtype),
+                None,
+                batch_size=batch_size,
+            )
         return output + delta * self.scaling
 
 
