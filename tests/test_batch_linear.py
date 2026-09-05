@@ -10,6 +10,7 @@ from fastwam.adapters import PolicyRegime, RegimeContext, RegimeLoRALinear
 from fastwam.models.wan22.adaptive_action import CachedActionVelocity
 from fastwam.models.wan22.batch_linear import (
     BatchInvariantLinear,
+    BatchLinearContext,
     install_batch_invariant_linears,
 )
 
@@ -104,6 +105,69 @@ def test_regime_lora_rowwise_base_and_delta_backward() -> None:
             serial_actor.parameters(),
             strict=True,
         )
+    )
+
+
+@pytest.mark.parametrize("batch_size", [2, 4])
+def test_bf16_lora_master_cast_and_gradients_match_mb1(batch_size: int) -> None:
+    regime = RegimeContext()
+    base = nn.Linear(13, 11, dtype=torch.bfloat16)
+    base.requires_grad_(False)
+    adapted = RegimeLoRALinear(
+        base,
+        regime_context=regime,
+        rank=5,
+        alpha=5,
+        dropout=0.0,
+    )
+    context = BatchLinearContext()
+    torch.manual_seed(0)
+    inputs = torch.randn(batch_size, 7, 13, dtype=torch.bfloat16)
+    upstream = torch.randn(batch_size, 7, 11, dtype=torch.bfloat16)
+    lora_a = torch.randn_like(adapted.lora_A)
+    lora_b = torch.randn_like(adapted.lora_B)
+    with torch.no_grad():
+        adapted.lora_A.copy_(lora_a)
+        adapted.lora_B.copy_(lora_b)
+    serial = copy.deepcopy(adapted)
+    adapted.batch_linear_context = context
+
+    with serial.regime_context.use(PolicyRegime.UNCOND):
+        serial_output = torch.cat(
+            [serial(inputs[index : index + 1]) for index in range(batch_size)]
+        )
+    with regime.use(PolicyRegime.UNCOND), context.use(batch_size):
+        batched_output = adapted(inputs)
+    serial_output.backward(upstream)
+    batched_output.backward(upstream)
+
+    assert torch.equal(batched_output, serial_output)
+    assert torch.equal(adapted.lora_A.grad, serial.lora_A.grad)
+    assert torch.equal(adapted.lora_B.grad, serial.lora_B.grad)
+
+    shared_a = lora_a.detach().clone().requires_grad_(True)
+    shared_b = lora_b.detach().clone().requires_grad_(True)
+    cast_a = shared_a.to(dtype=inputs.dtype)
+    cast_b = shared_b.to(dtype=inputs.dtype)
+    shared_hidden = torch.cat(
+        [
+            torch.nn.functional.linear(inputs[index : index + 1], cast_a)
+            for index in range(batch_size)
+        ]
+    )
+    shared_delta = torch.cat(
+        [
+            torch.nn.functional.linear(
+                shared_hidden[index : index + 1],
+                cast_b,
+            )
+            for index in range(batch_size)
+        ]
+    )
+    shared_delta.backward(upstream)
+    assert not (
+        torch.equal(shared_a.grad, serial.lora_A.grad)
+        and torch.equal(shared_b.grad, serial.lora_B.grad)
     )
 
 

@@ -258,17 +258,23 @@ class RegimeLoRALinear(nn.Linear):
             hidden = F.linear(dropped, self.lora_A.to(dtype=input.dtype))
             delta = F.linear(hidden, self.lora_B.to(dtype=input.dtype))
         else:
-            hidden = rowwise_linear(
-                dropped,
-                self.lora_A.to(dtype=input.dtype),
-                None,
-                batch_size=batch_size,
+            hidden = torch.cat(
+                [
+                    F.linear(
+                        dropped[index : index + 1],
+                        self.lora_A.to(dtype=input.dtype),
+                    )
+                    for index in range(batch_size)
+                ]
             )
-            delta = rowwise_linear(
-                hidden,
-                self.lora_B.to(dtype=input.dtype),
-                None,
-                batch_size=batch_size,
+            delta = torch.cat(
+                [
+                    F.linear(
+                        hidden[index : index + 1],
+                        self.lora_B.to(dtype=input.dtype),
+                    )
+                    for index in range(batch_size)
+                ]
             )
         return output + delta * self.scaling
 
