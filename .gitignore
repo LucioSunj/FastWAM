@@ -42,6 +42,7 @@ evaluate_results/
 *.pyc
 *Thumbs.db
 *.patch
+*.orig
 
 # Credential information that should never be checked in
 credentials
