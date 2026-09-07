@@ -254,17 +254,34 @@ class FastWAM(RuntimePlacementMixin, torch.nn.Module):
         return z
 
     @torch.no_grad()
-    def _encode_input_image_latents_tensor(self, input_image: torch.Tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
+    def _encode_input_image_latents_tensor(
+        self,
+        input_image: torch.Tensor,
+        tiled=False,
+        tile_size=(30, 52),
+        tile_stride=(15, 26),
+    ):
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if (
+            input_image.ndim != 4
+            or input_image.shape[0] < 1
+            or input_image.shape[1] != 3
+        ):
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must have shape [B,3,H,W] with B >= 1 or [3,H,W], got {tuple(input_image.shape)}"
             )
-        image = input_image.to(device=self.device)[0].unsqueeze(1)
-        z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        images = input_image.to(device=self.device)
+        videos = [image.unsqueeze(1) for image in images]
+        z = self.vae.encode(
+            videos,
+            device=self.device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )
         if isinstance(z, list):
-            z = z[0].unsqueeze(0)
+            z = torch.stack(z)
         return z
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):

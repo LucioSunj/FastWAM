@@ -104,11 +104,45 @@ def _condition() -> CachedActionCondition:
     return CachedActionCondition(
         context=torch.randn(2, 4, 5),
         context_mask=torch.ones(2, 4, dtype=torch.bool),
-        video_kv_cache=[{"k": torch.randn(2, 1, 3), "v": torch.randn(2, 1, 3)}],
+        video_kv_cache=[
+            {
+                "k": torch.randn(2, 1, 3),
+                "v": torch.randn(2, 1, 3),
+                "_gate_current_frame_video_tokens": 1,
+            }
+        ],
         attention_mask=torch.ones(3, 3, dtype=torch.bool),
         video_seq_len=1,
         current_frame_video_tokens=1,
     )
+
+
+def test_cached_action_condition_selects_every_batched_payload() -> None:
+    condition = _condition()
+    indices = torch.tensor([1, 0, 1])
+
+    selected = condition.index_select(indices)
+
+    torch.testing.assert_close(selected.context, condition.context[indices])
+    torch.testing.assert_close(
+        selected.context_mask,
+        condition.context_mask[indices],
+    )
+    torch.testing.assert_close(
+        selected.video_kv_cache[0]["k"],
+        condition.video_kv_cache[0]["k"][indices],
+    )
+    torch.testing.assert_close(
+        selected.video_kv_cache[0]["v"],
+        condition.video_kv_cache[0]["v"][indices],
+    )
+    assert (
+        selected.video_kv_cache[0]["_gate_current_frame_video_tokens"]
+        == condition.video_kv_cache[0]["_gate_current_frame_video_tokens"]
+    )
+    assert selected.attention_mask is condition.attention_mask
+    assert selected.video_seq_len == condition.video_seq_len
+    assert selected.current_frame_video_tokens == condition.current_frame_video_tokens
 
 
 def test_cached_action_velocity_keeps_gradient_and_restores_regime():

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,7 @@ from torch import nn
 from fastwam.adapters import PolicyRegime, RegimeContext, RegimeLoRALinear
 
 from .adaptive_sampler import VelocityOutput
+from .batch_linear import BatchLinearContext
 from .kv_tap import GateKVSnapshot, GateKVTapRequest
 
 
@@ -39,6 +41,49 @@ class CachedActionCondition:
         if self.context_mask.dtype != torch.bool:
             raise TypeError("`context_mask` must use bool dtype.")
 
+    def index_select(self, batch_indices: torch.Tensor) -> CachedActionCondition:
+        """Select batch rows while preserving the shared attention geometry."""
+
+        if not isinstance(batch_indices, torch.Tensor):
+            raise TypeError("`batch_indices` must be a tensor.")
+        if batch_indices.ndim != 1:
+            raise ValueError("`batch_indices` must be one-dimensional.")
+        if batch_indices.dtype not in (torch.int32, torch.int64):
+            raise TypeError("`batch_indices` must use an integer dtype.")
+        if self.context.shape[0] != self.context_mask.shape[0]:
+            raise ValueError("Cached context and context mask batch sizes differ.")
+
+        def _select(value: torch.Tensor) -> torch.Tensor:
+            indices = batch_indices.to(device=value.device, dtype=torch.long)
+            return value.index_select(0, indices)
+
+        selected_cache: list[dict[str, Any]] = []
+        for layer_index, layer in enumerate(self.video_kv_cache):
+            selected_layer = dict(layer)
+            for bank_name in ("k", "v"):
+                bank = layer.get(bank_name)
+                if not isinstance(bank, torch.Tensor) or bank.ndim < 1:
+                    raise ValueError(
+                        "Cached video K/V must be batched tensors at "
+                        f"layer={layer_index}, bank={bank_name}."
+                    )
+                if bank.shape[0] != self.context.shape[0]:
+                    raise ValueError(
+                        "Cached video K/V batch size differs from context at "
+                        f"layer={layer_index}, bank={bank_name}."
+                    )
+                selected_layer[bank_name] = _select(bank)
+            selected_cache.append(selected_layer)
+
+        return CachedActionCondition(
+            context=_select(self.context),
+            context_mask=_select(self.context_mask),
+            video_kv_cache=selected_cache,
+            attention_mask=self.attention_mask,
+            video_seq_len=self.video_seq_len,
+            current_frame_video_tokens=self.current_frame_video_tokens,
+        )
+
 
 class CachedActionVelocity:
     """Bind FastWAM conditioning while leaving the action state differentiable."""
@@ -51,6 +96,7 @@ class CachedActionVelocity:
         condition: CachedActionCondition,
         regime: PolicyRegime | str,
         regime_context: RegimeContext | None = None,
+        batch_linear_context: BatchLinearContext | None = None,
         gate_layer_indices: tuple[int, ...] | None = None,
         capture_gate_kv: bool = False,
         actor_version: int = 0,
@@ -60,6 +106,7 @@ class CachedActionVelocity:
         self.condition = condition
         self.regime = PolicyRegime.parse(regime)
         self.regime_context = regime_context
+        self.batch_linear_context = batch_linear_context
         self.gate_layer_indices = gate_layer_indices
         self.capture_gate_kv = bool(capture_gate_kv)
         self.actor_version = int(actor_version)
@@ -74,6 +121,12 @@ class CachedActionVelocity:
             self.regime_context, RegimeContext
         ):
             raise TypeError("`regime_context` must be a RegimeContext instance.")
+        if self.batch_linear_context is not None and not isinstance(
+            self.batch_linear_context, BatchLinearContext
+        ):
+            raise TypeError(
+                "`batch_linear_context` must be a BatchLinearContext instance."
+            )
         if self.regime is PolicyRegime.UNCOND:
             adapted_layers = tuple(
                 module
@@ -98,6 +151,16 @@ class CachedActionVelocity:
             return nullcontext()
         return self.regime_context.use(self.regime)
 
+    def _batch_linear_scope(self) -> AbstractContextManager[None]:
+        if self.batch_linear_context is None:
+            return nullcontext()
+        return self.batch_linear_context.use(self.condition.context.shape[0])
+
+    @contextmanager
+    def _execution_scope(self) -> Iterator[None]:
+        with self._regime_scope(), self._batch_linear_scope():
+            yield
+
     def _checkpoint_regime_contexts(
         self,
     ) -> tuple[
@@ -106,7 +169,7 @@ class CachedActionVelocity:
     ]:
         """Bind the same route to checkpoint forward and backward recomputation."""
 
-        return self._regime_scope(), self._regime_scope()
+        return self._execution_scope(), self._execution_scope()
 
     def __call__(
         self,
@@ -137,7 +200,7 @@ class CachedActionVelocity:
                 actor_version=self.actor_version,
             )
 
-        with self._regime_scope():
+        with self._execution_scope():
             action_pre = self.action_expert.pre_dit(
                 action_tokens=latents_action,
                 timestep=timestep_action,
@@ -186,6 +249,7 @@ class StaticCachedActionVelocity(CachedActionVelocity):
         self.condition = condition
         self.regime = PolicyRegime.parse(regime)
         self.regime_context = None
+        self.batch_linear_context = None
         self.gate_layer_indices = gate_layer_indices
         self.capture_gate_kv = bool(capture_gate_kv)
         self.actor_version = int(actor_version)
