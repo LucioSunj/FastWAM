@@ -1,0 +1,14 @@
+# Native scripts/train.py settings embedded by prepare_dataset.
+# Real assets and training budget stay mandatory until supplied.
+batch_size: 1
+num_workers: 0
+mixed_precision: bf16
+learning_rate: ???
+max_steps: ???
+num_epochs: ???
+gradient_accumulation_steps: 1
+weight_decay: 0.0
+max_grad_norm: 1.0
+encode_overlap: false
+wandb:
+  enabled: false
