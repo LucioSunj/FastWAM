@@ -27,6 +27,7 @@ from torch import nn
 from fastwam.models.wan22.batch_linear import BatchLinearContext, rowwise_linear
 
 REGIME_LORA_SIDECAR_SCHEMA = "fastwam-regime-lora-v1"
+VIDEO_BC_LORA_SIDECAR_SCHEMA = "fastwam-video-bc-lora-v1"
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -390,6 +391,8 @@ class BaseFreezeAudit:
 class ActionDiTLoRAAdapter:
     """Controller and serialization surface for injected ActionDiT adapters."""
 
+    sidecar_schema = REGIME_LORA_SIDECAR_SCHEMA
+
     def __init__(
         self,
         action_dit: nn.Module,
@@ -566,7 +569,7 @@ class ActionDiTLoRAAdapter:
 
         parent_hash = _validate_sha256(parent_checkpoint_sha256)
         return {
-            "schema": REGIME_LORA_SIDECAR_SCHEMA,
+            "schema": self.sidecar_schema,
             "parent_checkpoint_sha256": parent_hash,
             "active_regime": PolicyRegime.UNCOND.value,
             "rank": self.config.rank,
@@ -624,10 +627,10 @@ class ActionDiTLoRAAdapter:
             raise TypeError(
                 "LoRA sidecar requires dict `metadata` and `state_dict` fields."
             )
-        if metadata.get("schema") != REGIME_LORA_SIDECAR_SCHEMA:
+        if metadata.get("schema") != self.sidecar_schema:
             raise ValueError(
                 f"Unsupported LoRA sidecar schema {metadata.get('schema')!r}; "
-                f"expected {REGIME_LORA_SIDECAR_SCHEMA!r}"
+                f"expected {self.sidecar_schema!r}"
             )
         if metadata.get("parent_checkpoint_sha256") != expected_hash:
             raise ValueError(
@@ -655,6 +658,16 @@ class ActionDiTLoRAAdapter:
         return metadata
 
 
+class VideoBCDiTLoRAAdapter(ActionDiTLoRAAdapter):
+    """Block adapter controller for current-frame Video DiT action BC.
+
+    Video and Action blocks share projection names and serialization mechanics.
+    A distinct schema prevents a Video sidecar from being used as Action LoRA.
+    """
+
+    sidecar_schema = VIDEO_BC_LORA_SIDECAR_SCHEMA
+
+
 def inject_action_dit_lora(
     action_dit: nn.Module,
     config: RegimeLoRAConfig | None = None,
@@ -672,27 +685,7 @@ def inject_action_dit_lora(
     )
     if not target_names:
         raise ValueError("No ActionDiT LoRA targets were discovered.")
-    if any(
-        isinstance(action_dit.get_submodule(name), RegimeLoRALinear)
-        for name in target_names
-    ):
-        raise ValueError("ActionDiT already contains regime-gated LoRA layers.")
-
-    for name in target_names:
-        base = action_dit.get_submodule(name)
-        if not isinstance(base, nn.Linear):
-            raise TypeError(
-                f"ActionDiT target {name} must be nn.Linear, got {type(base)}"
-            )
-        adapted = RegimeLoRALinear(
-            base,
-            regime_context=context,
-            rank=resolved_config.rank,
-            alpha=resolved_config.alpha,
-            dropout=resolved_config.dropout,
-        )
-        _replace_submodule(action_dit, name, adapted)
-
+    _inject_lora_targets(action_dit, resolved_config, context, target_names)
     adapter = ActionDiTLoRAAdapter(
         action_dit,
         config=resolved_config,
@@ -702,6 +695,68 @@ def inject_action_dit_lora(
     if resolved_config.freeze_base:
         adapter.freeze_base()
     return adapter
+
+
+def inject_video_bc_dit_lora(
+    video_dit: nn.Module,
+    config: RegimeLoRAConfig,
+    *,
+    regime_context: RegimeContext,
+) -> VideoBCDiTLoRAAdapter:
+    """Adapt Video projections that contribute to current-frame action loss.
+
+    Action denoising consumes each Video block's input K/V. The last block's
+    Q, output projection, cross-attention and FFN cannot affect that loss, so
+    they remain frozen plain linears rather than unused DDP parameters.
+    """
+
+    discovered = discover_action_dit_lora_targets(
+        video_dit, config.target_groups, strict=config.strict_target_discovery
+    )
+    last_prefix = f"blocks.{len(video_dit.blocks) - 1}."
+    target_names = tuple(
+        name
+        for name in discovered
+        if not name.startswith(last_prefix)
+        or name in {last_prefix + "self_attn.k", last_prefix + "self_attn.v"}
+    )
+    if not target_names:
+        raise ValueError("No Video DiT LoRA targets contribute to action BC.")
+    _inject_lora_targets(video_dit, config, regime_context, target_names)
+    adapter = VideoBCDiTLoRAAdapter(
+        video_dit,
+        config=config,
+        regime_context=regime_context,
+        target_names=target_names,
+    )
+    if config.freeze_base:
+        adapter.freeze_base()
+    return adapter
+
+
+def _inject_lora_targets(
+    dit: nn.Module,
+    config: RegimeLoRAConfig,
+    context: RegimeContext,
+    target_names: Sequence[str],
+) -> None:
+    if any(
+        isinstance(dit.get_submodule(name), RegimeLoRALinear) for name in target_names
+    ):
+        raise ValueError("DiT already contains regime-gated LoRA layers.")
+
+    for name in target_names:
+        base = dit.get_submodule(name)
+        if not isinstance(base, nn.Linear):
+            raise TypeError(f"DiT target {name} must be nn.Linear, got {type(base)}")
+        adapted = RegimeLoRALinear(
+            base,
+            regime_context=context,
+            rank=config.rank,
+            alpha=config.alpha,
+            dropout=config.dropout,
+        )
+        _replace_submodule(dit, name, adapted)
 
 
 def _validate_sha256(value: str) -> str:

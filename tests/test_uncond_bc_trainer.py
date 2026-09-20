@@ -348,7 +348,9 @@ def test_vectorized_lora_snapshot_preserves_exact_update_norm() -> None:
         nn.Parameter(torch.tensor([[3.0], [4.0]])),
     ]
     adapter = SimpleNamespace(lora_parameters=lambda: iter(parameters))
-    policy = SimpleNamespace(lora_adapter=adapter)
+    policy = SimpleNamespace(
+        lora_parameters=adapter.lora_parameters, lora_adapters={"action": adapter}
+    )
 
     before = _snapshot_lora(policy)
     with torch.no_grad():
@@ -695,7 +697,7 @@ def _call_mock_checkpoint(path: Path):
     token = object()
     return _save_checkpoint(
         path,
-        policy=SimpleNamespace(lora_adapter=token),
+        policy=SimpleNamespace(lora_adapter=token, video_lora_adapter=None),
         optimizer=token,
         scheduler=token,
         scaler=token,

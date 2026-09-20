@@ -2,15 +2,17 @@
 
 This module is deliberately separate from :mod:`fastwam.trainer` and from the
 joint FastWAM training losses.  It encodes only the current observation frame,
-prefills the frozen video K/V cache, and evaluates the same cached UNCOND
+prefills current-frame video K/V, and evaluates the same cached UNCOND
 ActionDiT velocity callable used by the adaptive RL policy.
+An optional Video LoRA receives gradients through that cache from action loss.
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +24,7 @@ from fastwam.adapters import (
     PolicyRegime,
     RegimeLoRAConfig,
     inject_action_dit_lora,
+    inject_video_bc_dit_lora,
 )
 from fastwam.models.wan22.adaptive_action import (
     CachedActionCondition,
@@ -270,6 +273,7 @@ class FastWAMUncondBCPolicy(nn.Module):
         lora_config: RegimeLoRAConfig,
         config: FastWAMUncondBCConfig | None = None,
         lora_adapter: ActionDiTLoRAAdapter | None = None,
+        video_lora_config: RegimeLoRAConfig | None = None,
     ) -> None:
         super().__init__()
         self.actor = actor
@@ -284,7 +288,31 @@ class FastWAMUncondBCPolicy(nn.Module):
             self.lora_adapter.freeze_base()
         if self.lora_adapter.config != lora_config:
             raise ValueError("Provided LoRA adapter does not match `lora_config`.")
+        self.video_lora_adapter = (
+            None
+            if video_lora_config is None
+            else inject_video_bc_dit_lora(
+                self.actor.video_expert,
+                video_lora_config,
+                regime_context=self.lora_adapter.regime_context,
+            )
+        )
         self._assert_only_lora_trainable()
+
+    @property
+    def lora_adapters(self) -> dict[str, ActionDiTLoRAAdapter]:
+        """Return the enabled adapters in optimizer/checkpoint order."""
+
+        adapters = {"action": self.lora_adapter}
+        if self.video_lora_adapter is not None:
+            adapters["video"] = self.video_lora_adapter
+        return adapters
+
+    def lora_parameters(self) -> Iterator[nn.Parameter]:
+        """Yield every trainable Action and optional Video LoRA factor once."""
+
+        for adapter in self.lora_adapters.values():
+            yield from adapter.lora_parameters()
 
     @property
     def device(self) -> torch.device:
@@ -295,16 +323,18 @@ class FastWAMUncondBCPolicy(nn.Module):
         return next(self.actor.parameters()).dtype
 
     def _assert_only_lora_trainable(self) -> None:
-        self.lora_adapter.audit_freeze().assert_valid()
-        lora_ids = {id(parameter) for parameter in self.lora_adapter.lora_parameters()}
+        for adapter in self.lora_adapters.values():
+            adapter.audit_freeze().assert_valid()
+        lora_ids = {id(parameter) for parameter in self.lora_parameters()}
         unexpected = [
             name
             for name, parameter in self.actor.named_parameters()
             if parameter.requires_grad and id(parameter) not in lora_ids
         ]
         missing = [
-            name
-            for name, parameter in self.lora_adapter.named_lora_parameters()
+            f"{branch}.{name}"
+            for branch, adapter in self.lora_adapters.items()
+            for name, parameter in adapter.named_lora_parameters()
             if not parameter.requires_grad
         ]
         if unexpected or missing:
@@ -316,7 +346,7 @@ class FastWAMUncondBCPolicy(nn.Module):
     def trainable_parameter_names(self) -> tuple[str, ...]:
         """Return the complete trainable set for manifests and assertions."""
 
-        lora_ids = {id(parameter) for parameter in self.lora_adapter.lora_parameters()}
+        lora_ids = {id(parameter) for parameter in self.lora_parameters()}
         return tuple(
             name
             for name, parameter in self.actor.named_parameters()
@@ -380,11 +410,11 @@ class FastWAMUncondBCPolicy(nn.Module):
             raise ValueError("UNCOND BC action_is_pad must match action [B,T].")
 
     @torch.no_grad()
-    def prepare_action_condition(
+    def _prepare_inputs(
         self,
         batch: Mapping[str, Any],
-    ) -> CachedActionCondition:
-        """Encode exactly the current frame and prefill frozen video K/V."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode only the current frame and frozen text/proprio inputs."""
 
         self._validate_batch(batch)
         video = batch["video"]
@@ -435,6 +465,45 @@ class FastWAMUncondBCPolicy(nn.Module):
                 non_blocking=True,
             ),
         )
+        return current_latents, context, context_mask
+
+    def _video_checkpoint_contexts(
+        self,
+    ) -> tuple[AbstractContextManager, AbstractContextManager]:
+        context = self.lora_adapter.regime_context
+        return context.use(PolicyRegime.UNCOND), context.use(PolicyRegime.UNCOND)
+
+    def prepare_action_condition(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        regime: PolicyRegime = PolicyRegime.UNCOND,
+    ) -> CachedActionCondition:
+        """Build per-batch K/V, retaining its graph only for Video LoRA BC."""
+
+        current_latents, context, context_mask = self._prepare_inputs(batch)
+        grad_context = (
+            torch.no_grad() if self.video_lora_adapter is None else nullcontext()
+        )
+        with grad_context, self.lora_adapter.use_regime(regime):
+            return self._prefill_action_condition(
+                current_latents,
+                context,
+                context_mask,
+                train_video=(
+                    self.video_lora_adapter is not None
+                    and regime == PolicyRegime.UNCOND
+                ),
+            )
+
+    def _prefill_action_condition(
+        self,
+        current_latents: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        *,
+        train_video: bool,
+    ) -> CachedActionCondition:
         fuse_flag = bool(
             getattr(self.actor.video_expert, "fuse_vae_embedding_in_latents", False)
         )
@@ -473,6 +542,11 @@ class FastWAMUncondBCPolicy(nn.Module):
             },
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
             gate_current_frame_video_tokens=tokens_per_frame,
+            **(
+                {"checkpoint_context_fn": self._video_checkpoint_contexts}
+                if train_video
+                else {}
+            ),
         )
         return CachedActionCondition(
             context=context,

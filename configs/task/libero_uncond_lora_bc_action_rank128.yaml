@@ -1,0 +1,51 @@
+# @package _global_
+
+defaults:
+  - libero_uncond_lora_bc
+  - _self_
+
+runner:
+  output_dir: ${oc.env:FASTWAM_BC_OUTPUT_DIR,./runs/uncond_bc_action_rank128/${now:%Y-%m-%d}_${now:%H-%M-%S}}
+
+provenance:
+  dataset_paths:
+    - /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+    - /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_object_no_noops_lerobot
+    - /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_goal_no_noops_lerobot
+    - /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/Datasets/fastwam/libero_mujoco3.3.2/libero_10_no_noops_lerobot
+  text_cache_path: /data0/FastWAM-PERF-002-storage/root-migration-20260716T0311Z/repo-runs-performance-assets/text_embeds_cache/libero
+  verified_manifest: null
+
+lora:
+  rank: 128
+  alpha: 128.0
+  dropout: 0.0
+
+video_lora: null
+
+optimizer:
+  learning_rate: 1.0e-4
+
+training:
+  # Four-process default; the eight-process launcher selects accumulation 16.
+  microbatch_size: 1
+  gradient_accumulation_steps: 32
+  global_batch_size: 128
+  distributed_backend: nccl
+
+data:
+  num_workers: 0
+  prefetch_factor: 1
+  multiprocessing_context: null
+  persistent_workers: false
+  train:
+    current_frame_image_only: false
+    current_frame_only: true
+    strict_sample_loading: true
+  validation:
+    current_frame_image_only: false
+    current_frame_only: true
+    strict_sample_loading: true
+
+bc_policy:
+  expected_video_frames: 1

@@ -559,6 +559,7 @@ class MoT(nn.Module):
         video_context_payload: dict | None,
         video_attention_mask: torch.Tensor,
         gate_current_frame_video_tokens: int | None = None,
+        checkpoint_context_fn: CheckpointContextFn | None = None,
     ) -> list[dict[str, Any]]:
         """Prefill video branch once and cache per-layer K/V for action denoising.
 
@@ -572,6 +573,8 @@ class MoT(nn.Module):
             video_attention_mask: Video self-attention mask, shape [Sv, Sv].
             gate_current_frame_video_tokens: If provided, validate and record
                 the causal current-frame prefix required by later Gate taps.
+            checkpoint_context_fn: Bind Video LoRA activation during both the
+                original forward and gradient-checkpoint recomputation.
 
         Returns:
             Layer-wise cache list with length `num_layers`.
@@ -649,6 +652,7 @@ class MoT(nn.Module):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 mixed_slice=mixed,
                 context_payload=video_context_payload,
+                checkpoint_context_fn=checkpoint_context_fn,
             )
             layer_cache: dict[str, Any] = {"k": k, "v": v}
             if gate_current_frame_video_tokens is not None:

@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - libero_uncond_lora_bc_action_rank128
+  - _self_
+
+runner:
+  output_dir: ${oc.env:FASTWAM_BC_OUTPUT_DIR,./runs/uncond_bc_video_action_rank128/${now:%Y-%m-%d}_${now:%H-%M-%S}}
+
+# Video K/V stays differentiable; both adapters receive only action BC loss.
+# The Video adapter excludes the eight unused final-block projections.
+video_lora: ${lora}

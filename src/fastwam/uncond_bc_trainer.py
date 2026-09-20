@@ -38,14 +38,17 @@ from fastwam.uncond_bc import (
     FastWAMUncondBCPolicy,
     SampleIdentityDataset,
     cosine_warmup_multiplier,
+    lora_gradient_norm,
     stateless_validation_flow_inputs,
 )
 from fastwam.uncond_bc_checkpoint import (
     capture_rng_state,
     inspect_uncond_bc_checkpoint,
     load_uncond_bc_checkpoint,
+    load_uncond_bc_sidecar,
     restore_rng_state,
     save_uncond_bc_checkpoint,
+    save_uncond_bc_sidecar,
 )
 from fastwam.utils import misc
 
@@ -802,6 +805,7 @@ def _save_checkpoint(
         save_uncond_bc_checkpoint(
             path,
             adapter=policy.lora_adapter,
+            video_adapter=policy.video_lora_adapter,
             parent_checkpoint_sha256=parent_sha256,
             optimizer=optimizer,
             lr_scheduler=scheduler,
@@ -837,7 +841,7 @@ def _save_checkpoint(
 
 def _snapshot_lora(policy: FastWAMUncondBCPolicy) -> torch.Tensor:
     return torch.nn.utils.parameters_to_vector(
-        [parameter.detach() for parameter in policy.lora_adapter.lora_parameters()]
+        [parameter.detach() for parameter in policy.lora_parameters()]
     )
 
 
@@ -845,16 +849,34 @@ def _lora_update_norm(
     policy: FastWAMUncondBCPolicy,
     before: torch.Tensor,
 ) -> torch.Tensor:
-    current = torch.nn.utils.parameters_to_vector(
-        [parameter.detach() for parameter in policy.lora_adapter.lora_parameters()]
+    return torch.linalg.vector_norm(
+        torch.stack(list(_lora_update_norms(policy, before).values()))
     )
-    if current.shape != before.shape:
+
+
+def _lora_update_norms(
+    policy: FastWAMUncondBCPolicy,
+    before: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Measure branch updates without another full rank-128 parameter vector."""
+
+    if before.numel() != sum(p.numel() for p in policy.lora_parameters()):
         raise ValueError("LoRA update snapshot shape changed during optimization.")
-    return torch.linalg.vector_norm((current - before).float())
+    norms = {}
+    offset = 0
+    for branch, adapter in policy.lora_adapters.items():
+        squared = before.new_zeros(())
+        for parameter in adapter.lora_parameters():
+            end = offset + parameter.numel()
+            delta = parameter.detach().reshape(-1) - before[offset:end]
+            squared.add_(delta.float().square().sum())
+            offset = end
+        norms[branch] = squared.sqrt()
+    return norms
 
 
 def _frozen_versions(policy: FastWAMUncondBCPolicy) -> dict[str, int]:
-    lora_ids = {id(parameter) for parameter in policy.lora_adapter.lora_parameters()}
+    lora_ids = {id(parameter) for parameter in policy.lora_parameters()}
     return {
         name: parameter._version
         for name, parameter in policy.actor.named_parameters()
@@ -972,6 +994,8 @@ def _build_provenance(
         "lora": OmegaConf.to_container(cfg.lora, resolve=True),
         "bc_policy": OmegaConf.to_container(cfg.bc_policy, resolve=True),
     }
+    if cfg.get("video_lora") is not None:
+        contract["video_lora"] = OmegaConf.to_container(cfg.video_lora, resolve=True)
     root = Path(__file__).resolve().parents[2]
     provenance = {
         "schema": "fastwam-uncond-bc-provenance-v1",
@@ -1100,15 +1124,26 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         "cross_attention_qkvo",
         "ffn",
     ]
+    rank128 = int(cfg.lora.rank) == 128
     if (
-        int(cfg.lora.rank) not in {16, 32}
-        or float(cfg.lora.alpha) != 16.0
+        int(cfg.lora.rank) not in {16, 32, 128}
+        or float(cfg.lora.alpha) != (128.0 if rank128 else 16.0)
         or float(cfg.lora.dropout) != 0.0
         or list(cfg.lora.target_groups) != expected_targets
         or not bool(cfg.lora.freeze_base)
         or not bool(cfg.lora.strict_target_discovery)
     ):
         raise ValueError("UNCOND BC LoRA structure differs from the approved contract.")
+    if cfg.get("video_lora") is not None and (
+        not rank128
+        or OmegaConf.to_container(cfg.video_lora, resolve=True)
+        != OmegaConf.to_container(cfg.lora, resolve=True)
+    ):
+        raise ValueError(
+            "Video BC LoRA requires the matching rank-128/alpha-128 config."
+        )
+    if rank128 and (stage == "pilot" or float(cfg.optimizer.learning_rate) != 1e-4):
+        raise ValueError("Rank-128 BC uses fixed LR 1e-4 with no LR pilots.")
     current_frame_flags = [
         bool(split.get("current_frame_only", False))
         for split in (cfg.data.train, cfg.data.validation)
@@ -1146,6 +1181,8 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
 
     lora_rank = int(cfg.lora.rank)
     expected_world_size = 6 if lora_rank == 32 else 4
+    if rank128 and world_size == 8:
+        expected_world_size = 8
     expected_global_batch = 96 if lora_rank == 32 else 128
     allowed_microbatches = (1, 2, 4, 8, 16, 32) if lora_rank == 16 else (1, 2, 4, 8)
     expected_accumulation = {
@@ -1161,9 +1198,10 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         if world_size != 1:
             raise ValueError(f"{stage} must run on exactly one GPU.")
     elif world_size != expected_world_size:
+        allowed_world_sizes = "4 or 8" if rank128 else str(expected_world_size)
         raise ValueError(
             f"{stage} with LoRA rank {lora_rank} must run on exactly "
-            f"{expected_world_size} GPUs."
+            f"{allowed_world_sizes} GPUs."
         )
     if stage in {"bc2", "pilot", "formal"}:
         expected = expected_accumulation[microbatch]
@@ -1190,9 +1228,20 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
             or cfg.data.multiprocessing_context is not None
         ):
             raise ValueError(
-                "Rank-32 six-GPU BC requires zero extra DataLoader workers "
+                "Rank-32 BC requires zero extra DataLoader workers "
                 "per rank and prefetch factor one."
             )
+        if rank128:
+            loader_config = (
+                int(cfg.data.num_workers),
+                int(cfg.data.prefetch_factor),
+                cfg.data.multiprocessing_context,
+            )
+            if loader_config not in {(0, 1, None), (8, 2, "spawn")}:
+                raise ValueError(
+                    "Rank-128 BC supports zero workers or eight spawn workers "
+                    "with prefetch factor two."
+                )
     if stage == "bc1" and not bool(cfg.runner.single_gpu_diagnostic):
         raise ValueError("BC1 requires runner.single_gpu_diagnostic=true.")
     if stage != "bc1" and bool(cfg.runner.single_gpu_diagnostic):
@@ -1249,7 +1298,8 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
 def _zero_lora(policy: FastWAMUncondBCPolicy) -> bool:
     return all(
         torch.count_nonzero(parameter).item() == 0
-        for name, parameter in policy.lora_adapter.named_lora_parameters()
+        for adapter in policy.lora_adapters.values()
+        for name, parameter in adapter.named_lora_parameters()
         if name.endswith(".lora_B")
     )
 
@@ -1264,20 +1314,18 @@ def _strict_reload_best_sidecar(
     if not path.is_file():
         raise FileNotFoundError(f"Best UNCOND BC sidecar is missing: {path}")
     before = {
-        name: value.detach().cpu().clone()
-        for name, value in policy.lora_adapter.lora_state_dict().items()
+        branch: adapter.lora_state_dict()
+        for branch, adapter in policy.lora_adapters.items()
     }
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
         payload = torch.load(path, map_location="cpu")
-    expected_state = payload.get("state_dict") if isinstance(payload, Mapping) else None
-    if not isinstance(expected_state, Mapping):
-        raise TypeError("Best UNCOND BC sidecar has no tensor state mapping.")
-    metadata = policy.lora_adapter.load_sidecar(
+    metadata = load_uncond_bc_sidecar(
         path,
+        adapter=policy.lora_adapter,
+        video_adapter=policy.video_lora_adapter,
         expected_parent_checkpoint_sha256=parent_sha256,
-        strict=True,
     )
     observed_extra = metadata.get("extra")
     if observed_extra != dict(expected_extra):
@@ -1285,18 +1333,27 @@ def _strict_reload_best_sidecar(
             "Best UNCOND BC sidecar provenance mismatch: "
             f"expected={dict(expected_extra)}, observed={observed_extra}."
         )
-    loaded = policy.lora_adapter.lora_state_dict()
-    load_mismatches = sorted(
-        name
-        for name, value in loaded.items()
-        if name not in expected_state
-        or not torch.equal(value, expected_state[name].to(dtype=value.dtype))
-    )
-    policy.lora_adapter.load_lora_state_dict(before, strict=True)
-    restored = policy.lora_adapter.lora_state_dict()
-    restore_mismatches = sorted(
-        name for name, value in before.items() if not torch.equal(value, restored[name])
-    )
+    load_mismatches = []
+    restore_mismatches = []
+    for branch, adapter in policy.lora_adapters.items():
+        expected_state = (
+            payload["state_dict"]
+            if policy.video_lora_adapter is None
+            else payload[branch]["state_dict"]
+        )
+        loaded = adapter.lora_state_dict()
+        load_mismatches.extend(
+            f"{branch}.{name}"
+            for name, value in loaded.items()
+            if not torch.equal(value, expected_state[name])
+        )
+        adapter.load_lora_state_dict(before[branch], strict=True)
+        restored = adapter.lora_state_dict()
+        restore_mismatches.extend(
+            f"{branch}.{name}"
+            for name, value in before[branch].items()
+            if not torch.equal(value, restored[name])
+        )
     if load_mismatches or restore_mismatches:
         raise RuntimeError(
             "Best-sidecar strict reload round trip failed: "
@@ -1331,7 +1388,6 @@ def _bc0_parity_and_action_report(
         device=policy.device,
         dtype=policy.dtype,
     )
-    condition = policy.prepare_action_condition(batch)
     normalized_action = action.to(
         device=policy.device,
         dtype=policy.dtype,
@@ -1345,16 +1401,17 @@ def _bc0_parity_and_action_report(
     common = {
         "action_expert": policy.actor.action_expert,
         "mot": policy.actor.mot,
-        "condition": condition,
         "regime_context": policy.lora_adapter.regime_context,
         "capture_gate_kv": False,
     }
     idm_velocity = CachedActionVelocity(
         **common,
+        condition=policy.prepare_action_condition(batch, regime=PolicyRegime.IDM),
         regime=PolicyRegime.IDM,
     )(noisy_action, timestep).velocity
     uncond_velocity = CachedActionVelocity(
         **common,
+        condition=policy.prepare_action_condition(batch),
         regime=PolicyRegime.UNCOND,
     )(noisy_action, timestep).velocity
     delta = (idm_velocity.float() - uncond_velocity.float()).abs()
@@ -1410,7 +1467,7 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
     distributed_backend = str(cfg.training.get("distributed_backend", "nccl"))
     rank, world_size, local_rank, device = _distributed_context(
         distributed_backend,
-        collective_timeout_seconds=int(cfg.distributed.collective_timeout_seconds)
+        collective_timeout_seconds=int(cfg.distributed.collective_timeout_seconds),
     )
     _validate_training_config(cfg, world_size=world_size)
     _set_seed(
@@ -1485,8 +1542,15 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
         actor=actor,
         lora_config=RegimeLoRAConfig(**lora_payload),
         config=FastWAMUncondBCConfig(**bc_payload),
+        video_lora_config=(
+            None
+            if cfg.get("video_lora") is None
+            else RegimeLoRAConfig(
+                **OmegaConf.to_container(cfg.video_lora, resolve=True)
+            )
+        ),
     ).to(device)
-    parameters = list(policy.lora_adapter.lora_parameters())
+    parameters = list(policy.lora_parameters())
     if distributed_backend == "gloo_manual":
         _broadcast_trainable_parameters(
             parameters,
@@ -1569,6 +1633,10 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             "capability": list(torch.cuda.get_device_capability(local_rank)),
         },
         "trainable_parameter_names": list(policy.trainable_parameter_names()),
+        "lora_targets": {
+            branch: list(adapter.target_names)
+            for branch, adapter in policy.lora_adapters.items()
+        },
         "zero_lora_at_start": _zero_lora(policy),
         "future_prediction_calls": future_prediction_calls["count"],
         "contains_gate": False,
@@ -1685,6 +1753,7 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
         payload = load_uncond_bc_checkpoint(
             str(resume),
             adapter=policy.lora_adapter,
+            video_adapter=policy.video_lora_adapter,
             expected_parent_checkpoint_sha256=parent_sha256,
             expected_contract=contract,
             optimizer=optimizer,
@@ -1705,10 +1774,32 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             restored_trainer_state["epochs_without_improvement"]
         )
         nonzero_update_count = int(restored_trainer_state["nonzero_update_count"])
+        if rank == 0:
+            _atomic_json(
+                output_dir / "resume_state.json",
+                {
+                    "checkpoint": str(resume),
+                    "global_step": global_step,
+                    "epoch": start_epoch,
+                    "sampler_offset": sampler_offset,
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                    "lr_scheduler_last_epoch": scheduler.last_epoch,
+                    "optimizer_state_entries": len(optimizer.state),
+                    "optimizer_steps": sorted(
+                        {
+                            int(state["step"].item())
+                            for state in optimizer.state.values()
+                        }
+                    ),
+                    "trainer_state": restored_trainer_state,
+                    "rng_rank_count": len(payload["rng_by_rank"]),
+                },
+            )
     if global_step >= stop_after_steps:
         raise ValueError(
             f"BC resume step {global_step} already reached stop {stop_after_steps}."
         )
+    initial_global_step = global_step
 
     checkpoints_dir = output_dir / "checkpoints"
     metrics_path = output_dir / "metrics.jsonl"
@@ -1794,11 +1885,23 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             )
             if not torch.isfinite(gradient_norm):
                 raise FloatingPointError("Non-finite UNCOND LoRA gradient norm.")
+            branch_gradients = {
+                branch: float(lora_gradient_norm(adapter).item())
+                for branch, adapter in policy.lora_adapters.items()
+            }
             before = _snapshot_lora(policy)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            update_norm = _lora_update_norm(policy, before)
+            branch_update_norms = _lora_update_norms(policy, before)
+            update_norm = torch.linalg.vector_norm(
+                torch.stack(list(branch_update_norms.values()))
+            )
+            branch_updates = {
+                branch: float(norm.item())
+                for branch, norm in branch_update_norms.items()
+            }
+            del before
             if not torch.isfinite(update_norm):
                 raise FloatingPointError("Non-finite UNCOND LoRA update norm.")
             update_norm_value = float(update_norm.item())
@@ -1809,7 +1912,7 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
                 global_step % int(cfg.training.save_every_steps) == 0
                 or global_step >= stop_after_steps
             )
-            if global_step == 1 or checkpoint_due:
+            if global_step == initial_global_step + 1 or checkpoint_due:
                 _assert_frozen_versions(policy, frozen_versions)
             record = {
                 "global_step": global_step,
@@ -1829,10 +1932,19 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
                 "valid_action_count": int(output["valid_action_count"].item()),
                 "lora_gradient_norm": float(gradient_norm.item()),
                 "lora_update_norm": update_norm_value,
+                "lora_gradient_norm_by_branch": branch_gradients,
+                "lora_update_norm_by_branch": branch_updates,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "sample_identity_sha256": identity_digest.hexdigest(),
                 "timestep_sha256": timestep_digest.hexdigest(),
                 "noise_sha256": noise_digest.hexdigest(),
+                "frozen_parameter_versions_checked": (
+                    global_step == initial_global_step + 1 or checkpoint_due
+                ),
+                # All preceding tensor .item()/.cpu() reads have completed this
+                # update on CUDA; consecutive timestamps include data loading,
+                # forward/backward, communication, optimizer and metric costs.
+                "wall_time_unix_seconds": time.time(),
             }
             if rank == 0:
                 with metrics_path.open("a", encoding="utf-8") as handle:
@@ -1884,8 +1996,10 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             best_step = global_step
             epochs_without_improvement = 0
             if rank == 0:
-                policy.lora_adapter.save_sidecar(
+                save_uncond_bc_sidecar(
                     output_dir / "best_uncond_lora.pt",
+                    adapter=policy.lora_adapter,
+                    video_adapter=policy.video_lora_adapter,
                     parent_checkpoint_sha256=parent_sha256,
                     extra_metadata={
                         "bc_step": global_step,

@@ -14,11 +14,14 @@ import torch
 
 from fastwam.adapters import (
     REGIME_LORA_SIDECAR_SCHEMA,
+    VIDEO_BC_LORA_SIDECAR_SCHEMA,
     ActionDiTLoRAAdapter,
     sha256_file,
 )
 
 UNCOND_BC_TRAINING_SCHEMA = "fastwam-uncond-bc-training-v1"
+DUAL_UNCOND_BC_TRAINING_SCHEMA = "fastwam-uncond-bc-training-v2"
+DUAL_UNCOND_BC_SIDECAR_SCHEMA = "fastwam-uncond-bc-dual-lora-v1"
 _TRAINING_CHECKPOINT_KEYS = {
     "schema",
     "global_step",
@@ -152,6 +155,96 @@ def _validate_adapter_payload(
     return dict(metadata)
 
 
+def _atomic_save(path: str | os.PathLike[str], payload: Mapping[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp")
+    try:
+        torch.save(_cpu_clone(payload), temporary)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def save_uncond_bc_sidecar(
+    path: str | os.PathLike[str],
+    *,
+    adapter: ActionDiTLoRAAdapter,
+    video_adapter: ActionDiTLoRAAdapter | None = None,
+    parent_checkpoint_sha256: str,
+    extra_metadata: Mapping[str, Any],
+) -> None:
+    """Save all enabled BC adapters, retaining the Action-only v1 format."""
+
+    action = build_lora_sidecar_payload(
+        adapter,
+        parent_checkpoint_sha256=parent_checkpoint_sha256,
+        extra_metadata=extra_metadata,
+    )
+    payload = action
+    if video_adapter is not None:
+        payload = {
+            "schema": DUAL_UNCOND_BC_SIDECAR_SCHEMA,
+            "action": action,
+            "video": build_lora_sidecar_payload(
+                video_adapter,
+                parent_checkpoint_sha256=parent_checkpoint_sha256,
+                extra_metadata=extra_metadata,
+            ),
+        }
+    _atomic_save(path, payload)
+
+
+def load_uncond_bc_sidecar(
+    path: str | os.PathLike[str],
+    *,
+    adapter: ActionDiTLoRAAdapter,
+    video_adapter: ActionDiTLoRAAdapter | None = None,
+    expected_parent_checkpoint_sha256: str,
+) -> dict[str, Any]:
+    """Strictly load a complete Action-only or dual-DiT BC sidecar."""
+
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if video_adapter is None:
+        return _validate_adapter_payload(
+            adapter,
+            payload,
+            expected_parent_checkpoint_sha256=expected_parent_checkpoint_sha256,
+        )
+    if set(payload) != {"schema", "action", "video"} or (
+        payload["schema"] != DUAL_UNCOND_BC_SIDECAR_SCHEMA
+    ):
+        raise ValueError("Dual-DiT BC requires both Action and Video sidecars.")
+    metadata = _validate_adapter_payload(
+        adapter,
+        payload["action"],
+        expected_parent_checkpoint_sha256=expected_parent_checkpoint_sha256,
+    )
+    video_metadata = _validate_adapter_payload(
+        video_adapter,
+        payload["video"],
+        expected_parent_checkpoint_sha256=expected_parent_checkpoint_sha256,
+    )
+    if metadata["extra"] != video_metadata["extra"]:
+        raise ValueError("Action and Video sidecar training provenance differs.")
+    return {
+        **metadata,
+        "schema": DUAL_UNCOND_BC_SIDECAR_SCHEMA,
+        "video": video_metadata,
+    }
+
+
+def _validate_checkpoint_structure(payload: Any, *, dual: bool) -> None:
+    expected_keys = _TRAINING_CHECKPOINT_KEYS | ({"video_adapter"} if dual else set())
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        raise ValueError(
+            "BC training checkpoint keys changed or adapter scope differs."
+        )
+    schema = DUAL_UNCOND_BC_TRAINING_SCHEMA if dual else UNCOND_BC_TRAINING_SCHEMA
+    if payload.get("schema") != schema:
+        raise ValueError(f"Unsupported BC checkpoint schema {payload.get('schema')!r}.")
+
+
 def _validate_trainer_state(
     payload: Mapping[str, Any] | None,
     *,
@@ -208,6 +301,7 @@ def save_uncond_bc_checkpoint(
     path: str | os.PathLike[str],
     *,
     adapter: ActionDiTLoRAAdapter,
+    video_adapter: ActionDiTLoRAAdapter | None = None,
     parent_checkpoint_sha256: str,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: Any,
@@ -259,21 +353,21 @@ def save_uncond_bc_checkpoint(
         "provenance": dict(provenance),
         "trainer_state": normalized_trainer_state,
     }
-    payload = _cpu_clone(payload)
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.tmp")
-    try:
-        torch.save(payload, temporary)
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
+    if video_adapter is not None:
+        payload["schema"] = DUAL_UNCOND_BC_TRAINING_SCHEMA
+        payload["video_adapter"] = build_lora_sidecar_payload(
+            video_adapter,
+            parent_checkpoint_sha256=parent_checkpoint_sha256,
+            extra_metadata=sidecar_extra,
+        )
+    _atomic_save(path, payload)
 
 
 def load_uncond_bc_checkpoint(
     path: str | os.PathLike[str],
     *,
     adapter: ActionDiTLoRAAdapter,
+    video_adapter: ActionDiTLoRAAdapter | None = None,
     expected_parent_checkpoint_sha256: str,
     expected_contract: Mapping[str, Any],
     optimizer: torch.optim.Optimizer,
@@ -283,11 +377,7 @@ def load_uncond_bc_checkpoint(
     """Strictly restore the complete BC trainer state except rank-local RNG."""
 
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict) or set(payload) != _TRAINING_CHECKPOINT_KEYS:
-        keys = sorted(payload) if isinstance(payload, dict) else type(payload)
-        raise ValueError(f"BC training checkpoint keys changed: {keys}.")
-    if payload.get("schema") != UNCOND_BC_TRAINING_SCHEMA:
-        raise ValueError(f"Unsupported BC checkpoint schema {payload.get('schema')!r}.")
+    _validate_checkpoint_structure(payload, dual=video_adapter is not None)
     expected_parent = str(expected_parent_checkpoint_sha256).lower()
     if payload.get("parent_checkpoint_sha256") != expected_parent:
         raise ValueError(
@@ -303,6 +393,14 @@ def load_uncond_bc_checkpoint(
     )
     if metadata.get("extra", {}).get("bc_step") != int(payload["global_step"]):
         raise ValueError("BC sidecar step does not match its training checkpoint.")
+    if video_adapter is not None:
+        video_metadata = _validate_adapter_payload(
+            video_adapter,
+            payload["video_adapter"],
+            expected_parent_checkpoint_sha256=expected_parent,
+        )
+        if video_metadata["extra"] != metadata["extra"]:
+            raise ValueError("Action and Video checkpoint provenance differs.")
     payload["trainer_state"] = _validate_trainer_state(
         payload["trainer_state"],
         global_step=int(payload["global_step"]),
@@ -317,16 +415,13 @@ def load_uncond_bc_adapter_checkpoint(
     path: str | os.PathLike[str],
     *,
     adapter: ActionDiTLoRAAdapter,
+    video_adapter: ActionDiTLoRAAdapter | None = None,
     expected_parent_checkpoint_sha256: str,
 ) -> dict[str, Any]:
     """Strictly load only the LoRA state from a complete trainer checkpoint."""
 
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict) or set(payload) != _TRAINING_CHECKPOINT_KEYS:
-        keys = sorted(payload) if isinstance(payload, dict) else type(payload)
-        raise ValueError(f"BC training checkpoint keys changed: {keys}.")
-    if payload.get("schema") != UNCOND_BC_TRAINING_SCHEMA:
-        raise ValueError(f"Unsupported BC checkpoint schema {payload.get('schema')!r}.")
+    _validate_checkpoint_structure(payload, dual=video_adapter is not None)
     expected_parent = str(expected_parent_checkpoint_sha256).lower()
     if payload.get("parent_checkpoint_sha256") != expected_parent:
         raise ValueError(
@@ -345,6 +440,15 @@ def load_uncond_bc_adapter_checkpoint(
     )
     if metadata.get("extra", {}).get("bc_step") != global_step:
         raise ValueError("BC sidecar step does not match its training checkpoint.")
+    video_metadata = None
+    if video_adapter is not None:
+        video_metadata = _validate_adapter_payload(
+            video_adapter,
+            payload["video_adapter"],
+            expected_parent_checkpoint_sha256=expected_parent,
+        )
+        if video_metadata["extra"] != metadata["extra"]:
+            raise ValueError("Action and Video checkpoint provenance differs.")
     return {
         "schema": payload["schema"],
         "global_step": global_step,
@@ -352,6 +456,11 @@ def load_uncond_bc_adapter_checkpoint(
         "sampler_offset": int(payload["sampler_offset"]),
         "parent_checkpoint_sha256": expected_parent,
         "adapter_metadata": metadata,
+        **(
+            {"video_adapter_metadata": video_metadata}
+            if video_adapter is not None
+            else {}
+        ),
         "contract": dict(payload["contract"]),
         "provenance": dict(payload["provenance"]),
         "trainer_state": trainer_state,
@@ -375,29 +484,55 @@ def inspect_uncond_bc_checkpoint(path: str | os.PathLike[str]) -> dict[str, Any]
     """Return a machine-readable payload audit and fail closed on model data."""
 
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict) or set(payload) != _TRAINING_CHECKPOINT_KEYS:
-        raise ValueError("Not a complete FastWAM UNCOND BC training checkpoint.")
+    dual = (
+        isinstance(payload, dict)
+        and payload.get("schema") == DUAL_UNCOND_BC_TRAINING_SCHEMA
+    )
+    _validate_checkpoint_structure(payload, dual=dual)
     trainer_state = _validate_trainer_state(
         payload["trainer_state"],
         global_step=int(payload["global_step"]),
     )
-    adapter = payload.get("adapter")
-    if not isinstance(adapter, Mapping) or set(adapter) != _ADAPTER_KEYS:
-        raise ValueError("BC checkpoint is missing its v1 adapter sidecar payload.")
-    metadata = adapter["metadata"]
-    state_dict = adapter["state_dict"]
-    if metadata.get("schema") != REGIME_LORA_SIDECAR_SCHEMA:
-        raise ValueError("BC checkpoint does not contain a v1 regime-LoRA sidecar.")
-    if not isinstance(state_dict, Mapping) or not state_dict:
-        raise ValueError("BC checkpoint adapter state is empty or malformed.")
-    invalid_lora_names = sorted(
-        name for name in state_dict if not str(name).endswith((".lora_A", ".lora_B"))
-    )
-    if invalid_lora_names:
-        raise ValueError(f"BC sidecar contains non-LoRA tensors: {invalid_lora_names}.")
+    components = {"adapter": REGIME_LORA_SIDECAR_SCHEMA}
+    if dual:
+        components["video_adapter"] = VIDEO_BC_LORA_SIDECAR_SCHEMA
+    state_dict = {}
+    for component, schema in components.items():
+        sidecar = payload.get(component)
+        if not isinstance(sidecar, Mapping) or set(sidecar) != _ADAPTER_KEYS:
+            raise ValueError(f"BC checkpoint is missing its {component} payload.")
+        branch_metadata = sidecar["metadata"]
+        branch_state = sidecar["state_dict"]
+        if branch_metadata.get("schema") != schema:
+            raise ValueError(f"BC {component} sidecar schema differs.")
+        if not isinstance(branch_state, Mapping) or not branch_state:
+            raise ValueError("BC checkpoint adapter state is empty or malformed.")
+        expected_names = {
+            f"{name}.{factor}"
+            for name in branch_metadata["target_names"]
+            for factor in ("lora_A", "lora_B")
+        }
+        if set(branch_state) != expected_names:
+            raise ValueError(f"BC {component} LoRA tensors do not match its targets.")
+        if any(not isinstance(value, torch.Tensor) for value in branch_state.values()):
+            raise ValueError(f"BC {component} contains a non-tensor LoRA value.")
+        if (
+            branch_metadata["parent_checkpoint_sha256"]
+            != payload["parent_checkpoint_sha256"]
+        ):
+            raise ValueError(f"BC {component} parent differs from the checkpoint.")
+        if branch_metadata.get("extra", {}).get("bc_step") != int(
+            payload["global_step"]
+        ):
+            raise ValueError(f"BC {component} step differs from the checkpoint.")
+        state_dict.update(
+            {f"{component}.{name}": value for name, value in branch_state.items()}
+        )
+    metadata = payload["adapter"]["metadata"]
 
     allowed_tensor_prefixes = (
         "adapter.state_dict.",
+        "video_adapter.state_dict.",
         "optimizer.",
         "lr_scheduler.",
         "grad_scaler.",
@@ -474,6 +609,21 @@ def inspect_uncond_bc_checkpoint(path: str | os.PathLike[str]) -> dict[str, Any]
         "adapter_rank": int(metadata["rank"]),
         "adapter_alpha": float(metadata["alpha"]),
         "adapter_target_names": list(metadata["target_names"]),
+        **(
+            {
+                "video_adapter": {
+                    "schema": payload["video_adapter"]["metadata"]["schema"],
+                    "rank": int(payload["video_adapter"]["metadata"]["rank"]),
+                    "alpha": float(payload["video_adapter"]["metadata"]["alpha"]),
+                    "target_names": list(
+                        payload["video_adapter"]["metadata"]["target_names"]
+                    ),
+                    "tensor_count": len(payload["video_adapter"]["state_dict"]),
+                }
+            }
+            if dual
+            else {}
+        ),
         "lora_tensor_count": len(lora_tensors),
         "lora_bytes": int(lora_bytes),
         "lora_master_dtype": "torch.float32",
@@ -583,6 +733,11 @@ def compare_uncond_bc_checkpoints(
             },
         ),
     }
+    if "video_adapter" in first or "video_adapter" in second:
+        groups["video_adapter"] = (
+            first.get("video_adapter"),
+            second.get("video_adapter"),
+        )
     group_reports = {}
     all_mismatches = []
     for name, (left, right) in groups.items():
