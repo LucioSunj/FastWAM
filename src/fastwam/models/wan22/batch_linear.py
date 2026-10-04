@@ -53,12 +53,16 @@ def rowwise_linear(
         input_tensor = input_tensor.reshape(batch_size, -1, input_tensor.shape[-1])
     elif input_tensor.ndim < 2 or input_tensor.shape[0] != batch_size:
         raise ValueError("Batch-major Linear input does not match sample batch.")
-    output = torch.cat(
-        [
-            F.linear(input_tensor[index : index + 1], weight, bias)
-            for index in range(batch_size)
-        ],
-        dim=0,
+    output = (
+        F.linear(input_tensor, weight, bias)
+        if batch_size == 1
+        else torch.cat(
+            [
+                F.linear(input_tensor[index : index + 1], weight, bias)
+                for index in range(batch_size)
+            ],
+            dim=0,
+        )
     )
     if flattened_batch:
         return output.reshape(*original_shape[:-1], weight.shape[0])

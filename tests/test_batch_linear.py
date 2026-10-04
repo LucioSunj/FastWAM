@@ -108,7 +108,7 @@ def test_regime_lora_rowwise_base_and_delta_backward() -> None:
     )
 
 
-@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_bf16_lora_master_cast_and_gradients_match_mb1(batch_size: int) -> None:
     regime = RegimeContext()
     base = nn.Linear(13, 11, dtype=torch.bfloat16)
@@ -165,10 +165,16 @@ def test_bf16_lora_master_cast_and_gradients_match_mb1(batch_size: int) -> None:
         ]
     )
     shared_delta.backward(upstream)
-    assert not (
-        torch.equal(shared_a.grad, serial.lora_A.grad)
-        and torch.equal(shared_b.grad, serial.lora_B.grad)
+    shared_matches = torch.equal(shared_a.grad, serial.lora_A.grad) and torch.equal(
+        shared_b.grad, serial.lora_B.grad
     )
+    assert shared_matches is (batch_size == 1)
+
+    with torch.no_grad(), regime.use(PolicyRegime.UNCOND), context.use(batch_size):
+        # Inference hoists factor casts, while the gradient-enabled path above
+        # keeps each row's cast and FP32 master accumulation independent.
+        rollout_output = adapted(inputs)
+    assert torch.equal(rollout_output, serial_output)
 
 
 def test_nonzero_lora_dropout_is_outside_supported_contract() -> None:

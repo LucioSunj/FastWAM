@@ -255,9 +255,20 @@ class RegimeLoRALinear(nn.Linear):
         # the numerics of a fully base-dtype adapter while gradients still
         # accumulate into the FP32 leaves the optimizer owns.
         dropped = self.lora_dropout(input)
-        if batch_size is None:
+        if batch_size is None or batch_size == 1:
             hidden = F.linear(dropped, self.lora_A.to(dtype=input.dtype))
             delta = F.linear(hidden, self.lora_B.to(dtype=input.dtype))
+        elif not torch.is_grad_enabled():
+            # Rollout needs one cast per factor, while each GEMM retains its
+            # batch-one geometry. Training keeps independent row casts below:
+            # sharing their backward would accumulate BF16 gradients before
+            # returning them to the FP32 masters.
+            hidden = rowwise_linear(
+                dropped, self.lora_A.to(dtype=input.dtype), None, batch_size=batch_size
+            )
+            delta = rowwise_linear(
+                hidden, self.lora_B.to(dtype=input.dtype), None, batch_size=batch_size
+            )
         else:
             hidden = torch.cat(
                 [
