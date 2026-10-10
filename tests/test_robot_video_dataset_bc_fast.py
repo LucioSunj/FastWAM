@@ -31,6 +31,7 @@ def test_text_context_is_loaded_once_per_dataset_process(tmp_path) -> None:
     dataset = object.__new__(RobotVideoDataset)
     dataset.text_embedding_cache_dir = str(tmp_path)
     dataset.context_len = context_len
+    dataset.text_padding = "legacy_visible"
     dataset._text_context_cache = {}
 
     first = dataset._get_cached_text_context(prompt)

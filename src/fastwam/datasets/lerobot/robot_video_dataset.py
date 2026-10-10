@@ -1,22 +1,24 @@
-import hashlib
 import os
-from typing import Optional
 import time
-import numpy as np
 import traceback
+from contextlib import contextmanager
+from typing import Optional
+
+import numpy as np
 import torch
 import torchvision.transforms.functional as transforms_F
-from contextlib import contextmanager
-
+from accelerate import PartialState
+from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
-from hydra.utils import instantiate
-from .base_lerobot_dataset import BaseLerobotDataset
-from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
-from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
-from fastwam.utils.logging_config import get_logger
 from fastwam.utils import misc, pytorch_utils
-from accelerate import PartialState
+from fastwam.utils.logging_config import get_logger
+from fastwam.utils.text_cache import load_text_context, validate_text_padding
+
+from ..dataset_utils import CenterCrop, Normalize, ResizeSmallestSideAspectPreserving
+from .base_lerobot_dataset import BaseLerobotDataset
+from .utils.normalizer import load_dataset_stats_from_json, save_dataset_stats_to_json
+
 logger = get_logger(__name__)
 
 
@@ -45,7 +47,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         current_frame_image_only: bool = False,
         current_frame_only: bool = False,
         strict_sample_loading: bool = False,
+        text_padding: str = "legacy_visible",
     ):
+        self.text_padding = validate_text_padding(text_padding)
         self.current_frame_image_only = bool(current_frame_image_only)
         self.current_frame_only = bool(current_frame_only)
         if self.current_frame_image_only and self.current_frame_only:
@@ -291,46 +295,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def _get_cached_text_context(self, prompt: str):
         if self.text_embedding_cache_dir is None:
             raise ValueError("text_embedding_cache_dir is not set.")
-        cache_dir = self.text_embedding_cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
-        hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        cache_path = os.path.join(cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt")
-        cached = self._text_context_cache.get(cache_path)
-        if cached is not None:
-            return cached
-        if not os.path.exists(cache_path):
-            raise FileNotFoundError(
-                f"Missing text embedding cache: {cache_path}. "
-                "Run scripts/precompute_text_embeds.py first."
+        cached = self._text_context_cache.get(prompt)
+        if cached is None:
+            cached = load_text_context(
+                self.text_embedding_cache_dir,
+                prompt,
+                self.context_len,
+                text_padding=self.text_padding,
             )
-        payload = torch.load(cache_path, map_location="cpu", weights_only=True)
-        context = payload["context"]
-        context_mask = payload["mask"].bool()
-        if context.ndim != 2:
-            raise ValueError(
-                f"Cached `context` must be 2D [L, D], got shape {tuple(context.shape)} in {cache_path}"
-            )
-        if context_mask.ndim != 1:
-            raise ValueError(
-                f"Cached `mask` must be 1D [L], got shape {tuple(context_mask.shape)} in {cache_path}"
-            )
-        if context.shape[0] != self.context_len:
-            raise ValueError(
-                f"Cached context_len mismatch: expected {self.context_len}, got {context.shape[0]} in {cache_path}"
-            )
-        if context_mask.shape[0] != self.context_len:
-            raise ValueError(
-                f"Cached mask_len mismatch: expected {self.context_len}, got {context_mask.shape[0]} in {cache_path}"
-            )
-
-        context = context.clone()
-        context_mask = context_mask.clone()
-        # Keep the existing Wan2.2 condition semantics while avoiding repeated
-        # deserialization for the same instruction.
-        context[~context_mask] = 0.0
-        context_mask = torch.ones_like(context_mask)
-        cached = (context, context_mask)
-        self._text_context_cache[cache_path] = cached
+            self._text_context_cache[prompt] = cached
         return cached
 
     def __getitem__(self, idx):

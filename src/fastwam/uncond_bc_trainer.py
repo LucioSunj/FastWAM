@@ -51,6 +51,10 @@ from fastwam.uncond_bc_checkpoint import (
     save_uncond_bc_sidecar,
 )
 from fastwam.utils import misc
+from fastwam.utils.text_cache import (
+    validate_checkpoint_text_padding,
+    validate_text_padding,
+)
 
 BC_OUTPUT_MARKER = ".fastwam-uncond-bc-output-v1"
 _LIBC = ctypes.CDLL(None)
@@ -376,6 +380,9 @@ def load_strict_fastwam_parent(actor: nn.Module, checkpoint: str) -> dict[str, A
         payload = torch.load(checkpoint, **kwargs)
     if not isinstance(payload, Mapping):
         raise TypeError("FastWAM parent checkpoint must be a mapping.")
+    validate_checkpoint_text_padding(
+        payload, getattr(actor, "text_padding", "legacy_visible")
+    )
     mot_state = payload.get("mot")
     if not isinstance(mot_state, Mapping):
         raise TypeError("FastWAM parent checkpoint must contain `mot` weights.")
@@ -1033,6 +1040,14 @@ def _build_provenance(
 
 
 def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
+    text_padding = validate_text_padding(
+        cfg.model.get("text_padding", "legacy_visible")
+    )
+    for split in (cfg.data.train, cfg.data.validation):
+        if split.get("text_padding", "legacy_visible") != text_padding:
+            raise ValueError(
+                "BC model and both datasets must use the same text_padding."
+            )
     stage = str(cfg.runner.stage)
     allowed_stages = {"bc0", "bc1", "bc2", "pilot", "formal"}
     if stage not in allowed_stages:
@@ -1062,44 +1077,79 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
             "Manual Gloo synchronization is reserved for Host-B rank-16 BC."
         )
 
-    expected_parent = (
-        "/XYFS02/HDD_POOL/nju_shklu/nju_shklu_1/"
-        "When-will-inference-time-prediction-beneficial-/"
-        "fastwam-idm-wan-robot-init/"
-        "fastwam-idm-libero-wan-robot-init-step_021700.pt"
-    )
-    if str(cfg.parent.checkpoint) != expected_parent or (
-        str(cfg.parent.checkpoint_sha256)
-        != "e979511a2d7a1310009496c6b2f06957171bba28b96aac0d513992c6ed21ca5a"
-    ):
-        raise ValueError("UNCOND BC parent path/hash differs from the approved parent.")
-    expected_stats = str(Path(expected_parent).with_name("dataset_stats.json"))
-    if str(cfg.parent.statistics) != expected_stats or (
-        str(cfg.parent.statistics_sha256)
-        != "30f81ad7d5076e97323e3328bce003e01a04cb21327b5bacd21bb72846768638"
-    ):
-        raise ValueError("UNCOND BC statistics path/hash differs from the parent.")
-    if (
-        int(cfg.data.expected_train_episodes) != 1539
-        or int(cfg.data.expected_validation_episodes) != 173
-    ):
-        raise ValueError("UNCOND BC episode split counts changed.")
-    if (
-        int(cfg.data.expected_source_episodes) != 1712
-        or int(cfg.data.expected_source_transitions) != 277713
-    ):
-        raise ValueError("UNCOND BC source-corpus counts changed.")
-    dataset_suite_names = [
-        Path(str(path)).name for path in cfg.provenance.dataset_paths
-    ]
-    if dataset_suite_names != [
-        "libero_spatial_no_noops_lerobot",
-        "libero_object_no_noops_lerobot",
-        "libero_goal_no_noops_lerobot",
-        "libero_10_no_noops_lerobot",
-    ]:
-        raise ValueError("UNCOND BC must use the approved four LIBERO suites in order.")
+    if text_padding == "legacy_visible":
+        expected_parent = (
+            "/XYFS02/HDD_POOL/nju_shklu/nju_shklu_1/"
+            "When-will-inference-time-prediction-beneficial-/"
+            "fastwam-idm-wan-robot-init/"
+            "fastwam-idm-libero-wan-robot-init-step_021700.pt"
+        )
+        if str(cfg.parent.checkpoint) != expected_parent or (
+            str(cfg.parent.checkpoint_sha256)
+            != "e979511a2d7a1310009496c6b2f06957171bba28b96aac0d513992c6ed21ca5a"
+        ):
+            raise ValueError(
+                "UNCOND BC parent path/hash differs from the approved parent."
+            )
+        expected_stats = str(Path(expected_parent).with_name("dataset_stats.json"))
+        if str(cfg.parent.statistics) != expected_stats or (
+            str(cfg.parent.statistics_sha256)
+            != "30f81ad7d5076e97323e3328bce003e01a04cb21327b5bacd21bb72846768638"
+        ):
+            raise ValueError("UNCOND BC statistics path/hash differs from the parent.")
+        if (
+            int(cfg.data.expected_train_episodes) != 1539
+            or int(cfg.data.expected_validation_episodes) != 173
+        ):
+            raise ValueError("UNCOND BC episode split counts changed.")
+        if (
+            int(cfg.data.expected_source_episodes) != 1712
+            or int(cfg.data.expected_source_transitions) != 277713
+        ):
+            raise ValueError("UNCOND BC source-corpus counts changed.")
+        dataset_suite_names = [
+            Path(str(path)).name for path in cfg.provenance.dataset_paths
+        ]
+        if dataset_suite_names != [
+            "libero_spatial_no_noops_lerobot",
+            "libero_object_no_noops_lerobot",
+            "libero_goal_no_noops_lerobot",
+            "libero_10_no_noops_lerobot",
+        ]:
+            raise ValueError(
+                "UNCOND BC must use the approved four LIBERO suites in order."
+            )
+    else:
+        for key in (
+            "checkpoint",
+            "checkpoint_sha256",
+            "statistics",
+            "statistics_sha256",
+        ):
+            if not str(cfg.parent[key]).strip():
+                raise ValueError(f"EasyWAM BC requires parent.{key}.")
+        expected_stats = str(cfg.parent.statistics)
+        train_episodes = int(cfg.data.expected_train_episodes)
+        validation_episodes = int(cfg.data.expected_validation_episodes)
+        if (
+            min(train_episodes, validation_episodes) < 1
+            or int(cfg.data.expected_source_episodes)
+            != train_episodes + validation_episodes
+            or int(cfg.data.expected_source_transitions) < 1
+        ):
+            raise ValueError(
+                "EasyWAM BC requires the actual positive source/split counts."
+            )
+        if (
+            not cfg.provenance.dataset_paths
+            or not str(cfg.provenance.text_cache_path).strip()
+        ):
+            raise ValueError(
+                "EasyWAM BC requires dataset paths and its masked text cache."
+            )
     for split in (cfg.data.train, cfg.data.validation):
+        if float(split.val_set_proportion) != 0.1:
+            raise ValueError("UNCOND BC requires the 90/10 episode split.")
         if str(split.pretrained_norm_stats) != expected_stats:
             raise ValueError("Every BC split must reuse the parent statistics.")
         if bool(split.processor.use_stepwise_action_norm) or (

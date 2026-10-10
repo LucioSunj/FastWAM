@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import torch
@@ -91,7 +92,7 @@ def test_text_context_is_loaded_once_and_keeps_wan_mask_semantics(
     tmp_path: Path,
 ) -> None:
     prompt = "A video prompt"
-    hashed = dataset_module.hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     cache_path = tmp_path / f"{hashed}.t5_len3.wan22ti2v5b.pt"
     torch.save(
         {
@@ -111,6 +112,7 @@ def test_text_context_is_loaded_once_and_keeps_wan_mask_semantics(
     dataset = RobotVideoDataset.__new__(RobotVideoDataset)
     dataset.text_embedding_cache_dir = str(tmp_path)
     dataset.context_len = 3
+    dataset.text_padding = "legacy_visible"
     dataset._text_context_cache = {}
 
     first_context, first_mask = dataset._get_cached_text_context(prompt)

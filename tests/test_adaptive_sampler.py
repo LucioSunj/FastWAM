@@ -326,28 +326,82 @@ def test_pre_fix_gate_capture_is_sampler_numerically_read_only(
     assert torch.equal(tapped_rng_state, plain_rng_state)
 
 
-def test_eval_sampling_can_omit_replay_chain_and_log_probs():
-    initial = torch.zeros(2, 3, 4)
-    timesteps = torch.tensor([1000.0, 500.0])
-    deltas = torch.tensor([-0.5, -0.5])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize(
+    ("initial_dtype", "velocity_dtype"),
+    [
+        (torch.float32, torch.float32),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+    ],
+)
+def test_eval_sampling_can_omit_replay_chain_and_log_probs(
+    batch_size, initial_dtype, velocity_dtype
+):
+    _, timesteps, deltas = _schedule(num_steps=20)
+    initial = torch.linspace(-1, 1, batch_size * 12).reshape(batch_size, 3, 4)
+    initial = initial.to(dtype=initial_dtype)
+    generator = torch.Generator().manual_seed(42)
+    initial_rng_state = generator.get_state().clone()
 
+    def velocity_fn(x_t, timestep):
+        assert timestep.dtype == x_t.dtype
+        velocity = x_t.to(dtype=velocity_dtype) * 0.125
+        velocity = velocity + timestep.to(dtype=velocity_dtype).view(-1, 1, 1) / 1000
+        return VelocityOutput(velocity, gate_tap=x_t.clone())
+
+    common = {
+        "velocity_fn": velocity_fn,
+        "timesteps": timesteps,
+        "scheduler_deltas": deltas,
+        "num_train_timesteps": 1000,
+        "noise_level": 0.5,
+        "stochastic": False,
+        "gate_last_n": 3,
+        "generator": generator,
+    }
+    baseline = sample_action_flow_sde(initial, collect_replay=True, **common)
+    assert torch.equal(generator.get_state(), initial_rng_state)
     rollout = sample_action_flow_sde(
         initial,
-        velocity_fn=lambda x_t, _t: VelocityOutput(
-            torch.ones_like(x_t), gate_tap={"batch": x_t.shape[0]}
-        ),
-        timesteps=timesteps,
-        scheduler_deltas=deltas,
-        num_train_timesteps=1000,
-        noise_level=0.5,
-        stochastic=False,
-        gate_last_n=1,
         collect_replay=False,
+        **common,
     )
 
-    assert rollout.chains.shape == (2, 0, 3, 4)
-    assert rollout.old_log_probs.shape == (2, 0)
-    assert len(rollout.gate_taps) == 1
+    assert torch.equal(rollout.actions, baseline.actions)
+    assert torch.equal(rollout.denoise_indices, baseline.denoise_indices)
+    assert torch.equal(generator.get_state(), initial_rng_state)
+    assert rollout.chains.shape == (batch_size, 0, 3, 4)
+    assert rollout.old_log_probs.shape == (batch_size, 0)
+    assert len(rollout.gate_taps) == len(baseline.gate_taps) == 3
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(rollout.gate_taps, baseline.gate_taps)
+    )
+
+
+@pytest.mark.parametrize(
+    ("bad_delta", "message"),
+    [
+        (float("nan"), "only finite"),
+        (float("inf"), "only finite"),
+        (0.0, "strictly decreasing"),
+        (0.1, "strictly decreasing"),
+    ],
+)
+def test_eval_sampling_preserves_schedule_validation(bad_delta, message):
+    for collect_replay in (True, False):
+        with pytest.raises(ValueError, match=message):
+            sample_action_flow_sde(
+                torch.zeros(1, 3, 4),
+                velocity_fn=lambda x_t, _t: torch.ones_like(x_t),
+                timesteps=torch.tensor([1000.0, 500.0]),
+                scheduler_deltas=torch.tensor([-0.5, bad_delta]),
+                num_train_timesteps=1000,
+                noise_level=0.5,
+                stochastic=False,
+                collect_replay=collect_replay,
+            )
 
 
 def test_bfloat16_actions_use_fp32_default_schedule_through_final_sde_step():

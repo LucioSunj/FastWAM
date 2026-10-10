@@ -1,0 +1,33 @@
+# @package _global_
+
+defaults:
+  - libero_uncond_lora_bc_video_action_rank128
+  - _self_
+
+# Fill these from the exported EasyWAM IDM parent and the shared LIBERO corpus.
+parent:
+  checkpoint: ???
+  checkpoint_sha256: ???
+  statistics: ???
+  statistics_sha256: ???
+
+provenance:
+  dataset_paths: ???
+  text_cache_path: ???
+  verified_manifest: null
+
+runner:
+  output_dir: ${oc.env:FASTWAM_BC_OUTPUT_DIR,./runs/uncond_bc_easywam/${now:%Y-%m-%d}_${now:%H-%M-%S}}
+
+model:
+  text_padding: masked
+
+data:
+  expected_train_episodes: ???
+  expected_validation_episodes: ???
+  expected_source_episodes: ???
+  expected_source_transitions: ???
+  train:
+    text_padding: ${model.text_padding}
+  validation:
+    text_padding: ${model.text_padding}

@@ -521,7 +521,7 @@ class WanVideoDiT(torch.nn.Module):
         if self.video_attention_mask_mode == "first_frame_causal":
             video_mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
             first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-            video_mask[:first_frame_tokens, first_frame_tokens:] = False
+            video_mask[:first_frame_tokens, first_frame_tokens:].zero_()
             return video_mask
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")
@@ -586,7 +586,7 @@ class WanVideoDiT(torch.nn.Module):
             # 关键一行: 第 0 帧(通常是 fuse 进去的干净 VAE 条件帧)的 timestep 强制置 0
             # 设计意图: 首帧作为"条件",其扩散前向/反向都从 t=0 出发,不参与加噪去噪,作为静态视觉锚点
             # 后续 T-1 帧仍按 timestep 去噪,实现"以首帧为条件生成后续帧"
-            token_timesteps[:, 0, :] = 0
+            token_timesteps[:, 0, :].zero_()
             # 拉平为 (B, T * tokens_per_frame),与接下来进入主循环的视频 token 序列一一对应
             token_timesteps = token_timesteps.reshape(batch_size, -1)
             # 对每个 token 的 timestep 单独做正弦位置式编码

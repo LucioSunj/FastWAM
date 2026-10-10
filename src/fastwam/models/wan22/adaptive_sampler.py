@@ -13,6 +13,7 @@ from .flow_sde import (
     flow_sde_mean_std,
     gaussian_log_prob,
     normalize_flow_time,
+    reverse_step_size,
 )
 
 
@@ -181,6 +182,13 @@ def sample_action_flow_sde(
     next_times = normalized_times + scheduler_deltas.to(
         device=device, dtype=torch.float32
     )
+    # Validate the fixed deterministic schedule once, before model calls. Keep
+    # time - (time + scheduler_delta) in FP32 to preserve the ODE's rounding.
+    ode_deltas = (
+        reverse_step_size(normalized_times, next_times)
+        if not stochastic and not collect_replay
+        else None
+    )
 
     if stochastic:
         if denoise_indices is None:
@@ -232,12 +240,21 @@ def sample_action_flow_sde(
         if step_idx >= gate_start:
             gate_taps.append(output.gate_tap)
 
-        ode_next = flow_ode_mean(
-            x_t,
-            output.velocity,
-            time=time,
-            next_time=next_time,
-        )
+        if ode_deltas is None:
+            ode_next = flow_ode_mean(
+                x_t,
+                output.velocity,
+                time=time,
+                next_time=next_time,
+            )
+        else:
+            delta = (
+                ode_deltas[step_idx]
+                .expand(batch_size)
+                .to(device=x_t.device, dtype=x_t.dtype)
+            )
+            delta = delta.view(batch_size, *([1] * (x_t.ndim - 1)))
+            ode_next = x_t - delta * output.velocity
         selected = denoise_indices == step_idx
         if stochastic and bool(selected.any()):
             mean, std = flow_sde_mean_std(

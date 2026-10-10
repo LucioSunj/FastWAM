@@ -7,6 +7,10 @@ import torch.nn.functional as F
 from PIL import Image
 
 from fastwam.utils.logging_config import get_logger
+from fastwam.utils.text_cache import (
+    validate_checkpoint_text_padding,
+    validate_text_padding,
+)
 
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
@@ -31,6 +35,7 @@ class FastWAM(RuntimePlacementMixin, torch.nn.Module):
         tokenizer=None,
         text_dim: Optional[int] = None,
         proprio_dim: Optional[int] = None,
+        text_padding: str = "legacy_visible",
         device: str = "cpu",
         torch_dtype: torch.dtype = torch.float32,
         video_train_shift: float = 5.0,
@@ -52,6 +57,7 @@ class FastWAM(RuntimePlacementMixin, torch.nn.Module):
         self.vae = vae
         self.text_encoder = text_encoder
         self.tokenizer = tokenizer
+        self.text_padding = validate_text_padding(text_padding)
         if text_dim is None:
             if self.text_encoder is None:
                 raise ValueError("`text_dim` is required when `text_encoder` is not loaded.")
@@ -100,6 +106,7 @@ class FastWAM(RuntimePlacementMixin, torch.nn.Module):
         tokenizer_max_len: int = 512,
         load_text_encoder: bool = True,
         proprio_dim: Optional[int] = None,
+        text_padding: str = "legacy_visible",
         redirect_common_files: bool = True,
         video_dit_config: dict[str, Any] | None = None,
         action_dit_config: dict[str, Any] | None = None,
@@ -161,6 +168,7 @@ class FastWAM(RuntimePlacementMixin, torch.nn.Module):
             tokenizer=components.tokenizer,
             text_dim=int(video_dit_config["text_dim"]),
             proprio_dim=proprio_dim,
+            text_padding=text_padding,
             device=device,
             torch_dtype=torch_dtype,
             video_train_shift=video_train_shift,
@@ -212,11 +220,12 @@ class FastWAM(RuntimePlacementMixin, torch.nn.Module):
         ids = ids.to(self.device)
         mask = mask.to(self.device, dtype=torch.bool)
         prompt_emb = self.text_encoder(ids, mask)
-        # FIXME: original implementation's zero padding is visible in cross-attn.
-        seq_lens = mask.gt(0).sum(dim=1).long()
-        for i, v in enumerate(seq_lens):
-            prompt_emb[i, v:] = 0
-        mask = torch.ones_like(mask)
+        if self.text_padding == "legacy_visible":
+            # Preserve the text semantics of historical FastWAM parents.
+            seq_lens = mask.gt(0).sum(dim=1).long()
+            for i, v in enumerate(seq_lens):
+                prompt_emb[i, v:] = 0
+            mask = torch.ones_like(mask)
         return prompt_emb.to(device=self.device), mask
 
     def _append_proprio_to_context(
@@ -1256,6 +1265,7 @@ class FastWAM(RuntimePlacementMixin, torch.nn.Module):
             "mot": self.mot.state_dict(),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "text_padding": self.text_padding,
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
@@ -1265,6 +1275,7 @@ class FastWAM(RuntimePlacementMixin, torch.nn.Module):
 
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
+        validate_checkpoint_text_padding(payload, self.text_padding)
         if "mot" in payload:
             self.mot.load_state_dict(payload["mot"], strict=False)
         elif "dit" in payload:
