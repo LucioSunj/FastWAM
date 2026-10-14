@@ -25,6 +25,8 @@ logger = get_logger(__name__)
 DEFAULT_PROMPT = "A video recorded from a robot's point of view executing the following instruction: {task}"
 
 class RobotVideoDataset(torch.utils.data.Dataset):
+    base_dataset_class = BaseLerobotDataset
+
     def __init__(
         self,
         dataset_dirs,
@@ -57,7 +59,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 "current_frame_image_only and current_frame_only are mutually exclusive."
             )
         self.strict_sample_loading = bool(strict_sample_loading)
-        self.lerobot_dataset = BaseLerobotDataset(
+        self.lerobot_dataset = self.base_dataset_class(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
             obs_size=num_frames,

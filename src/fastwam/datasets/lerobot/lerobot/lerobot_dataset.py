@@ -1082,6 +1082,8 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
     structure of `LeRobotDataset`.
     """
 
+    dataset_class = LeRobotDataset
+
     def __init__(
         self,
         dataset_dirs: list[str],
@@ -1104,7 +1106,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         self._datasets = []
         for ds_root, ds_name in zip(ds_roots, ds_names, strict=True):
             try:
-                _dataset = LeRobotDataset(
+                _dataset = self.dataset_class(
                     ds_name,
                     root=ds_root,
                     episodes=episodes[ds_name] if episodes else None,

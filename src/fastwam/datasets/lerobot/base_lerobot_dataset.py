@@ -15,6 +15,9 @@ logger = get_logger(__name__)
 MAX_GETITEM_ATTEMPT = 5
 
 class BaseLerobotDataset(torch.utils.data.Dataset):
+    metadata_class = LeRobotDatasetMetadata
+    multi_dataset_class = MultiLeRobotDataset
+
     def __init__(
         self,
         dataset_dirs: List[str],
@@ -60,7 +63,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         for ds_dir in dataset_dirs:
             ds_root = Path(ds_dir)
             repo_id = ds_dir
-            meta = LeRobotDatasetMetadata(repo_id=repo_id, root=ds_root)
+            meta = self.metadata_class(repo_id=repo_id, root=ds_root)
             metas.append(meta)
 
         fps_list = [m.fps for m in metas]
@@ -116,7 +119,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
                 else:
                     episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
 
-        self.multi_dataset = MultiLeRobotDataset(
+        self.multi_dataset = self.multi_dataset_class(
             dataset_dirs=self.dataset_dirs,
             episodes=episodes,
             delta_timestamps=delta_timestamps,
