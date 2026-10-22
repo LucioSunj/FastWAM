@@ -1039,7 +1039,76 @@ def _build_provenance(
     return contract, provenance
 
 
+def _validate_fr3_data_config(cfg: DictConfig) -> None:
+    """Keep FR3 joint targets, camera transforms and parent statistics aligned."""
+    if cfg.model.get("text_padding") != "masked":
+        raise ValueError("FR3 BC requires masked text padding.")
+    if int(cfg.lora.rank) != 128 or cfg.get("video_lora") is None:
+        raise ValueError("FR3 BC requires Video and Action rank-128 LoRA.")
+    for split in (cfg.data.train, cfg.data.validation):
+        expected = {
+            "num_frames": 17,
+            "global_sample_stride": 1,
+            "action_video_freq_ratio": 4,
+            "concat_multi_camera": "horizontal",
+            "current_frame_only": True,
+            "current_frame_image_only": False,
+        }
+        for key, value in expected.items():
+            if split.get(key) != value:
+                raise ValueError(f"FR3 BC requires data.{key}={value!r}.")
+        processor = split.processor
+        if (
+            list(split.video_size) != [224, 448]
+            or processor.action_output_dim != 8
+            or processor.proprio_output_dim != 8
+            or processor.num_obs_steps != 17
+            or processor.num_output_cameras != 2
+            or processor.get("delta_action_dim_mask") is not None
+            or processor.get("norm_exception_mode") is not None
+        ):
+            raise ValueError("FR3 BC requires the 17-step, 8-D two-camera processor.")
+        images = processor.shape_meta.images
+        if [image.key for image in images] != ["left", "wrist"] or any(
+            list(image.raw_shape) != [3, 480, 640] or list(image.shape) != [3, 224, 224]
+            for image in images
+        ):
+            raise ValueError("FR3 BC cameras must be left/wrist RGB 480x640.")
+        for field in ("action", "state"):
+            meta = processor.shape_meta[field]
+            if len(meta) != 1 or meta[0].key != "default" or meta[0].shape != 8:
+                raise ValueError(f"FR3 BC requires one 8-D default {field}.")
+        relative = processor.action_state_transforms
+        if (
+            len(relative) != 1
+            or relative[0].get("_target_")
+            != "fastwam.datasets.lerobot.transforms.relative_action.RelativeJointTransform"
+            or list(relative[0]["keys"]) != ["default"]
+            or relative[0].get("joint_dim") != 7
+        ):
+            raise ValueError(
+                "FR3 BC requires relative seven joints and absolute gripper."
+            )
+        expected_images = [
+            {"_target_": "fastwam.datasets.lerobot.transforms.image.ToTensor"},
+            {"_target_": "torchvision.transforms.Resize", "size": [168, 224]},
+            {
+                "_target_": "fastwam.datasets.lerobot.transforms.image.Pad",
+                "padding": [0, 28, 0, 28],
+            },
+        ]
+        for mode in ("train_transforms", "val_transforms"):
+            if OmegaConf.to_container(processor[mode], resolve=True) != expected_images:
+                raise ValueError("FR3 BC requires resize 168x224 then vertical pad 28.")
+
+
 def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
+    profile = str(cfg.get("profile", "libero"))
+    if profile not in {"libero", "fr3"}:
+        raise ValueError(f"Expected BC profile libero or fr3, got {profile!r}.")
+    fr3 = profile == "fr3"
+    if fr3:
+        _validate_fr3_data_config(cfg)
     text_padding = validate_text_padding(
         cfg.model.get("text_padding", "legacy_visible")
     )
@@ -1153,7 +1222,7 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         if str(split.pretrained_norm_stats) != expected_stats:
             raise ValueError("Every BC split must reuse the parent statistics.")
         if bool(split.processor.use_stepwise_action_norm) or (
-            str(split.processor.norm_default_mode) != "min/max"
+            str(split.processor.norm_default_mode) != ("z-score" if fr3 else "min/max")
         ):
             raise ValueError("BC action/state normalization contract changed.")
         repeats_current_frame = bool(split.get("current_frame_image_only", False))
@@ -1210,13 +1279,13 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
                     "Current-frame-only BC must fail closed on sample errors."
                 )
     expected_bc_shape = {
-        "action_horizon": 32,
-        "action_dim": 7,
+        "action_horizon": 16 if fr3 else 32,
+        "action_dim": 8 if fr3 else 7,
         "proprio_dim": 8,
         "expected_video_frames": expected_video_frames,
         "expected_video_height": 224,
         "expected_video_width": 448,
-        "gripper_dimension": 6,
+        "gripper_dimension": 7 if fr3 else 6,
     }
     observed_bc_shape = {key: int(cfg.bc_policy[key]) for key in expected_bc_shape}
     if observed_bc_shape != expected_bc_shape:
@@ -1229,69 +1298,92 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
     ):
         raise ValueError("UNCOND BC requires the 30-layer parent architecture.")
 
-    lora_rank = int(cfg.lora.rank)
-    expected_world_size = 6 if lora_rank == 32 else 4
-    if rank128 and world_size == 8:
-        expected_world_size = 8
-    expected_global_batch = 96 if lora_rank == 32 else 128
-    allowed_microbatches = (1, 2, 4, 8, 16, 32) if lora_rank == 16 else (1, 2, 4, 8)
-    expected_accumulation = {
-        microbatch: expected_global_batch // (expected_world_size * microbatch)
-        for microbatch in allowed_microbatches
-    }
-    microbatch = int(cfg.training.microbatch_size)
-    if microbatch not in expected_accumulation:
-        raise ValueError(
-            "BC microbatch is outside the approved rank-specific capacity ladder."
-        )
-    if stage in {"bc0", "bc1"}:
-        if world_size != 1:
+    if fr3:
+        microbatch = int(cfg.training.microbatch_size)
+        accumulation = int(cfg.training.gradient_accumulation_steps)
+        configured_world_size = int(cfg.training.world_size)
+        if min(world_size, microbatch, accumulation) < 1:
+            raise ValueError(
+                "FR3 BC world size, microbatch and accumulation must be positive."
+            )
+        if world_size != configured_world_size:
+            raise ValueError(
+                "FR3 BC launch world size differs from training.world_size."
+            )
+        if stage in {"bc0", "bc1"} and world_size != 1:
             raise ValueError(f"{stage} must run on exactly one GPU.")
-    elif world_size != expected_world_size:
-        allowed_world_sizes = "4 or 8" if rank128 else str(expected_world_size)
-        raise ValueError(
-            f"{stage} with LoRA rank {lora_rank} must run on exactly "
-            f"{allowed_world_sizes} GPUs."
-        )
-    if stage in {"bc2", "pilot", "formal"}:
-        expected = expected_accumulation[microbatch]
-        actual_accumulation = int(cfg.training.gradient_accumulation_steps)
-        if actual_accumulation != expected:
-            raise ValueError(
-                f"{expected_world_size}-GPU microbatch {microbatch} requires "
-                f"accumulation {expected}."
-            )
-        actual_global_batch = microbatch * world_size * actual_accumulation
-        if int(cfg.training.global_batch_size) != actual_global_batch:
-            raise ValueError(
-                "Effective global batch mismatch: expected "
-                f"{cfg.training.global_batch_size}, got {actual_global_batch}."
-            )
-        if int(cfg.training.global_batch_size) != expected_global_batch:
-            raise ValueError(
-                "The approved UNCOND BC experiment requires global batch "
-                f"{expected_global_batch} for LoRA rank {lora_rank}."
-            )
-        if lora_rank == 32 and (
-            int(cfg.data.num_workers) != 0
-            or int(cfg.data.prefetch_factor) != 1
-            or cfg.data.multiprocessing_context is not None
+        if microbatch * world_size * accumulation != int(
+            cfg.training.global_batch_size
         ):
             raise ValueError(
-                "Rank-32 BC requires zero extra DataLoader workers "
-                "per rank and prefetch factor one."
+                "FR3 BC effective global batch does not match the configured batch."
             )
-        if rank128:
-            loader_config = (
-                int(cfg.data.num_workers),
-                int(cfg.data.prefetch_factor),
-                cfg.data.multiprocessing_context,
+        if int(cfg.training.global_batch_size) != 128:
+            raise ValueError("FR3 rank-128 BC requires global batch 128.")
+    else:
+        lora_rank = int(cfg.lora.rank)
+        expected_world_size = 6 if lora_rank == 32 else 4
+        if rank128 and world_size == 8:
+            expected_world_size = 8
+        expected_global_batch = 96 if lora_rank == 32 else 128
+        allowed_microbatches = (1, 2, 4, 8, 16, 32) if lora_rank == 16 else (1, 2, 4, 8)
+        expected_accumulation = {
+            microbatch: expected_global_batch // (expected_world_size * microbatch)
+            for microbatch in allowed_microbatches
+        }
+        microbatch = int(cfg.training.microbatch_size)
+        if microbatch not in expected_accumulation:
+            raise ValueError(
+                "BC microbatch is outside the approved rank-specific capacity ladder."
             )
-            if loader_config not in {(0, 1, None), (8, 2, "spawn")}:
+        if stage in {"bc0", "bc1"}:
+            if world_size != 1:
+                raise ValueError(f"{stage} must run on exactly one GPU.")
+        elif world_size != expected_world_size:
+            allowed_world_sizes = "4 or 8" if rank128 else str(expected_world_size)
+            raise ValueError(
+                f"{stage} with LoRA rank {lora_rank} must run on exactly "
+                f"{allowed_world_sizes} GPUs."
+            )
+        if stage in {"bc2", "pilot", "formal"}:
+            expected = expected_accumulation[microbatch]
+            actual_accumulation = int(cfg.training.gradient_accumulation_steps)
+            if actual_accumulation != expected:
                 raise ValueError(
-                    "Rank-128 BC supports zero workers or eight spawn workers "
-                    "with prefetch factor two."
+                    f"{expected_world_size}-GPU microbatch {microbatch} requires "
+                    f"accumulation {expected}."
                 )
+            actual_global_batch = microbatch * world_size * actual_accumulation
+            if int(cfg.training.global_batch_size) != actual_global_batch:
+                raise ValueError(
+                    "Effective global batch mismatch: expected "
+                    f"{cfg.training.global_batch_size}, got {actual_global_batch}."
+                )
+            if int(cfg.training.global_batch_size) != expected_global_batch:
+                raise ValueError(
+                    "The approved UNCOND BC experiment requires global batch "
+                    f"{expected_global_batch} for LoRA rank {lora_rank}."
+                )
+            if lora_rank == 32 and (
+                int(cfg.data.num_workers) != 0
+                or int(cfg.data.prefetch_factor) != 1
+                or cfg.data.multiprocessing_context is not None
+            ):
+                raise ValueError(
+                    "Rank-32 BC requires zero extra DataLoader workers "
+                    "per rank and prefetch factor one."
+                )
+            if rank128:
+                loader_config = (
+                    int(cfg.data.num_workers),
+                    int(cfg.data.prefetch_factor),
+                    cfg.data.multiprocessing_context,
+                )
+                if loader_config not in {(0, 1, None), (8, 2, "spawn")}:
+                    raise ValueError(
+                        "Rank-128 BC supports zero workers or eight spawn workers "
+                        "with prefetch factor two."
+                    )
     if stage == "bc1" and not bool(cfg.runner.single_gpu_diagnostic):
         raise ValueError("BC1 requires runner.single_gpu_diagnostic=true.")
     if stage != "bc1" and bool(cfg.runner.single_gpu_diagnostic):
@@ -1339,6 +1431,11 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
     elif stage == "pilot":
         if int(max_steps or -1) != 1000 or stop_after is not None:
             raise ValueError("Each BC LR pilot must run exactly 1000 optimizer steps.")
+    elif fr3 and stage == "formal":
+        if max_steps is not None and int(max_steps) < 1:
+            raise ValueError("FR3 training.max_steps must be positive when set.")
+        if stop_after is not None and int(stop_after) < 1:
+            raise ValueError("FR3 stop_after_steps must be positive when set.")
     elif stage in {"bc0", "formal"} and (
         max_steps is not None or stop_after is not None
     ):

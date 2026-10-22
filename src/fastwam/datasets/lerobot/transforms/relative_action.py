@@ -82,8 +82,23 @@ class RelativePoseTransform:
     
 
 class RelativeJointTransform:
-    def __init__(self, keys: List[str]):
+    def __init__(self, keys: List[str], joint_dim: int | None = None):
         self.keys = keys
+        if joint_dim is not None and joint_dim <= 0:
+            raise ValueError(f"joint_dim must be positive, got {joint_dim}.")
+        self.joint_dim = joint_dim
+
+    def _transform(self, action: torch.Tensor, state: torch.Tensor, sign: int):
+        joint_dim = action.shape[-1] if self.joint_dim is None else self.joint_dim
+        if joint_dim > min(action.shape[-1], state.shape[-1]):
+            raise ValueError(
+                f"joint_dim={joint_dim} exceeds action/state dimensions "
+                f"{action.shape[-1]}/{state.shape[-1]}."
+            )
+        result = action.clone()
+        # Every target is relative to the same observation; gripper stays absolute.
+        result[..., :joint_dim] += sign * state[..., :1, :joint_dim]
+        return result
 
     def forward(self, batch: Dict):
         # for close-loop eval, "action" may not be in batch
@@ -91,14 +106,16 @@ class RelativeJointTransform:
             return batch
         
         for k in self.keys:
-            # NOTE: fixed to the first frame
-            batch["action"][k] = batch["action"][k] - batch["state"][k][..., :1, :]
+            batch["action"][k] = self._transform(
+                batch["action"][k], batch["state"][k], -1
+            )
 
         return batch
 
     def backward(self, batch: Dict):
         for k in self.keys:
-            # NOTE: fixed to the first frame
-            batch["action"][k] = batch["action"][k] + batch["state"][k][..., :1, :]
+            batch["action"][k] = self._transform(
+                batch["action"][k], batch["state"][k], 1
+            )
         
         return batch

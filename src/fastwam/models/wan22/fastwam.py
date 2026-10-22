@@ -1,7 +1,7 @@
 from typing import Any, Optional, Sequence, Union
 
 import torch
-import torch.cuda.nvtx as nvtx
+from fastwam.utils import nvtx
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image

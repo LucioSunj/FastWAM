@@ -7,7 +7,7 @@ from typing import Any
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.cuda import nvtx
+from fastwam.utils import nvtx
 
 from fastwam.utils.logging_config import get_logger
 

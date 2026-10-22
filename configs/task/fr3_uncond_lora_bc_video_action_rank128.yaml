@@ -1,0 +1,64 @@
+# @package _global_
+
+defaults:
+  - libero_uncond_lora_bc_easywam
+  - _self_
+
+profile: fr3
+
+training:
+  world_size: 1
+  microbatch_size: 1
+  gradient_accumulation_steps: 128
+  global_batch_size: 128
+
+bc_policy:
+  action_horizon: 16
+  action_dim: 8
+  proprio_dim: 8
+  expected_video_frames: 1
+  expected_video_height: 224
+  expected_video_width: 448
+  gripper_dimension: 7
+
+model:
+  action_dit_config:
+    action_dim: 8
+  video_dit_config:
+    action_dim: 8
+
+data:
+  train:
+    shape_meta:
+      images:
+        - {key: left, raw_shape: [3, 480, 640], shape: [3, 224, 224]}
+        - {key: wrist, raw_shape: [3, 480, 640], shape: [3, 224, 224]}
+      action:
+        - {key: default, raw_shape: 8, shape: 8}
+      state:
+        - {key: default, raw_shape: 8, shape: 8}
+    num_frames: 17
+    processor:
+      num_obs_steps: 17
+      num_image_obs_steps: 1
+      action_output_dim: 8
+      proprio_output_dim: 8
+      norm_default_mode: z-score
+      use_stepwise_action_norm: false
+      delta_action_dim_mask: null
+      action_state_transforms:
+        - _target_: fastwam.datasets.lerobot.transforms.relative_action.RelativeJointTransform
+          keys: [default]
+          joint_dim: 7
+      train_transforms:
+        - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+        - _target_: torchvision.transforms.Resize
+          size: [168, 224]
+        - _target_: fastwam.datasets.lerobot.transforms.image.Pad
+          padding: [0, 28, 0, 28]
+      val_transforms:
+        - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+        - _target_: torchvision.transforms.Resize
+          size: [168, 224]
+        - _target_: fastwam.datasets.lerobot.transforms.image.Pad
+          padding: [0, 28, 0, 28]
