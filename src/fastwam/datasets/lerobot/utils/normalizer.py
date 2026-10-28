@@ -23,7 +23,8 @@ class LinearNormalizer:
             use_stepwise_action_norm,
             default_mode: NormMode, 
             exception_mode: Dict[str, Dict[str, NormMode]], 
-            stats: Dict[str, Dict[str, Dict[str, torch.Tensor]]]
+            stats: Dict[str, Dict[str, Dict[str, torch.Tensor]]],
+            action_clip_range: tuple[float, float] | None = (-5.0, 5.0),
         ):
         super().__init__()
         self.normalizers = {"action": {}, "state": {}}
@@ -45,6 +46,7 @@ class LinearNormalizer:
             self.normalizers["action"][key] = SingleFieldLinearNormalizer(
                 stats=cur_stats, 
                 mode=cur_mode,
+                clip_range=action_clip_range,
             )
 
         for meta in shape_meta["state"]:
@@ -93,9 +95,13 @@ class SingleFieldLinearNormalizer:
     range_tol = 1e-4
     output_max = 1.0
     output_min = -1.0
-    def __init__(self, stats, mode: NormMode="min/max"):
+    def __init__(
+        self, stats, mode: NormMode = "min/max",
+        clip_range: tuple[float, float] | None = (-5.0, 5.0),
+    ):
         self.stats = stats
         self.mode = mode
+        self.clip_range = clip_range
 
         if mode == "z-score":
             input_mean, input_std = stats["mean"], stats["std"]
@@ -126,7 +132,8 @@ class SingleFieldLinearNormalizer:
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x * self.scale + self.offset
-        x = torch.clamp(x, -5.0, 5.0)
+        if self.clip_range is not None:
+            x = torch.clamp(x, *self.clip_range)
         return x
     def backward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x - self.offset) / self.scale
