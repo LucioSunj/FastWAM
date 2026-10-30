@@ -1,15 +1,15 @@
-from typing import Literal, Dict, Annotated, Union, Any, List, Tuple, Optional
-import torch
+import hashlib
 import json
 from collections import defaultdict
-import numpy as np
-from omegaconf import DictConfig, OmegaConf
-import hashlib
 from pathlib import Path
-from git import Repo
-from fastwam.utils.logging_config import get_logger
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 
+import numpy as np
+import torch
+from fastwam.utils.logging_config import get_logger
 from fastwam.utils.pytorch_utils import dict_apply
+from git import Repo
+from omegaconf import DictConfig, OmegaConf
 
 logger = get_logger(__name__)
 
@@ -25,10 +25,13 @@ class LinearNormalizer:
             exception_mode: Dict[str, Dict[str, NormMode]], 
             stats: Dict[str, Dict[str, Dict[str, torch.Tensor]]],
             action_clip_range: tuple[float, float] | None = (-5.0, 5.0),
+            state_clip_range: tuple[float, float] | None = (-5.0, 5.0),
+            binary_dims: Optional[Dict[str, Dict[str, List[int]]]] = None,
         ):
         super().__init__()
         self.normalizers = {"action": {}, "state": {}}
         self.stats = stats
+        binary_dims = {} if binary_dims is None else binary_dims
 
         for meta in shape_meta["action"]:
             key = meta["key"]
@@ -47,6 +50,7 @@ class LinearNormalizer:
                 stats=cur_stats, 
                 mode=cur_mode,
                 clip_range=action_clip_range,
+                binary_dims=binary_dims.get("action", {}).get(key),
             )
 
         for meta in shape_meta["state"]:
@@ -61,6 +65,8 @@ class LinearNormalizer:
             self.normalizers["state"][key] = SingleFieldLinearNormalizer(
                 stats=cur_stats, 
                 mode=cur_mode,
+                clip_range=state_clip_range,
+                binary_dims=binary_dims.get("state", {}).get(key),
             )
 
     def get_stats(self):
@@ -98,10 +104,12 @@ class SingleFieldLinearNormalizer:
     def __init__(
         self, stats, mode: NormMode = "min/max",
         clip_range: tuple[float, float] | None = (-5.0, 5.0),
+        binary_dims: Optional[List[int]] = None,
     ):
         self.stats = stats
         self.mode = mode
         self.clip_range = clip_range
+        self.binary_dims = [] if binary_dims is None else list(binary_dims)
 
         if mode == "z-score":
             input_mean, input_std = stats["mean"], stats["std"]
@@ -127,13 +135,25 @@ class SingleFieldLinearNormalizer:
 
         self.scale = scale
         self.offset = offset
+        if self.binary_dims:
+            self.scale = self.scale.clone()
+            self.offset = self.offset.clone()
+            self.scale[..., self.binary_dims] = 2.0
+            self.offset[..., self.binary_dims] = -1.0
     def get_stats(self):
         return self.stats
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        binary_values = x[..., self.binary_dims] if self.binary_dims else None
+        if binary_values is not None and not torch.logical_or(
+            binary_values == 0, binary_values == 1
+        ).all():
+            raise ValueError("Binary dimensions must contain exact finite 0/1 values.")
         x = x * self.scale + self.offset
         if self.clip_range is not None:
             x = torch.clamp(x, *self.clip_range)
+        if binary_values is not None:
+            x[..., self.binary_dims] = binary_values * 2 - 1
         return x
     def backward(self, x: torch.Tensor) -> torch.Tensor:
         x = (x - self.offset) / self.scale

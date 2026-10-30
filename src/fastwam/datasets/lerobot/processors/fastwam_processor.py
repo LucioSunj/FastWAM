@@ -1,12 +1,12 @@
-from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List, Literal
-
-import torch
-import numpy as np
 from copy import deepcopy
-from ..utils.normalizer import LinearNormalizer, NormMode
-from fastwam.utils.pytorch_utils import dict_apply
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import torch
 from fastwam.utils.logging_config import get_logger
+from fastwam.utils.pytorch_utils import dict_apply
+
+from ..utils.normalizer import LinearNormalizer, NormMode
 from .base_processor import BaseProcessor
 
 logger = get_logger(__name__)
@@ -43,6 +43,8 @@ class FastWAMProcessor(BaseProcessor):
         tokenizer: Optional[Any] = None,
         delta_action_dim_mask: Optional[Dict[str, List[bool]]] = None,
         action_clip_range: tuple[float, float] | None = (-5.0, 5.0),
+        state_clip_range: tuple[float, float] | None = (-5.0, 5.0),
+        binary_dims: Optional[Dict[str, Dict[str, List[int]]]] = None,
     ):
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
@@ -72,6 +74,8 @@ class FastWAMProcessor(BaseProcessor):
 
         self.use_stepwise_action_norm = use_stepwise_action_norm
         self.action_clip_range = action_clip_range
+        self.state_clip_range = state_clip_range
+        self.binary_dims = binary_dims
         self.norm_default_mode = norm_default_mode
         self.norm_exception_mode = norm_exception_mode
         self._normalizer = None
@@ -127,6 +131,8 @@ class FastWAMProcessor(BaseProcessor):
             exception_mode=self.norm_exception_mode,
             stats=dataset_stats,
             action_clip_range=self.action_clip_range,
+            state_clip_range=self.state_clip_range,
+            binary_dims=self.binary_dims,
         )
 
     def augment_instruction(self, data: Dict[str, str] | List[str]) -> List[str]:

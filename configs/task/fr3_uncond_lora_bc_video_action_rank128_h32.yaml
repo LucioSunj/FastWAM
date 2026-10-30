@@ -1,0 +1,15 @@
+# @package _global_
+
+defaults:
+  - fr3_uncond_lora_bc_video_action_rank128
+  - _self_
+
+# The source IDM uses nine video frames. BC consumes the current frame only.
+bc_policy:
+  action_horizon: 32
+
+data:
+  train:
+    num_frames: 33
+    processor:
+      num_obs_steps: 33

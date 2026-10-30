@@ -6,10 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
-from torch import nn
-
 from fastwam import uncond_bc_trainer
 from fastwam.uncond_bc_trainer import (
     DistributedEvalSampler,
@@ -31,6 +27,9 @@ from fastwam.uncond_bc_trainer import (
     load_strict_fastwam_parent,
     record_uncond_bc_failure,
 )
+from hydra import compose, initialize_config_dir
+from omegaconf import OmegaConf
+from torch import nn
 
 
 def _compose_config(*, task: str | None = None):
@@ -38,6 +37,82 @@ def _compose_config(*, task: str | None = None):
     with initialize_config_dir(version_base="1.3", config_dir=str(config_dir)):
         overrides = [] if task is None else [f"task={task}"]
         return compose(config_name="uncond_bc", overrides=overrides)
+
+
+@pytest.mark.parametrize("horizon", [16, 32])
+def test_fr3_bc_horizon_matches_both_dataset_windows(horizon) -> None:
+    task = "fr3_uncond_lora_bc_video_action_rank128"
+    if horizon == 32:
+        task += "_h32"
+    cfg = _compose_config(task=task)
+    cfg.parent = {
+        "checkpoint": "/parent.pt",
+        "checkpoint_sha256": "parent",
+        "statistics": "/dataset_stats.json",
+        "statistics_sha256": "statistics",
+    }
+    cfg.provenance.dataset_paths = ["/fr3_insert_tubes"]
+    cfg.provenance.text_cache_path = "/text_cache"
+    cfg.data.expected_train_episodes = 269
+    cfg.data.expected_validation_episodes = 30
+    cfg.data.expected_source_episodes = 299
+    cfg.data.expected_source_transitions = 132292
+    _validate_training_config(cfg, world_size=1)
+    assert cfg.bc_policy.action_horizon == horizon
+    assert cfg.data.train.num_frames == horizon + 1
+    assert cfg.data.validation.processor.num_obs_steps == horizon + 1
+    assert cfg.bc_policy.expected_video_frames == 1
+    cfg.data.validation.num_frames = 17 if horizon == 32 else 33
+    with pytest.raises(ValueError, match="num_frames"):
+        _validate_training_config(cfg, world_size=1)
+
+
+def test_fr3_full_corpus_training_has_no_validation_loader(monkeypatch) -> None:
+    cfg = _compose_config(task="fr3_uncond_lora_bc_video_action_rank128_h32")
+    cfg.parent = {
+        "checkpoint": "/parent.pt",
+        "checkpoint_sha256": "parent",
+        "statistics": "/dataset_stats.json",
+        "statistics_sha256": "statistics",
+    }
+    cfg.provenance.dataset_paths = ["/fr3_insert_tubes"]
+    cfg.provenance.text_cache_path = "/text_cache"
+    cfg.data.expected_train_episodes = 299
+    cfg.data.expected_validation_episodes = 0
+    cfg.data.expected_source_episodes = 299
+    cfg.data.expected_source_transitions = 132292
+    cfg.data.validation = None
+    cfg.data.train.val_set_proportion = 0.0
+    cfg.data.num_workers = 0
+    cfg.training.max_epochs = 4
+    cfg.training.minimum_epochs = 4
+    cfg.training.early_stopping_patience = None
+    _validate_training_config(cfg, world_size=1)
+
+    constructed = []
+
+    def instantiate_train(dataset_cfg, *, expected_seed):
+        constructed.append((dataset_cfg.val_set_proportion, expected_seed))
+        return list(range(256))
+
+    monkeypatch.setattr(uncond_bc_trainer, "_instantiate_bc_dataset", instantiate_train)
+    train, validation = uncond_bc_trainer._build_datasets(cfg)
+    assert constructed == [(0.0, 42)]
+    assert len(train) == 256 and validation is None
+    train_loader, validation_loader, _ = uncond_bc_trainer._build_loaders(
+        cfg, train_dataset=train, validation_dataset=validation, rank=0, world_size=1
+    )
+    assert len(train_loader.dataset) == 256
+    assert validation_loader is None
+    assert _dataset_summary(validation) == {"episodes": 0, "windows": 0, "suites": []}
+
+    cfg.training.early_stopping_patience = 2
+    with pytest.raises(ValueError, match="schedule"):
+        _validate_training_config(cfg, world_size=1)
+    cfg.training.early_stopping_patience = None
+    cfg.data.train.val_set_proportion = 0.1
+    with pytest.raises(ValueError, match="val_set_proportion=0.0"):
+        _validate_training_config(cfg, world_size=1)
 
 
 def test_uncond_bc_hydra_preset_is_isolated_and_parent_bound() -> None:
@@ -666,6 +741,24 @@ def test_checkpoint_retention_prunes_only_older_known_training_state(
         )
 
 
+def test_epoch_retention_survives_later_step_and_epoch_saves(tmp_path) -> None:
+    first = tmp_path / "epoch_01_step_001033.pt"
+    old_step = tmp_path / "step_001000.pt"
+    latest_step = tmp_path / "step_001500.pt"
+    for path in (first, old_step, latest_step):
+        path.write_bytes(path.name.encode())
+    assert _prune_training_checkpoints(
+        tmp_path, keep_path=latest_step, keep_last=1, keep_every_epoch=True
+    ) == [old_step.name]
+    assert first.exists() and latest_step.exists()
+    second = tmp_path / "epoch_02_step_002066.pt"
+    second.write_bytes(b"epoch2")
+    assert _prune_training_checkpoints(
+        tmp_path, keep_path=second, keep_last=1, keep_every_epoch=True
+    ) == [latest_step.name]
+    assert first.exists() and second.exists()
+
+
 def _patch_checkpoint_dependencies(
     monkeypatch,
     *,
@@ -729,11 +822,11 @@ def test_save_checkpoint_inspects_before_pruning(monkeypatch, tmp_path) -> None:
         events.append("inspect")
         return {"result": "PASS", "global_step": 500}
 
-    def prune(directory, *, keep_path, keep_last):
+    def prune(directory, *, keep_path, keep_last, keep_every_epoch):
         assert events == ["save", "inspect"]
         assert Path(directory) == target.parent
         assert Path(keep_path) == target
-        assert keep_last == 1
+        assert keep_last == 1 and not keep_every_epoch
         events.append("prune")
         return ["step_000001.pt"]
 
@@ -754,6 +847,7 @@ def test_save_checkpoint_inspects_before_pruning(monkeypatch, tmp_path) -> None:
     assert events == ["save", "inspect", "prune", "barrier"]
     assert report["checkpoint_retention"] == {
         "keep_last": 1,
+        "keep_every_epoch": False,
         "kept": target.name,
         "pruned": ["step_000001.pt"],
     }

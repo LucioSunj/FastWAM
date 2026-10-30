@@ -438,14 +438,18 @@ def _build_datasets(cfg: DictConfig):
         _instantiate_bc_dataset(cfg.data.train, expected_seed=int(cfg.seed)),
         namespace="train-seed42",
     )
-    validation = SampleIdentityDataset(
-        _instantiate_bc_dataset(cfg.data.validation, expected_seed=int(cfg.seed)),
-        namespace="validation-seed42",
-    )
+    validation = None
+    if cfg.data.validation is not None:
+        validation = SampleIdentityDataset(
+            _instantiate_bc_dataset(cfg.data.validation, expected_seed=int(cfg.seed)),
+            namespace="validation-seed42",
+        )
     return train, validation
 
 
-def _dataset_summary(dataset: SampleIdentityDataset) -> dict[str, Any]:
+def _dataset_summary(dataset: SampleIdentityDataset | None) -> dict[str, Any]:
+    if dataset is None:
+        return {"episodes": 0, "windows": 0, "suites": []}
     underlying = dataset.dataset
     lerobot = getattr(underlying, "lerobot_dataset", None)
     multi = getattr(lerobot, "multi_dataset", None)
@@ -485,11 +489,6 @@ def _build_loaders(
         seed=int(cfg.seed),
         drop_last=True,
     )
-    validation_sampler = DistributedEvalSampler(
-        validation_dataset,
-        rank=rank,
-        world_size=world_size,
-    )
     common = {
         "batch_size": int(cfg.training.microbatch_size),
         "num_workers": int(cfg.data.num_workers),
@@ -504,7 +503,6 @@ def _build_loaders(
         if multiprocessing_context is not None:
             common["multiprocessing_context"] = str(multiprocessing_context)
     train_generator = torch.Generator().manual_seed(int(cfg.seed))
-    validation_generator = torch.Generator().manual_seed(int(cfg.validation.seed))
     train_loader = DataLoader(
         train_dataset,
         sampler=train_sampler,
@@ -512,13 +510,17 @@ def _build_loaders(
         generator=train_generator,
         **common,
     )
-    validation_loader = DataLoader(
-        validation_dataset,
-        sampler=validation_sampler,
-        drop_last=False,
-        generator=validation_generator,
-        **common,
-    )
+    validation_loader = None
+    if validation_dataset is not None:
+        validation_loader = DataLoader(
+            validation_dataset,
+            sampler=DistributedEvalSampler(
+                validation_dataset, rank=rank, world_size=world_size
+            ),
+            drop_last=False,
+            generator=torch.Generator().manual_seed(int(cfg.validation.seed)),
+            **common,
+        )
     return train_loader, validation_loader, train_sampler
 
 
@@ -761,6 +763,7 @@ def _prune_training_checkpoints(
     *,
     keep_path: Path,
     keep_last: int,
+    keep_every_epoch: bool = False,
 ) -> list[str]:
     """Remove older known trainer checkpoints after a validated replacement."""
 
@@ -783,6 +786,8 @@ def _prune_training_checkpoints(
         raise ValueError("Retention keep_path is not a recognized trainer checkpoint.")
     pruned = []
     for path in known:
+        if keep_every_epoch and path.name.startswith("epoch_"):
+            continue
         if path != keep:
             path.unlink()
             pruned.append(path.name)
@@ -806,6 +811,7 @@ def _save_checkpoint(
     rank: int,
     world_size: int,
     checkpoint_keep_last: int,
+    checkpoint_keep_every_epoch: bool = False,
 ) -> dict[str, Any] | None:
     rng_by_rank = _gather_rng(world_size=world_size)
     if rank == 0:
@@ -833,13 +839,17 @@ def _save_checkpoint(
         report = dict(report)
         report["checkpoint_retention"] = {
             "keep_last": int(checkpoint_keep_last),
+            "keep_every_epoch": checkpoint_keep_every_epoch,
             "kept": path.name,
             "pruned": _prune_training_checkpoints(
                 path.parent,
                 keep_path=path,
                 keep_last=checkpoint_keep_last,
+                keep_every_epoch=checkpoint_keep_every_epoch,
             ),
         }
+        if checkpoint_keep_every_epoch and path.name.startswith("epoch_"):
+            _atomic_json(path.with_suffix(".inspection.json"), report)
     else:
         report = None
     _barrier(world_size)
@@ -1041,13 +1051,19 @@ def _build_provenance(
 
 def _validate_fr3_data_config(cfg: DictConfig) -> None:
     """Keep FR3 joint targets, camera transforms and parent statistics aligned."""
+    action_horizon = int(cfg.bc_policy.action_horizon)
+    if action_horizon not in {16, 32}:
+        raise ValueError("FR3 BC supports 16- or 32-step action targets.")
+    num_frames = action_horizon + 1
     if cfg.model.get("text_padding") != "masked":
         raise ValueError("FR3 BC requires masked text padding.")
     if int(cfg.lora.rank) != 128 or cfg.get("video_lora") is None:
         raise ValueError("FR3 BC requires Video and Action rank-128 LoRA.")
     for split in (cfg.data.train, cfg.data.validation):
+        if split is None:
+            continue
         expected = {
-            "num_frames": 17,
+            "num_frames": num_frames,
             "global_sample_stride": 1,
             "action_video_freq_ratio": 4,
             "concat_multi_camera": "horizontal",
@@ -1062,12 +1078,14 @@ def _validate_fr3_data_config(cfg: DictConfig) -> None:
             list(split.video_size) != [224, 448]
             or processor.action_output_dim != 8
             or processor.proprio_output_dim != 8
-            or processor.num_obs_steps != 17
+            or processor.num_obs_steps != num_frames
             or processor.num_output_cameras != 2
             or processor.get("delta_action_dim_mask") is not None
             or processor.get("norm_exception_mode") is not None
         ):
-            raise ValueError("FR3 BC requires the 17-step, 8-D two-camera processor.")
+            raise ValueError(
+                f"FR3 BC requires the {num_frames}-step, 8-D two-camera processor."
+            )
         images = processor.shape_meta.images
         if [image.key for image in images] != ["left", "wrist"] or any(
             list(image.raw_shape) != [3, 480, 640] or list(image.shape) != [3, 224, 224]
@@ -1107,12 +1125,17 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
     if profile not in {"libero", "fr3"}:
         raise ValueError(f"Expected BC profile libero or fr3, got {profile!r}.")
     fr3 = profile == "fr3"
+    has_validation = cfg.data.validation is not None
+    if not has_validation and not fr3:
+        raise ValueError("Full-corpus BC without validation is supported for FR3.")
     if fr3:
         _validate_fr3_data_config(cfg)
     text_padding = validate_text_padding(
         cfg.model.get("text_padding", "legacy_visible")
     )
     for split in (cfg.data.train, cfg.data.validation):
+        if split is None:
+            continue
         if split.get("text_padding", "legacy_visible") != text_padding:
             raise ValueError(
                 "BC model and both datasets must use the same text_padding."
@@ -1123,9 +1146,8 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         raise ValueError(f"runner.stage must be one of {sorted(allowed_stages)}.")
     if int(cfg.seed) != 42 or int(cfg.validation.seed) != 42:
         raise ValueError("The approved UNCOND BC train/split/validation seed is 42.")
-    if (
-        int(cfg.data.train.split_seed) != 42
-        or int(cfg.data.validation.split_seed) != 42
+    if int(cfg.data.train.split_seed) != 42 or (
+        has_validation and int(cfg.data.validation.split_seed) != 42
     ):
         raise ValueError("Both BC dataset episode splits must use seed 42.")
     if str(cfg.precision).lower() != "bf16":
@@ -1201,7 +1223,9 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         train_episodes = int(cfg.data.expected_train_episodes)
         validation_episodes = int(cfg.data.expected_validation_episodes)
         if (
-            min(train_episodes, validation_episodes) < 1
+            train_episodes < 1
+            or validation_episodes < (1 if has_validation else 0)
+            or (not has_validation and validation_episodes != 0)
             or int(cfg.data.expected_source_episodes)
             != train_episodes + validation_episodes
             or int(cfg.data.expected_source_transitions) < 1
@@ -1217,8 +1241,13 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
                 "EasyWAM BC requires dataset paths and its masked text cache."
             )
     for split in (cfg.data.train, cfg.data.validation):
-        if float(split.val_set_proportion) != 0.1:
-            raise ValueError("UNCOND BC requires the 90/10 episode split.")
+        if split is None:
+            continue
+        expected_proportion = 0.1 if has_validation else 0.0
+        if float(split.val_set_proportion) != expected_proportion:
+            raise ValueError(
+                f"UNCOND BC requires val_set_proportion={expected_proportion}."
+            )
         if str(split.pretrained_norm_stats) != expected_stats:
             raise ValueError("Every BC split must reuse the parent statistics.")
         if bool(split.processor.use_stepwise_action_norm) or (
@@ -1233,8 +1262,8 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
             )
         if int(split.processor.num_image_obs_steps) != 1:
             raise ValueError("UNCOND BC processor must decode one image step.")
-    if not bool(cfg.data.train.is_training_set) or bool(
-        cfg.data.validation.is_training_set
+    if not bool(cfg.data.train.is_training_set) or (
+        has_validation and bool(cfg.data.validation.is_training_set)
     ):
         raise ValueError("BC train/validation episode split roles changed.")
 
@@ -1266,20 +1295,23 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
     current_frame_flags = [
         bool(split.get("current_frame_only", False))
         for split in (cfg.data.train, cfg.data.validation)
+        if split is not None
     ]
-    if current_frame_flags[0] != current_frame_flags[1]:
+    if len(set(current_frame_flags)) != 1:
         raise ValueError(
             "BC train and validation must agree on current-frame-only loading."
         )
     expected_video_frames = 1 if current_frame_flags[0] else 9
     if current_frame_flags[0]:
         for split in (cfg.data.train, cfg.data.validation):
+            if split is None:
+                continue
             if not bool(split.get("strict_sample_loading", False)):
                 raise ValueError(
                     "Current-frame-only BC must fail closed on sample errors."
                 )
     expected_bc_shape = {
-        "action_horizon": 16 if fr3 else 32,
+        "action_horizon": int(cfg.data.train.num_frames) - 1 if fr3 else 32,
         "action_dim": 8 if fr3 else 7,
         "proprio_dim": 8,
         "expected_video_frames": expected_video_frames,
@@ -1390,7 +1422,7 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         raise ValueError("single_gpu_diagnostic is reserved for BC1.")
     diagnostic_validation_batches = cfg.runner.get("diagnostic_validation_batches")
     if diagnostic_validation_batches is not None and (
-        stage != "bc2" or int(diagnostic_validation_batches) < 1
+        stage != "bc2" or int(diagnostic_validation_batches) < 1 or not has_validation
     ):
         raise ValueError("diagnostic_validation_batches is a positive BC2-only probe.")
     cleanup_interval = int(cfg.validation.get("host_cleanup_interval_batches", 1))
@@ -1410,10 +1442,20 @@ def _validate_training_config(cfg: DictConfig, *, world_size: int) -> None:
         raise ValueError("UNCOND BC warmup/cosine floor contract changed.")
     if float(cfg.optimizer.learning_rate) not in {3e-5, 1e-4, 3e-4}:
         raise ValueError("UNCOND BC LR must be one of the three preregistered values.")
+    if has_validation:
+        schedule_valid = (
+            int(cfg.training.max_epochs) == 10
+            and int(cfg.training.minimum_epochs) == 3
+            and int(cfg.training.early_stopping_patience) == 2
+        )
+    else:
+        schedule_valid = (
+            int(cfg.training.max_epochs) > 0
+            and int(cfg.training.minimum_epochs) == int(cfg.training.max_epochs)
+            and cfg.training.early_stopping_patience is None
+        )
     if (
-        int(cfg.training.max_epochs) != 10
-        or int(cfg.training.minimum_epochs) != 3
-        or int(cfg.training.early_stopping_patience) != 2
+        not schedule_valid
         or int(cfg.training.save_every_steps) != 500
         or int(cfg.training.checkpoint_keep_last) != 1
     ):
@@ -2121,6 +2163,9 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
                     rank=rank,
                     world_size=world_size,
                     checkpoint_keep_last=int(cfg.training.checkpoint_keep_last),
+                    checkpoint_keep_every_epoch=bool(
+                        cfg.training.checkpoint_keep_every_epoch
+                    ),
                 )
             if global_step >= stop_after_steps:
                 stop = True
@@ -2128,45 +2173,52 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
 
         if stop and diagnostic_stage:
             break
-        validation = _validate(
-            model,
-            policy,
-            validation_loader,
-            cfg=cfg,
-            world_size=world_size,
-            device=device,
-            expected_sample_count=len(validation_dataset),
-        )
-        improved = validation["loss_action_bc"] < best_validation
-        if improved:
-            best_validation = validation["loss_action_bc"]
-            best_step = global_step
-            epochs_without_improvement = 0
-            if rank == 0:
-                save_uncond_bc_sidecar(
-                    output_dir / "best_uncond_lora.pt",
-                    adapter=policy.lora_adapter,
-                    video_adapter=policy.video_lora_adapter,
-                    parent_checkpoint_sha256=parent_sha256,
-                    extra_metadata={
-                        "bc_step": global_step,
-                        "bc_config_sha256": contract_hash,
-                        "validation_loss_action_bc": best_validation,
-                        "statistics_sha256": stats_sha256,
-                        "dataset_sha256": contract["dataset_sha256"],
-                        "text_cache_sha256": contract["text_cache_sha256"],
-                    },
-                )
+        if validation_loader is not None:
+            validation = _validate(
+                model,
+                policy,
+                validation_loader,
+                cfg=cfg,
+                world_size=world_size,
+                device=device,
+                expected_sample_count=len(validation_dataset),
+            )
+            improved = validation["loss_action_bc"] < best_validation
+            if improved:
+                best_validation = validation["loss_action_bc"]
+                best_step = global_step
+                epochs_without_improvement = 0
+                if rank == 0:
+                    save_uncond_bc_sidecar(
+                        output_dir / "best_uncond_lora.pt",
+                        adapter=policy.lora_adapter,
+                        video_adapter=policy.video_lora_adapter,
+                        parent_checkpoint_sha256=parent_sha256,
+                        extra_metadata={
+                            "bc_step": global_step,
+                            "bc_config_sha256": contract_hash,
+                            "validation_loss_action_bc": best_validation,
+                            "statistics_sha256": stats_sha256,
+                            "dataset_sha256": contract["dataset_sha256"],
+                            "text_cache_sha256": contract["text_cache_sha256"],
+                        },
+                    )
+            else:
+                epochs_without_improvement += 1
+            epoch_record = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "validation": validation,
+                "improved": improved,
+                "best_validation_loss_action_bc": best_validation,
+                "epochs_without_improvement": epochs_without_improvement,
+            }
         else:
-            epochs_without_improvement += 1
-        epoch_record = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "validation": validation,
-            "improved": improved,
-            "best_validation_loss_action_bc": best_validation,
-            "epochs_without_improvement": epochs_without_improvement,
-        }
+            epoch_record = {
+                "epoch": epoch,
+                "completed_epoch": epoch + 1,
+                "global_step": global_step,
+            }
         if rank == 0:
             with metrics_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(epoch_record, sort_keys=True) + "\n")
@@ -2193,11 +2245,16 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             rank=rank,
             world_size=world_size,
             checkpoint_keep_last=int(cfg.training.checkpoint_keep_last),
+            checkpoint_keep_every_epoch=bool(cfg.training.checkpoint_keep_every_epoch),
         )
         if stop:
             break
-        if next_epoch >= int(cfg.training.minimum_epochs) and (
-            epochs_without_improvement >= int(cfg.training.early_stopping_patience)
+        if (
+            validation_loader is not None
+            and next_epoch >= int(cfg.training.minimum_epochs)
+            and (
+                epochs_without_improvement >= int(cfg.training.early_stopping_patience)
+            )
         ):
             break
 
@@ -2225,7 +2282,7 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
         float(best_validation) if math.isfinite(best_validation) else None
     )
     best_sidecar_report = None
-    if stage in {"pilot", "formal"}:
+    if stage in {"pilot", "formal"} and validation_loader is not None:
         if best_step is None or best_validation_value is None:
             raise RuntimeError(
                 "Validated BC training produced no finite best checkpoint."
@@ -2245,17 +2302,48 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             expected_extra=expected_extra,
         )
 
+    final_sidecar_report = None
+    if validation_loader is None and stage in {"bc2", "formal"}:
+        final_path = output_dir / "final_uncond_lora.pt"
+        final_metadata = {
+            "bc_step": global_step,
+            "bc_config_sha256": contract_hash,
+            "selection": "final_training_step",
+            "statistics_sha256": stats_sha256,
+            "dataset_sha256": contract["dataset_sha256"],
+            "text_cache_sha256": contract["text_cache_sha256"],
+        }
+        if rank == 0:
+            save_uncond_bc_sidecar(
+                final_path,
+                adapter=policy.lora_adapter,
+                video_adapter=policy.video_lora_adapter,
+                parent_checkpoint_sha256=parent_sha256,
+                extra_metadata=final_metadata,
+            )
+        _barrier(world_size)
+        final_sidecar_report = _strict_reload_best_sidecar(
+            policy,
+            final_path,
+            parent_sha256=parent_sha256,
+            expected_extra=final_metadata,
+        )
+
     future_prediction_free = future_prediction_calls["count"] == 0
     expected_steps_reached = (
         global_step == stop_after_steps
-        if stage in {"bc1", "bc2", "pilot"}
+        if stage in {"bc1", "bc2", "pilot"} or validation_loader is None
         else global_step > 0
     )
     passed = (
         expected_steps_reached
         and nonzero_update_count > 0
         and future_prediction_free
-        and (stage not in {"pilot", "formal"} or best_sidecar_report is not None)
+        and (
+            stage not in {"pilot", "formal"}
+            or best_sidecar_report is not None
+            or final_sidecar_report is not None
+        )
     )
     manifest.update(
         {
@@ -2282,6 +2370,7 @@ def run_uncond_bc(cfg: DictConfig) -> dict[str, Any]:
             "elapsed_seconds": time.time() - started_at,
             "peak_cuda_bytes": int(torch.cuda.max_memory_allocated(device)),
             "best_sidecar": best_sidecar_report,
+            "final_sidecar": final_sidecar_report,
             "diagnostic_validation": diagnostic_validation,
         }
     )
